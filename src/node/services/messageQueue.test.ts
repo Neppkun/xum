@@ -792,6 +792,55 @@ describe("MessageQueue", () => {
       ).toBe(false);
     });
 
+    it.each(["continuation", "wake", "manual"] as const)(
+      "ignores withdrawn predecessors when the live successor is %s",
+      (kind) => {
+        const options = { model: "gpt-4", agentId: "exec" };
+        const canceled = new AbortController();
+        queue.add(
+          "withdrawn continuation",
+          { ...options, muxMetadata: metadata },
+          {
+            synthetic: true,
+            cancelSignal: canceled.signal,
+          }
+        );
+        queue.add(
+          "withdrawn wake",
+          {
+            ...options,
+            muxMetadata: { type: "bash-monitor-wake", records: [] },
+          },
+          { synthetic: true, cancelSignal: canceled.signal }
+        );
+        canceled.abort();
+        expect(queue.getNextQueueCutCandidate()).toBeUndefined();
+        expect(queue.isNextEntryBashMonitorWake()).toBe(false);
+        expect(
+          queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+        ).toBe(true);
+
+        const liveMetadata =
+          kind === "continuation"
+            ? metadata
+            : kind === "wake"
+              ? { type: "bash-monitor-wake" as const, records: [] }
+              : undefined;
+        queue.add("live", { ...options, muxMetadata: liveMetadata, queueDispatchMode: "turn-end" });
+        expect(queue.getNextQueueCutCandidate()).toEqual({
+          muxMetadata: liveMetadata,
+          dispatchMode: "turn-end",
+        });
+        expect(queue.isNextEntryBashMonitorWake()).toBe(kind === "wake");
+        expect(
+          queue.hasNextWorkspaceTurnContinuation("wst_followup", "parent-workspace", "turn-1")
+        ).toBe(kind === "continuation");
+        expect(
+          queue.hasAllWorkspaceTurnContinuations("wst_followup", "parent-workspace", "turn-1")
+        ).toBe(kind === "continuation");
+      }
+    );
+
     it("exposes the head entry's metadata and dispatch mode as the queue-cut candidate", () => {
       expect(queue.getNextQueueCutCandidate()).toBeUndefined();
 
