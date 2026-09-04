@@ -7,7 +7,7 @@ import React, {
   useDeferredValue,
   useMemo,
 } from "react";
-import { Lightbulb } from "lucide-react";
+import { Lightbulb, Loader2 } from "lucide-react";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -1702,6 +1702,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
+                      isHydratingTranscript={isHydratingTranscript}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
                       preStreamAgentTaskStatus={
@@ -1773,8 +1774,8 @@ interface ChatInputPaneProps {
   workspaceName: string;
   /**
    * False until the chat view's one-commit reveal (transcript + decorations
-   * together). The decoration lane stays empty before that so a decoration
-   * can never mount after paint and shift the transcript.
+   * together). Async decorations stay hidden before that so they cannot
+   * mount after paint and shift the transcript.
    */
   revealDecorations: boolean;
   runtimeConfig?: RuntimeConfig;
@@ -1783,6 +1784,7 @@ interface ChatInputPaneProps {
   isCompacting: boolean;
   isStreamStarting: boolean;
   isTranscriptCaughtUp: boolean;
+  isHydratingTranscript: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
   concurrentLocalStreamingWorkspaceName: string | null;
@@ -1934,13 +1936,26 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  // The decoration lane lives inside the in-flow sticky composer dock, so a
-  // decoration mounting/unmounting reflows the transcript clearance in the same
-  // layout pass; the bottom stays pinned via native anchoring plus the
-  // scrollport-children ResizeObserver in useAutoScroll. Until the one-commit
-  // reveal the lane renders empty: readiness is monotonic per mounted
-  // workspace, so this only ever delays the initial mount — it never unmounts
-  // visible decorations.
+  if (props.isHydratingTranscript && !props.isStreamStarting && !props.canInterrupt) {
+    decorationEntries.push(
+      createChatInputDecorationStackItem({
+        key: "transcript-loading",
+        // Cached rows can be stale until replay completes, even before decorations are ready.
+        revealBeforeReady: true,
+        node: (
+          <ChatDockSurface>
+            <div role="status" className="text-muted flex items-center gap-2 px-3 py-1 text-xs">
+              <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
+              <span>Loading messages...</span>
+            </div>
+          </ChatDockSurface>
+        ),
+      })
+    );
+  }
+  // Keep decorations in the in-flow composer dock so height changes reserve
+  // transcript clearance in the same layout pass. Synchronous chat state bypasses
+  // readiness so hydration does not hide loading feedback or the queued follow-up.
 
   return (
     <>

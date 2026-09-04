@@ -1,0 +1,231 @@
+import { expect, userEvent, waitFor, within } from "@storybook/test";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { DEFAULT_MODEL } from "@/common/constants/knownModels";
+import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { createMockORPCClient } from "./mocks/orpc";
+import { createAssistantMessage } from "./mocks/messages";
+import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
+import {
+  collapseLeftSidebar,
+  collapseRightSidebar,
+  expandLeftSidebar,
+  expandProjects,
+  selectWorkspace,
+} from "./helpers/uiState";
+
+export default { ...appMeta, title: "App/ChatLoading" };
+
+function getLoadingStatus(canvasElement: HTMLElement) {
+  return canvasElement.querySelector<HTMLElement>(
+    '[data-component="ChatInputDecorationStack"] [role="status"]'
+  );
+}
+
+async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
+  expandLeftSidebar();
+  const row = await waitFor(async () => {
+    const element = canvasElement.querySelector<HTMLElement>(
+      '[data-workspace-id="' + workspaceId + '"][role="button"]'
+    );
+    await expect(element).not.toBeNull();
+    return element!;
+  });
+  await userEvent.click(row);
+  collapseLeftSidebar();
+}
+
+async function checkLoadingLayout(canvasElement: HTMLElement) {
+  await waitFor(async () => {
+    const status = getLoadingStatus(canvasElement);
+    await expect(status).toBeVisible();
+    const dock = status!.closest('[data-component="ChatDockSurface"]')!;
+    const composer = canvasElement.querySelector('[data-component="ChatInputSurface"]')!;
+    const statusRect = status!.getBoundingClientRect();
+    const dockRect = dock.getBoundingClientRect();
+    const composerRect = composer.getBoundingClientRect();
+    await expect(statusRect.bottom).toBeLessThanOrEqual(composerRect.top);
+    await expect(Math.abs(dockRect.left - composerRect.left)).toBeLessThan(1);
+    await expect(Math.abs(dockRect.right - composerRect.right)).toBeLessThan(1);
+    await expect(status!.scrollWidth).toBeLessThanOrEqual(status!.clientWidth);
+    await expect(composerRect.right).toBeLessThanOrEqual(
+      canvasElement.getBoundingClientRect().right
+    );
+  });
+}
+
+function createHydrationStory(workspaceId: string): AppStory {
+  const workspace = createWorkspace({
+    id: workspaceId,
+    name: "loading-history",
+    projectName: "xum",
+  });
+  const otherWorkspace = createWorkspace({
+    id: workspaceId + "-other",
+    name: "caught-up-history",
+    projectName: "xum",
+  });
+  const history = createAssistantMessage("history", "Previously loaded response.", {
+    historySequence: 1,
+  });
+  let emitChat: (event: WorkspaceChatMessage) => void;
+  let subscriptions = 0;
+
+  function setup() {
+    subscriptions = 0;
+    selectWorkspace(workspace);
+    collapseLeftSidebar();
+    collapseRightSidebar();
+    expandProjects([workspace.projectPath]);
+    return createMockORPCClient({
+      projects: groupWorkspacesByProject([workspace, otherWorkspace]),
+      workspaces: [workspace, otherWorkspace],
+      onChat: (workspaceId, emit) => {
+        if (workspaceId === workspace.id) {
+          emitChat = emit;
+          subscriptions += 1;
+        } else {
+          emit(
+            createAssistantMessage("other-history", "Another workspace response.", {
+              historySequence: 1,
+            })
+          );
+          emit({ type: "caught-up", hasOlderHistory: false });
+        }
+      },
+    });
+  }
+  const exerciseHydration: AppStory["play"] = async ({ canvasElement, step }) => {
+    const canvas = within(canvasElement);
+    await step("First fetch is visible before the transcript and decorations reveal", async () => {
+      await checkLoadingLayout(canvasElement);
+      await expect(canvas.getByTestId("transcript-hydration-placeholder")).toBeVisible();
+      await expect(canvas.getByRole("textbox")).toBeEnabled();
+      emitChat(history);
+      emitChat({
+        type: "caught-up",
+        hasOlderHistory: false,
+        cursor: { history: { messageId: history.id, historySequence: 1 } },
+      });
+      await waitFor(() => expect(getLoadingStatus(canvasElement)).toBeNull());
+      await expect(
+        await canvas.findByText("Previously loaded response.", {}, { timeout: 5000 })
+      ).toBeVisible();
+    });
+
+    await step(
+      "Switching away clears the status; revisiting keeps cached rows while replaying",
+      async () => {
+        await switchWorkspace(canvasElement, otherWorkspace.id);
+        await expect(
+          await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
+        ).toBeVisible();
+        await expect(getLoadingStatus(canvasElement)).toBeNull();
+        await switchWorkspace(canvasElement, workspace.id);
+        await waitFor(() => expect(subscriptions).toBe(2));
+        await checkLoadingLayout(canvasElement);
+        await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+        await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
+      }
+    );
+
+    await step("Running init and stream preparation suppress the competing status", async () => {
+      emitChat({
+        type: "init-start",
+        hookPath: "/project/.xum/init",
+        timestamp: STABLE_TIMESTAMP,
+        replay: true,
+      });
+      emitChat({
+        type: "init-output",
+        line: "Preparing workspace",
+        isError: false,
+        timestamp: STABLE_TIMESTAMP,
+        replay: true,
+      });
+      await waitFor(() => expect(getLoadingStatus(canvasElement), "running init").toBeNull());
+      emitChat({ type: "init-end", exitCode: 0, timestamp: STABLE_TIMESTAMP, replay: true });
+      await checkLoadingLayout(canvasElement);
+      emitChat({
+        type: "stream-lifecycle",
+        workspaceId: workspace.id,
+        phase: "preparing",
+        hadAnyOutput: false,
+      });
+      await waitFor(() => expect(getLoadingStatus(canvasElement), "preparing stream").toBeNull());
+      emitChat({
+        type: "stream-start",
+        workspaceId: workspace.id,
+        messageId: "stream",
+        model: DEFAULT_MODEL,
+        historySequence: 2,
+        startTime: STABLE_TIMESTAMP,
+      });
+      await expect(await canvas.findByText(/streaming\.\.\./)).toBeVisible();
+      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      emitChat(history);
+      emitChat({
+        type: "caught-up",
+        replay: "since",
+        hasOlderHistory: false,
+        cursor: { history: { messageId: history.id, historySequence: 1 } },
+      });
+      emitChat({
+        type: "stream-delta",
+        workspaceId: workspace.id,
+        messageId: "stream",
+        delta: "Live response.",
+        tokens: 3,
+        timestamp: STABLE_TIMESTAMP,
+      });
+      await expect(await canvas.findByText("Live response.")).toBeVisible();
+      await expect(getLoadingStatus(canvasElement)).toBeNull();
+      emitChat({
+        type: "stream-end",
+        workspaceId: workspace.id,
+        messageId: "stream",
+        metadata: { model: DEFAULT_MODEL },
+        parts: [{ type: "text", text: "Live response." }],
+      });
+      emitChat({
+        type: "stream-lifecycle",
+        workspaceId: workspace.id,
+        phase: "idle",
+        hadAnyOutput: true,
+      });
+    });
+
+    await step(
+      "A later replay shows the same aligned status without clearing cached messages",
+      async () => {
+        await switchWorkspace(canvasElement, otherWorkspace.id);
+        await expect(
+          await canvas.findByText("Another workspace response.", {}, { timeout: 5000 })
+        ).toBeVisible();
+        await switchWorkspace(canvasElement, workspace.id);
+        await waitFor(() => expect(subscriptions).toBe(3));
+        await checkLoadingLayout(canvasElement);
+        await expect(canvas.getByText("Previously loaded response.")).toBeVisible();
+      }
+    );
+  };
+
+  return { render: () => <AppWithMocks setup={setup} />, play: exerciseHydration };
+}
+
+export const Replay: AppStory = {
+  ...createHydrationStory("ws-loading-desktop"),
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } } },
+};
+
+export const Phone: AppStory = {
+  ...createHydrationStory("ws-loading-phone"),
+  decorators: [
+    (Story) => (
+      <div style={{ width: 390, maxWidth: "100%", height: 844, overflow: "hidden" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { viewports: ["phone"] } } },
+};
