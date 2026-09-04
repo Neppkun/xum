@@ -6236,7 +6236,8 @@ export class AgentSession {
     this.coordinator.beginPolicy(turn);
     if (!this.coordinator.isCurrentTurn(turn) || !this.coordinator.isCurrentOperation(operation))
       return;
-    const activeModelForAbort = this.activeStreamContext?.modelString;
+    // A configured fallback can bill a different model than the requested one.
+    const activeModelForAbort = payload.metadata?.model ?? this.activeStreamContext?.modelString;
     const activeOptionsForAbort = this.activeStreamContext?.options;
     this.lastSystemMessageTokens = systemMessageTokens ?? this.lastSystemMessageTokens;
     if (activeModelForAbort) {

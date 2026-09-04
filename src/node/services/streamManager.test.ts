@@ -5,7 +5,11 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
+import {
+  StreamAbortEventSchema,
+  StreamEndEventSchema,
+  ToolCallStartEventSchema,
+} from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
   ToolCallEndEvent,
@@ -6553,6 +6557,29 @@ describe("StreamManager - aborted stream usage persistence", () => {
       outputTokens: 30,
       totalTokens: 150,
     });
+  });
+
+  test("emits the effective fallback model with aborted usage", async () => {
+    const streamManager = new StreamManager(historyService);
+    const effectiveModel = "anthropic:claude-opus-4-1";
+    const abort = Promise.withResolvers<unknown>();
+    onTurnEngineEvent(streamManager, "stream-abort", (event) => abort.resolve(event));
+    const cleanupAborted = getPrivateMethodForTests<CleanupAbortedStreamForTests>(
+      streamManager,
+      "cleanupAbortedStream"
+    );
+    await cleanupAborted.call(
+      streamManager,
+      "fallback-abort",
+      {
+        ...createAbortStreamInfo("fallback-message"),
+        model: effectiveModel,
+      },
+      "system"
+    );
+    const event = StreamAbortEventSchema.parse(await abort.promise);
+    expect(event.metadata?.model).toBe(effectiveModel);
+    expect(event.metadata?.usage?.inputTokens).toBe(120);
   });
 
   test("routes tool-only aborted usage to the headless sidecar (commit would drop it)", async () => {

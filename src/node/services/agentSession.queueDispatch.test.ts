@@ -1,12 +1,16 @@
 import type { StreamAbortEvent } from "@/common/types/stream";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
+import { EventEmitter } from "node:events";
+import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import { getTotalCost } from "@/common/utils/tokens/usageAggregator";
 
 import type { MuxMessageMetadata } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { AIService } from "./aiService";
+import type { TurnCompletion } from "./streamManager";
 
 const TEST_MODEL = "anthropic:claude-sonnet-4-5";
 const WORKSPACE_TURN_CORRELATION = {
@@ -160,6 +164,68 @@ describe("AgentSession queued message tool-call dispatch", () => {
       } finally {
         releaseFailure.resolve();
         append.mockRestore();
+        session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
+  test.each([undefined, "anthropic:claude-opus-4-1"])(
+    "accounts aborted usage against the effective model %s with request fallback",
+    async (effectiveModel) => {
+      const workspaceId = "abort-effective-model";
+      const aiEmitter = new EventEmitter();
+      const accounting = Promise.withResolvers<number>();
+      const completion = Promise.withResolvers<TurnCompletion>();
+      const workspaceGoalService = {
+        assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+        recordStreamAccounting: mock((input: { costUsd: number }) => {
+          accounting.resolve(input.costUsd);
+          return Promise.resolve();
+        }),
+        applyPendingAfterStreamEnd: mock(() => Promise.resolve()),
+        requestContinuationAfterStreamEnd: mock(() => Promise.resolve()),
+        recordStreamStarted: mock(() => Promise.resolve()),
+        syncGoalModeWithChatTail: mock(() => Promise.resolve(null)),
+      } as unknown as WorkspaceGoalService;
+      const { session, cleanup } = await createAgentSessionHarness({
+        workspaceId,
+        aiEmitter,
+        workspaceGoalService,
+        aiServiceOverrides: {
+          streamMessage: mock(() => {
+            aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
+            return Promise.resolve(
+              Ok({ messageId: "assistant-1", completion: completion.promise })
+            );
+          }),
+        },
+      });
+      try {
+        expect(
+          (
+            await session.sendMessage(
+              "start",
+              { model: TEST_MODEL, agentId: "exec" },
+              { synthetic: true, agentInitiated: true }
+            )
+          ).success
+        ).toBe(true);
+        const usage = { inputTokens: 1_000_000, outputTokens: 0, totalTokens: 1_000_000 };
+        completion.resolve({
+          status: "aborted",
+          abortReason: "system",
+          streamAbort: {
+            type: "stream-abort",
+            workspaceId,
+            metadata: { duration: 1, usage, model: effectiveModel },
+          },
+        });
+        expect(await accounting.promise).toBe(
+          getTotalCost(createDisplayUsage(usage, effectiveModel ?? TEST_MODEL))
+        );
+        await session.waitForIdle();
+      } finally {
         session.dispose();
         await cleanup();
       }
