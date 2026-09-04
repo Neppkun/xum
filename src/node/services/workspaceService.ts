@@ -2528,11 +2528,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
       const hasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
       const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
-      if (hasPendingTurn || (hasSessionBackedBusyState && !hasAiServiceStream)) {
+      // Cancelable attention must not cut a turn that can consume it in its current tool call.
+      // Keep it outside the queue so later manual tool-end input cannot be held behind it.
+      if (hasPendingTurn || hasSessionBackedBusyState) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
         return "deferred";
       }
-      if (hasAiServiceStream && !hasSessionBackedBusyState) {
+      if (hasAiServiceStream) {
         return "deferred";
       }
       const sendOptions =
@@ -2543,43 +2545,23 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return "deferred";
       }
 
-      // Withdrawn while awaiting send options above: the abort listener below would never
-      // fire, and send preflight (which persists AI settings) has nothing left to admit.
+      // Withdrawal during send-option resolution must not enter preflight or persist settings.
       if (dispatch.cancelSignal.aborted) return "deferred";
 
       let accepted = false;
-      // A queued wake can be superseded after dequeue. Share cancellation state so
-      // AgentSession can release PREPARING when cancellation wins before acceptance.
-      const cancelState = { canceledBeforeAcceptance: false };
-      // Withdrawal (output already shown, process discarded, history cleared) must
-      // free the queue slot now, not at stream end: a lingering entry keeps the
-      // workspace reported busy and its dedupe key held. The key is unique per
-      // dispatch, so this cannot drop a newer wake's entry.
-      dispatch.cancelSignal.addEventListener(
-        "abort",
-        () => {
-          this.removeQueuedMessagesByDedupeKeyPrefix(ownerWorkspaceId, dispatch.dedupeKey, {
-            cancelReason: "Bash monitor wake withdrawn before dispatch.",
-          });
-        },
-        { once: true }
-      );
       const sendResult = await this.sendMessage(
         ownerWorkspaceId,
         dispatch.prompt,
         {
           ...sendOptions,
-          queueDispatchMode: "tool-end",
           muxMetadata: dispatch.muxMetadata,
         },
         {
           skipAutoResumeReset: true,
           synthetic: true,
           agentInitiated: true,
-          cancelState,
+          requireIdle: true,
           cancelSignal: dispatch.cancelSignal,
-          queueDedupeKey: dispatch.dedupeKey,
-          removableQueueDedupeKey: true,
           onAccepted: async () => {
             accepted = true;
             await dispatch.onAccepted();
@@ -11623,7 +11605,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const session = this.getOrCreateSession(workspaceId);
-      const stopResult = await session.interruptStream(options);
+      const stopResult = options?.soft
+        ? await session.interruptStream(options)
+        : await this.bashMonitorHistoryLocks.withLock(workspaceId, async () => {
+            const result = await session.interruptStream(options);
+            // Retire already-owed attention before releasing idle dispatch after a hard Stop.
+            if (result.success) await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId);
+            return result;
+          });
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -14685,11 +14674,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Send options for continuing a STILL-OPEN delegated workspace turn (bash-monitor
-   * wakes cut turns at tool boundaries). The delegated prompt's persisted
-   * retrySendOptions carry the turn's own settings — including per-turn overrides
-   * (agentId, model, strictAgentResolution) that are deliberately NOT in the
-   * workspace's persisted defaults when the launch used skipAiSettingsPersistence —
+   * Send options for continuing a STILL-OPEN delegated workspace turn. The delegated
+   * prompt's persisted retrySendOptions carry the turn's own settings — including
+   * per-turn overrides (agentId, model, strictAgentResolution) that are deliberately NOT
+   * in the workspace's persisted defaults when the launch used skipAiSettingsPersistence —
    * so resolving from workspace defaults would continue the turn under the wrong
    * agent. Openness is decided by the same rule as workspace-turn correlation
    * (inheritOpenWorkspaceTurnMetadata): only a correlated assistant cut with

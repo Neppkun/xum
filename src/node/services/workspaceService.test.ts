@@ -30,6 +30,9 @@ import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import { streamText, tool } from "ai";
+import { z } from "zod";
+import { StreamManager } from "./streamManager";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ExperimentsService } from "./experimentsService";
@@ -87,6 +90,11 @@ import {
 // nit DEREM-50) — import instead of defining local copies.
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
+import type {
+  BashMonitorProcessSnapshot,
+  BashMonitorWakeReconciler,
+  BashMonitorWakeDispatch,
+} from "./bashMonitorWakeReconciler";
 
 // Helper to access private renamingWorkspaces set
 function addToRenamingWorkspaces(service: WorkspaceService, workspaceId: string): void {
@@ -233,6 +241,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const events = new EventEmitter();
     const backgroundProcessManager = Object.assign(events, {
+      cleanup: mock(() => Promise.resolve()),
       notifyMonitorWakeStateChanged: mock(() => undefined),
       getActiveMonitorCount: mock(() => 0),
       pullMonitorWakeSignals: mock(() => Promise.resolve([])),
@@ -250,8 +259,466 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       ),
       backgroundProcessManager,
     });
-    return { config, service, events, cleanup };
+    return { config, historyService, backgroundProcessManager, service, events, cleanup };
   }
+
+  async function createActiveWakeHarness() {
+    const fixture = await createWakeWiringService();
+    const { config, service, historyService, backgroundProcessManager } = fixture;
+    const workspaceId = "monitor-attention-owner";
+    await config.addWorkspace("/tmp/monitor-attention-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "monitor-attention-project",
+      projectPath: "/tmp/monitor-attention-project",
+      runtimeConfig: { type: "local" },
+    });
+    const model = "anthropic:claude-sonnet-4-5";
+    const aiEmitter = new EventEmitter();
+    const requests: Array<Parameters<AIService["streamMessage"]>[0]> = [];
+    const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
+    const launched = new EventEmitter();
+    let streaming = false;
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        isStreaming: () => streaming,
+        streamMessage: mock((request: Parameters<AIService["streamMessage"]>[0]) => {
+          requests.push(request);
+          const completion = Promise.withResolvers<TurnCompletion>();
+          completions.push(completion);
+          streaming = true;
+          const messageId = "assistant-" + requests.length;
+          aiEmitter.emit("stream-start", {
+            type: "stream-start",
+            workspaceId,
+            messageId,
+            model,
+            startTime: Date.now(),
+          });
+          launched.emit("start");
+          return Promise.resolve(Ok({ messageId, completion: completion.promise }));
+        }),
+      },
+    });
+    const internal = service as unknown as {
+      aiService: typeof harness.aiService;
+      sessions: Map<string, AgentSession>;
+      bashMonitorRecoveryPromise: Promise<void>;
+      bashMonitorWakeReconciler: BashMonitorWakeReconciler;
+      pendingBashMonitorWakeIdleWaitsByOwner: Map<string, Promise<void>>;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<SendMessageOptions>;
+      dispatchBashMonitorWake(dispatch: BashMonitorWakeDispatch): Promise<"in-flight" | "deferred">;
+    };
+    await internal.bashMonitorRecoveryPromise;
+    internal.aiService = harness.aiService;
+    internal.sessions.set(workspaceId, harness.session);
+    internal.getDelegatedTurnContinuationSendOptions = () =>
+      Promise.resolve({ model, agentId: "exec" });
+    const signals: BashMonitorProcessSnapshot[] = [];
+    let shown = 0;
+    spyOn(backgroundProcessManager, "pullMonitorWakeSignals").mockImplementation(() => signals);
+    spyOn(backgroundProcessManager, "getMonitorWakeDeliveryState").mockImplementation(() =>
+      Promise.resolve({ status: "settled", shownThroughOffset: shown, terminalStatusShown: false })
+    );
+    const reconciler = internal.bashMonitorWakeReconciler;
+    const dispatch = spyOn(internal, "dispatchBashMonitorWake");
+    const complete = async (finishReason = "stop") => {
+      const messageId = "assistant-" + requests.length;
+      const message = createMuxMessage(messageId, "assistant", "final answer", {
+        model,
+        finishReason,
+        muxMetadata: requests[requests.length - 1].muxMetadata,
+      });
+      await historyService.appendToHistory(workspaceId, message);
+      const completed = new Promise<void>((resolve) => {
+        const unsubscribe = harness.session.onChatEvent(({ message: event }) => {
+          if (event.type === "stream-end") {
+            unsubscribe();
+            resolve();
+          }
+        });
+      });
+      streaming = false;
+      const streamEnd = {
+        type: "stream-end" as const,
+        workspaceId,
+        parts: [{ type: "text" as const, text: "final answer" }],
+        metadata: { model, finishReason },
+      };
+      aiEmitter.emit("stream-end", { ...streamEnd, messageId });
+      completions[requests.length - 1].resolve({ status: "completed", streamEnd });
+      await completed;
+    };
+    const abort = (abortReason: "user" | "system") => {
+      const messageId = "assistant-" + requests.length;
+      const streamAbort = { type: "stream-abort" as const, workspaceId, metadata: { duration: 1 } };
+      streaming = false;
+      aiEmitter.emit("stream-abort", { ...streamAbort, messageId, abortReason });
+      completions[requests.length - 1].resolve({ status: "aborted", abortReason, streamAbort });
+    };
+    return {
+      ...fixture,
+      ...harness,
+      workspaceId,
+      model,
+      requests,
+      launched,
+      internal,
+      reconciler,
+      dispatch,
+      complete,
+      abort,
+      stopStream: spyOn(harness.aiService, "stopStream"),
+      addAttention: async (offset: number) => {
+        signals.splice(
+          0,
+          signals.length,
+          ...["first", "second"].map((processId) => ({
+            processId,
+            taskId: "bash:" + processId,
+            ownerWorkspaceId: workspaceId,
+            filter: "READY",
+            filterExclude: false,
+            script: "watch",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            retired: false,
+            match: { throughOffset: offset, lines: ["READY " + offset], totalMatches: 1 },
+          }))
+        );
+        fixture.events.emit("monitor:match", workspaceId, {});
+        await reconciler.reconcile(workspaceId);
+      },
+      consume: async (offset: number) => {
+        shown = offset;
+        fixture.events.emit("output:shown", workspaceId, {});
+        await reconciler.reconcile(workspaceId);
+      },
+      finish: async () => {
+        await reconciler.dispose(workspaceId);
+        harness.session.dispose();
+        await fixture.cleanup();
+      },
+    };
+  }
+
+  test("the SDK answers in the original stream after repeated owed wakes are consumed", async () => {
+    const h = await createActiveWakeHarness();
+    let step = 0;
+    let offset = 0;
+    const sdkModel = new MockLanguageModelV3({
+      doStream: () => {
+        step++;
+        const chunks: LanguageModelV3StreamPart[] =
+          step <= 6
+            ? [
+                {
+                  type: "tool-call",
+                  toolCallId: "tool-" + step,
+                  toolName: step % 2 === 1 ? "held_tool" : "task_await",
+                  input: "{}",
+                },
+              ]
+            : [
+                { type: "text-start", id: "answer" },
+                { type: "text-delta", id: "answer", delta: "final answer" },
+                { type: "text-end", id: "answer" },
+              ];
+        chunks.push({
+          type: "finish",
+          finishReason: { unified: step <= 6 ? "tool-calls" : "stop", raw: undefined },
+          usage: {
+            inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 1, text: 1, reasoning: 0 },
+          },
+        });
+        return Promise.resolve({
+          stream: simulateReadableStream({ chunks, initialDelayInMs: null, chunkDelayInMs: null }),
+        });
+      },
+    });
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      const engine = new StreamManager(h.historyService) as unknown as {
+        createStopWhenCondition(
+          request: Pick<Parameters<AIService["streamMessage"]>[0], "hasQueuedMessages">
+        ): Array<(options: { steps: unknown[] }) => boolean>;
+      };
+      const result = streamText({
+        model: sdkModel,
+        prompt: "run the monitored tasks",
+        stopWhen: engine.createStopWhenCondition(h.requests[0]),
+        tools: {
+          held_tool: tool({
+            inputSchema: z.object({}),
+            execute: async () => {
+              offset += 10;
+              await h.addAttention(offset);
+              expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+              return "foreground finished";
+            },
+          }),
+          task_await: tool({
+            inputSchema: z.object({}),
+            execute: async () => {
+              await h.consume(offset);
+              return "READY";
+            },
+          }),
+        },
+      });
+      expect(await result.text).toBe("final answer");
+      expect(step).toBe(7);
+      expect(h.dispatch).toHaveBeenCalled();
+      await h.complete();
+      await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(1);
+      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+      expect(history.success && history.data.map((row) => row.role)).toEqual(["user", "assistant"]);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test.each([false, true])(
+    "owed monitor attention never cuts an active tool (native=%s)",
+    async (providerExecuted) => {
+      const h = await createActiveWakeHarness();
+      try {
+        expect(
+          (await h.session.sendMessage("original", { model: h.model, agentId: "exec" })).success
+        ).toBe(true);
+        for (const offset of [10, 20, 30]) {
+          h.aiEmitter.emit("tool-call-start", {
+            type: "tool-call-start",
+            workspaceId: h.workspaceId,
+            messageId: "assistant-1",
+            toolCallId: "held-tool",
+            toolName: "bash",
+            args: {},
+            timestamp: Date.now(),
+          });
+          await h.addAttention(offset);
+          expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+          expect(h.dispatch).toHaveBeenCalled();
+          expect(h.requests[0].hasQueuedMessages?.("tool-end")).toBe(false);
+          h.aiEmitter.emit("tool-call-end", {
+            type: "tool-call-end",
+            workspaceId: h.workspaceId,
+            messageId: "assistant-1",
+            toolCallId: "held-tool",
+            toolName: "bash",
+            result: {},
+            providerExecuted,
+            timestamp: Date.now(),
+          });
+          expect(h.stopStream).not.toHaveBeenCalled();
+          await h.consume(offset);
+          expect(h.requests[0].hasQueuedMessages?.("tool-end")).toBe(false);
+        }
+        await h.complete();
+        await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+        await h.reconciler.reconcile(h.workspaceId);
+        expect(h.requests).toHaveLength(1);
+        const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+        expect(history.success && history.data.map((row) => row.role)).toEqual([
+          "user",
+          "assistant",
+        ]);
+        expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      } finally {
+        await h.finish();
+      }
+    }
+  );
+
+  test("owed attention does not hold a delegated completion open or inherit its closed correlation", async () => {
+    const h = await createActiveWakeHarness();
+    const correlation = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_turn",
+      ownerWorkspaceId: "parent",
+      turnId: "turn",
+    };
+    try {
+      await h.session.sendMessage(
+        "delegated",
+        { model: h.model, agentId: "exec", muxMetadata: correlation },
+        { synthetic: true, agentInitiated: true }
+      );
+      await h.addAttention(10);
+      expect(h.service.hasPendingWorkspaceTurnContinuation(h.workspaceId, correlation)).toBe(false);
+      expect(h.service.hasPendingBashMonitorWakeContinuation(h.workspaceId)).toBe(false);
+      const next = new Promise<void>((resolve) => h.launched.once("start", resolve));
+      await h.complete();
+      await next;
+      expect(h.requests).toHaveLength(2);
+      expect(h.requests[0].muxMetadata).toEqual(correlation);
+      expect(h.requests[1].muxMetadata).toBeUndefined();
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("full context discard retires owed attention before the active turn becomes idle", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      const token = await h.reconciler.beginFullHistoryClear(h.workspaceId);
+      await h.reconciler.finishFullHistoryClear(token);
+      await h.complete();
+      await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(1);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("hard Stop retires owed attention without disarming future idle wakes", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      spyOn(h.aiService, "stopStream").mockImplementation(async () => {
+        h.abort("user");
+        await h.session.waitForIdle();
+        return Ok(undefined);
+      });
+      spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+      expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
+      await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(1);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      await h.addAttention(20);
+      expect(h.requests).toHaveLength(2);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test.each(["options", "settings"] as const)(
+    "wake yields when a turn starts during %s admission",
+    async (gate) => {
+      const h = await createActiveWakeHarness();
+      const entered = createDeferred<void>();
+      const release = createDeferred<void>();
+      const options = { model: h.model, agentId: "exec" };
+      if (gate === "options") {
+        spyOn(h.internal, "getDelegatedTurnContinuationSendOptions").mockImplementationOnce(
+          async () => {
+            entered.resolve();
+            await release.promise;
+            return options;
+          }
+        );
+      } else {
+        const internal = h.service as unknown as {
+          maybePersistAISettingsFromOptions(): Promise<void>;
+        };
+        spyOn(internal, "maybePersistAISettingsFromOptions").mockImplementationOnce(async () => {
+          entered.resolve();
+          await release.promise;
+        });
+      }
+      try {
+        const attention = h.addAttention(10);
+        await entered.promise;
+        await h.session.sendMessage("original", options);
+        release.resolve();
+        await attention;
+        expect(h.requests).toHaveLength(1);
+        expect(h.requests[0].hasQueuedMessages?.("tool-end")).toBe(false);
+        await h.consume(10);
+        await h.complete();
+        await h.reconciler.reconcile(h.workspaceId);
+        expect(h.requests).toHaveLength(1);
+      } finally {
+        release.resolve();
+        await h.finish();
+      }
+    }
+  );
+
+  test("unconsumed attention coalesces after natural completion and idle attention starts promptly", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(1);
+      const next = new Promise<void>((resolve) => h.launched.once("start", resolve));
+      await h.complete();
+      await next;
+      expect(h.requests).toHaveLength(2);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      await h.complete();
+      await h.addAttention(20);
+      expect(h.requests).toHaveLength(3);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test.each([false, true])(
+    "manual tool-end input takes precedence over owed bash attention (native=%s)",
+    async (providerExecuted) => {
+      const h = await createActiveWakeHarness();
+      try {
+        await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+        await h.addAttention(10);
+        expect(
+          (
+            await h.service.sendMessage(h.workspaceId, "manual", {
+              model: h.model,
+              agentId: "exec",
+              queueDispatchMode: "tool-end",
+            })
+          ).success
+        ).toBe(true);
+        expect(h.requests[0].hasQueuedMessages?.("tool-end")).toBe(true);
+        h.aiEmitter.emit("tool-call-end", {
+          type: "tool-call-end",
+          workspaceId: h.workspaceId,
+          messageId: "assistant-1",
+          toolCallId: "tool",
+          toolName: "bash",
+          result: {},
+          providerExecuted,
+          timestamp: Date.now(),
+        });
+        expect(h.stopStream).toHaveBeenCalledTimes(providerExecuted ? 1 : 0);
+        await h.consume(10);
+        const next = new Promise<void>((resolve) => h.launched.once("start", resolve));
+        if (providerExecuted) {
+          h.abort("system");
+        } else {
+          await h.complete("tool-calls");
+        }
+        await next;
+        expect(h.requests).toHaveLength(2);
+        const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+        expect(
+          history.success &&
+            history.data.filter((row) => row.role === "user").map((row) => row.parts[0])
+        ).toEqual([
+          expect.objectContaining({ type: "text", text: "original" }),
+          expect.objectContaining({ type: "text", text: "manual" }),
+        ]);
+      } finally {
+        await h.finish();
+      }
+    }
+  );
 
   test("monitor lifecycle and shown-output events poke the reconciler", async () => {
     const { service, events, cleanup } = await createWakeWiringService();
@@ -749,7 +1216,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
-        dedupeKey: string;
         cancelSignal: AbortSignal;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
@@ -762,7 +1228,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
-        dedupeKey: "wake",
         cancelSignal: new AbortController().signal,
         onAccepted,
         onDeferred,
@@ -775,7 +1240,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
-  test("active session-backed streams queue monitor wakes at tool end", async () => {
+  test("active session-backed streams defer monitor attention until idle", async () => {
     const { config, service, cleanup } = await createWakeWiringService();
     const workspaceId = "streaming-wake-owner";
     await config.addWorkspace("/tmp/streaming-wake-project", {
@@ -785,20 +1250,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       projectPath: "/tmp/streaming-wake-project",
       runtimeConfig: { type: "local" },
     });
-    let queuedMode: string | undefined;
-    let queuedCancelState: { canceledBeforeAcceptance: boolean } | undefined;
-    const sendMessage = mock(
-      (
-        _workspaceId: string,
-        _prompt: string,
-        options: { queueDispatchMode?: string },
-        internal?: { cancelState?: { canceledBeforeAcceptance: boolean } }
-      ) => {
-        queuedMode = options.queueDispatchMode;
-        queuedCancelState = internal?.cancelState;
-        return Promise.resolve(Ok(undefined));
-      }
-    );
+    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
     const afterIdle = mock(() => undefined);
     const internal = service as unknown as {
       aiService: { isStreaming(workspaceId: string): boolean };
@@ -811,7 +1263,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: string;
         prompt: string;
         muxMetadata: { type: "bash-monitor-wake"; records: [] };
-        dedupeKey: string;
         cancelSignal: AbortSignal;
         onAccepted(): Promise<void>;
         onDeferred(): Promise<void>;
@@ -829,119 +1280,59 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         ownerWorkspaceId: workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
-        dedupeKey: "wake",
         cancelSignal: new AbortController().signal,
         onAccepted: () => Promise.resolve(),
         onDeferred: () => Promise.resolve(),
       });
 
-      expect(outcome).toBe("in-flight");
-      expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(queuedMode).toBe("tool-end");
-      expect(queuedCancelState).toEqual({ canceledBeforeAcceptance: false });
-      expect(afterIdle).not.toHaveBeenCalled();
+      expect(outcome).toBe("deferred");
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(afterIdle).toHaveBeenCalledWith(workspaceId);
     } finally {
       await cleanup();
     }
   });
 
-  test("withdrawing a queued monitor wake removes it and releases its dedupe key", async () => {
-    const { config, service, cleanup } = await createWakeWiringService();
-    const workspaceId = "withdrawn-wake-owner";
-    await config.addWorkspace("/tmp/withdrawn-wake-project", {
-      id: workspaceId,
-      name: workspaceId,
-      projectName: "withdrawn-wake-project",
-      projectPath: "/tmp/withdrawn-wake-project",
-      runtimeConfig: { type: "local" },
+  test("withdrawn idle wake rolls back admission and permits a fresh delivery", async () => {
+    const h = await createActiveWakeHarness();
+    const entered = createDeferred<void>();
+    const release = createDeferred<void>();
+    const append = h.historyService.appendToHistory.bind(h.historyService);
+    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return append(...args);
     });
-    const session = service.getOrCreateSession(workspaceId);
-    const queuedModes: Array<"tool-end" | "turn-end" | null> = [];
-    // The real sendMessage queues behind a busy session; mirror only that branch.
-    const sendMessage = mock(
-      (
-        _workspaceId: string,
-        prompt: string,
-        options: SendMessageOptions,
-        internal?: {
-          synthetic?: boolean;
-          agentInitiated?: boolean;
-          queueDedupeKey?: string;
-          removableQueueDedupeKey?: boolean;
-          cancelState?: { canceledBeforeAcceptance: boolean };
-          cancelSignal?: AbortSignal;
-          onCanceled?: (reason: string) => Promise<void> | void;
-        }
-      ) => {
-        queuedModes.push(
-          session.queueMessage(prompt, options, {
-            synthetic: internal?.synthetic,
-            agentInitiated: internal?.agentInitiated,
-            dedupeKey: internal?.queueDedupeKey,
-            removableDedupeKey: internal?.removableQueueDedupeKey,
-            cancelState: internal?.cancelState,
-            cancelSignal: internal?.cancelSignal,
-            onCanceled: internal?.onCanceled,
-          })
-        );
-        return Promise.resolve(Ok(undefined));
-      }
-    );
-    const internal = service as unknown as {
-      aiService: { isStreaming(workspaceId: string): boolean };
-      hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
-      isBusyForMessage(workspaceId: string): boolean;
-      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
-      sendMessage: typeof sendMessage;
-      dispatchBashMonitorWake(dispatch: {
-        ownerWorkspaceId: string;
-        prompt: string;
-        muxMetadata: { type: "bash-monitor-wake"; records: [] };
-        dedupeKey: string;
-        cancelSignal: AbortSignal;
-        onAccepted(): Promise<void>;
-        onDeferred(): Promise<void>;
-      }): Promise<"in-flight" | "deferred">;
-    };
-    const dedupeKey = "bash-monitor-wake:" + workspaceId + ":dispatch-1";
-    const onDeferred = mock(() => Promise.resolve());
-    const dispatch = (cancelSignal: AbortSignal) =>
-      internal.dispatchBashMonitorWake({
-        ownerWorkspaceId: workspaceId,
+    const controller = new AbortController();
+    const accepted = mock(() => Promise.resolve());
+    const deferred = mock(() => Promise.resolve());
+    const send = (cancelSignal: AbortSignal) =>
+      h.internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: h.workspaceId,
         prompt: "wake",
         muxMetadata: { type: "bash-monitor-wake", records: [] },
-        dedupeKey,
         cancelSignal,
-        onAccepted: () => Promise.resolve(),
-        onDeferred,
+        onAccepted: accepted,
+        onDeferred: deferred,
       });
     try {
-      internal.aiService = { isStreaming: () => true };
-      internal.hasPendingQueuedOrPreparingTurn = () => false;
-      internal.isBusyForMessage = () => true;
-      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
-      internal.sendMessage = sendMessage;
-
-      const controller = new AbortController();
-      expect(await dispatch(controller.signal)).toBe("in-flight");
-      expect(session.hasQueuedMessages("tool-end")).toBe(true);
-
-      controller.abort("output already shown");
-      expect(session.hasQueuedMessages()).toBe(false);
-      expect(service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, dedupeKey)).toEqual(Ok(0));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(onDeferred).toHaveBeenCalledTimes(1);
-
-      // Already withdrawn at dispatch: never reaches the send, so nothing can be enqueued.
-      expect(await dispatch(controller.signal)).toBe("deferred");
-      expect(sendMessage).toHaveBeenCalledTimes(1);
-      expect(session.hasQueuedMessages()).toBe(false);
-      expect(onDeferred).toHaveBeenCalledTimes(1);
-
-      expect(await dispatch(new AbortController().signal)).toBe("in-flight");
-      expect(queuedModes).toEqual(["tool-end", "tool-end"]);
+      const dispatch = send(controller.signal);
+      await entered.promise;
+      controller.abort();
+      release.resolve();
+      await dispatch;
+      expect(accepted).not.toHaveBeenCalled();
+      expect(deferred).toHaveBeenCalledTimes(1);
+      expect(h.requests).toHaveLength(0);
+      expect(h.session.hasQueuedMessages()).toBe(false);
+      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+      expect(history.success && history.data).toEqual([]);
+      await send(new AbortController().signal);
+      expect(h.requests).toHaveLength(1);
+      expect(accepted).toHaveBeenCalledTimes(1);
     } finally {
-      await cleanup();
+      release.resolve();
+      await h.finish();
     }
   });
 

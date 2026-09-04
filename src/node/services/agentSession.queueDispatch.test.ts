@@ -222,7 +222,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
           },
         });
         expect(await accounting.promise).toBe(
-          getTotalCost(createDisplayUsage(usage, effectiveModel ?? TEST_MODEL))
+          getTotalCost(createDisplayUsage(usage, effectiveModel ?? TEST_MODEL)) ?? -1
         );
         await session.waitForIdle();
       } finally {

@@ -397,10 +397,7 @@ export class MessageQueue {
   }
 
   /**
-   * Whether the next dispatchable entry is a bash-monitor wake. Wake sends are
-   * the only queued input that continues an open delegated workspace turn
-   * (see AgentSession.inheritOpenWorkspaceTurnMetadata); any other head entry
-   * supersedes the turn when it dispatches.
+   * Bash-monitor wakes inherit an open delegated turn's correlation at dispatch.
    */
   isNextEntryBashMonitorWake(): boolean {
     const muxMetadata = this.nextDispatchableEntry()?.muxMetadata;

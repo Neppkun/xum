@@ -143,40 +143,18 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
   });
 
-  test("superseding a queued wake uses a distinct queue key", async () => {
-    const queuedKeys = new Set<string>();
-    const queuedDispatches: BashMonitorWakeDispatch[] = [];
-    const queueing = new BashMonitorWakeReconciler({
-      sessionsDir: root,
-      processManager: {
-        pullMonitorWakeSignals: () => live,
-        getMonitorWakeDeliveryState: () => Promise.resolve(deliveryState),
-        acknowledgeMonitorWake: () => undefined,
-        dropRetiredMonitor: () => undefined,
-      },
-      registry: {
-        listAll: () => Promise.resolve([]),
-        remove: () => undefined,
-        recordTerminal: () => undefined,
-      },
-      onWake: (dispatch) => {
-        if (queuedKeys.has(dispatch.dedupeKey)) return "deferred";
-        queuedKeys.add(dispatch.dedupeKey);
-        queuedDispatches.push(dispatch);
-        return "in-flight";
-      },
-    });
+  test("a newer match withdraws the in-flight wake and dispatches again", async () => {
     live = [liveSnapshot()];
-    await queueing.reconcile(OWNER);
+    await reconciler.reconcile(OWNER);
     live = [
       liveSnapshot({ match: { throughOffset: 24, lines: ["READY again"], totalMatches: 2 } }),
     ];
 
-    await queueing.reconcile(OWNER);
+    await reconciler.reconcile(OWNER);
 
-    expect(queuedDispatches).toHaveLength(2);
-    expect(queuedKeys.size).toBe(2);
-    expect(queuedDispatches[0].cancelSignal.aborted).toBe(true);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[0].cancelSignal.aborted).toBe(true);
+    expect(dispatches[1].cancelSignal.aborted).toBe(false);
   });
 
   test("keeps dead registry evidence until the queued wake is accepted", async () => {

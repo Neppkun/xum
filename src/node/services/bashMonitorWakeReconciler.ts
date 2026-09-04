@@ -105,7 +105,6 @@ export interface BashMonitorWakeDispatch {
   ownerWorkspaceId: string;
   prompt: string;
   muxMetadata: Extract<MuxMessageMetadata, { type: "bash-monitor-wake" }>;
-  dedupeKey: string;
   cancelSignal: AbortSignal;
   onAccepted(): Promise<void>;
   onDeferred(): Promise<void>;
@@ -550,7 +549,6 @@ export class BashMonitorWakeReconciler {
         ownerWorkspaceId,
         prompt: buildPrompt(dispatch.signals),
         muxMetadata: buildMetadata(dispatch.signals),
-        dedupeKey: "bash-monitor-wake:" + ownerWorkspaceId + ":" + dispatch.id,
         cancelSignal: dispatch.controller.signal,
         onAccepted: async () => this.accept(ownerWorkspaceId, dispatch),
         onDeferred: async () => this.defer(ownerWorkspaceId, dispatch),
@@ -592,7 +590,7 @@ export class BashMonitorWakeReconciler {
     state.dispatch = undefined;
   }
 
-  private async consumeCurrent(ownerWorkspaceId: string): Promise<void> {
+  async consumeCurrent(ownerWorkspaceId: string): Promise<void> {
     await this.locks.withLock(ownerWorkspaceId, async () => {
       this.abortDispatch(ownerWorkspaceId);
       const collected = await this.collect(ownerWorkspaceId, false);
