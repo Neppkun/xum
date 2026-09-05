@@ -943,6 +943,64 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       await cleanup();
     }
   });
+
+  test("superseding queued sub-agent progress skips its continuation-failure callbacks", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "superseded-progress-owner";
+    await config.addWorkspace("/tmp/superseded-progress-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "superseded-progress-project",
+      projectPath: "/tmp/superseded-progress-project",
+      runtimeConfig: { type: "local" },
+    });
+    const session = service.getOrCreateSession(workspaceId);
+    const options: SendMessageOptions = { model: "gpt-4", agentId: "exec" };
+    try {
+      // A progress report queued into an owner that runs as a delegated turn carries callbacks
+      // that settle that turn as interrupted; supersession by the terminal report must not fire them.
+      const progressCanceled = mock(() => undefined);
+      const wakeCanceled = mock(() => undefined);
+      expect(
+        session.queueMessage("progress", options, {
+          synthetic: true,
+          agentInitiated: true,
+          dedupeKey: "agent-report:child:wst_1:call-1",
+          removableDedupeKey: true,
+          onCanceled: progressCanceled,
+        })
+      ).toBe("tool-end");
+      expect(
+        session.queueMessage("wake", options, {
+          synthetic: true,
+          agentInitiated: true,
+          dedupeKey: "bash-monitor-wake:owner:1",
+          removableDedupeKey: true,
+          onCanceled: wakeCanceled,
+        })
+      ).toBe("tool-end");
+
+      expect(
+        service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, "agent-report:child:wst_1:", {
+          cancelReason: "superseded",
+          skipCancelCallbacks: true,
+        })
+      ).toEqual(Ok(1));
+      // Withdrawal (the default) still notifies, so wake bookkeeping keeps working.
+      expect(
+        service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, "bash-monitor-wake:", {
+          cancelReason: "withdrawn",
+        })
+      ).toEqual(Ok(1));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(progressCanceled).not.toHaveBeenCalled();
+      expect(wakeCanceled).toHaveBeenCalledWith("withdrawn");
+      expect(session.hasQueuedMessages()).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
 });
 
 async function setWorkspaceGoalOk(
@@ -9485,6 +9543,44 @@ describe("WorkspaceService sendMessage status clearing", () => {
         onCanceled: undefined,
         onAcceptedPreStreamFailure: undefined,
       })
+    );
+  });
+
+  test("judges a promoted progress report's correlation against the entries it stays behind", async () => {
+    fakeSession.hasQueuedOrDispatchingEntry.mockReturnValue(false);
+    const onCanceled = mock(() => undefined);
+    const muxMetadata = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_promoted_progress",
+      ownerWorkspaceId: "owner-workspace",
+      turnId: "turn-promoted-progress",
+    };
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "nested progress",
+      { model: "openai:gpt-4o-mini", agentId: "exec", muxMetadata },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        workspaceTurnContinuation: true,
+        queueDedupeKey: "agent-report:child:call-1",
+        removableQueueDedupeKey: true,
+        promoteAheadOfHiddenTurnEnd: true,
+        onCanceled,
+      }
+    );
+
+    expect(result.success).toBe(true);
+    // The session excludes the hidden turn-end entries the promotion will overtake (e.g. a
+    // queued heartbeat) when deciding whether a predecessor supersedes this continuation.
+    expect(fakeSession.hasQueuedOrDispatchingEntry).toHaveBeenCalledWith(muxMetadata, {
+      promoteAheadOfHiddenTurnEnd: true,
+    });
+    expect(fakeSession.queueMessage).toHaveBeenCalledWith(
+      "nested progress",
+      expect.objectContaining({ muxMetadata }),
+      expect.objectContaining({ onCanceled, promoteAheadOfHiddenTurnEnd: true })
     );
   });
 

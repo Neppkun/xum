@@ -56,7 +56,11 @@ import {
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import type { AgentPeerMessageMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageOptions } from "@/common/orpc/types";
-import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
+import {
+  AGENT_PEER_MESSAGE_DEDUPE_PREFIX,
+  AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
+  agentReportProgressDedupePrefix,
+} from "@/constants/agentMessaging";
 import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
@@ -1678,6 +1682,22 @@ export class TaskService implements AgentTaskIntegration {
     this.bumpWorkspaceStopEpoch(taskId);
     if (!parentWorkspaceId) {
       return;
+    }
+    // Every interrupted transition lands here right after the status commit. The child's queued
+    // incremental updates are superseded now: left in place as tool-end entries they would still
+    // cut the parent's active turn at its next step boundary before their admission probe refuses
+    // them. (A continuation owned by a different ancestor is cleaned by its settlement instead.)
+    const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+      parentWorkspaceId,
+      agentReportProgressDedupePrefix(taskId),
+      { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
+    );
+    if (!queuedProgressRemoval.success) {
+      log.warn("Failed to remove queued incremental sub-agent reports after interrupt", {
+        parentWorkspaceId,
+        childWorkspaceId: taskId,
+        error: queuedProgressRemoval.error,
+      });
     }
     this.timelineRecorder.record(parentWorkspaceId, {
       kind: "task.interrupted",
@@ -8082,10 +8102,9 @@ export class TaskService implements AgentTaskIntegration {
       if (childEntry.workspace.taskStatus === "interrupted" && !continuationActive) {
         throw new Error("agent_report cannot send updates from an interrupted sub-agent");
       }
-      const parentWorkspaceId =
-        continuationActive && continuationRecord != null
-          ? continuationRecord.ownerWorkspaceId
-          : directParentWorkspaceId;
+      const activeExecution =
+        continuationActive && continuationRecord != null ? continuationRecord : null;
+      const parentWorkspaceId = activeExecution?.ownerWorkspaceId ?? directParentWorkspaceId;
 
       if (childEntry.workspace.workflowTask != null) {
         // Workflow-owned tasks deliver structured output through WorkflowRunner's journal/result
@@ -8120,11 +8139,54 @@ export class TaskService implements AgentTaskIntegration {
       // A progress report is itself the wake-up message. Unlike terminal attention, it must be
       // allowed through while this child is still active so review findings and other incremental
       // results can immediately background a foreground wait or queue behind a busy parent turn.
+      // The key is scoped to the active continuation execution (when any) so that execution's
+      // terminal settlement drops exactly the updates it superseded.
+      const dedupePrefix = agentReportProgressDedupePrefix(
+        childWorkspaceId,
+        activeExecution?.handleId
+      );
+      // Superseded once this run is over: the settlement paths persist the child's status mirror
+      // (`reported`/`interrupted`, or a terminal execution status for a continuation) BEFORE they
+      // remove queued updates, so an entry already dequeued into the parent's asynchronous
+      // PREPARING phase — invisible to that removal — is refused at admission instead of starting
+      // a stale "in progress" turn after the terminal outcome. Synchronous reads only: admission
+      // probes run inside the session's turn gates. As with peer sends, a probe-carrying send
+      // never resurrects an interrupted parent.
+      const superseded = (): boolean => {
+        const fresh = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
+        if (fresh == null) {
+          return true;
+        }
+        if (activeExecution != null) {
+          // A successor generation claims the mirror only once this execution stopped being the
+          // live registration, and clearing it is part of this execution's own teardown — either
+          // way the update belongs to a finished generation.
+          return (
+            fresh.workspace.taskExecutionId !== activeExecution.handleId ||
+            !isActiveWorkspaceTurnTaskStatus(fresh.workspace.taskExecutionStatus)
+          );
+        }
+        return (
+          hasCompletedAgentReport(fresh.workspace) || fresh.workspace.taskStatus === "interrupted"
+        );
+      };
+      // A stop or settlement can land between the status checks above and here (neither shares
+      // this child's event lock), and the mirror is written at continuation acceptance, before
+      // the child's turn can call agent_report — so a probe that is already true means the run
+      // is over. Refuse now rather than wake the parent with an obsolete update.
+      if (superseded()) {
+        throw new Error("agent_report cannot send updates after the sub-agent's run has ended");
+      }
       const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
         parentWorkspaceId,
         parentEntry,
         content: reportContent,
-        queueDedupeKey: `agent-report:${childWorkspaceId}:${toolCallId}`,
+        queueDedupeKey: `${dedupePrefix}${toolCallId}`,
+        // Only the queue head's dispatch mode can cut the parent's stream. A child's earlier
+        // ancestor-bound peer message (turn-end by default) at the head would otherwise hold this
+        // report until the parent's turn ends — observed as 8–40 minute "delayed" updates.
+        promoteAheadOfHiddenTurnEnd: true,
+        admissionStale: superseded,
       });
       if (!wakeResult.success) {
         throw new Error(`agent_report failed to wake the parent workspace: ${wakeResult.error}`);
@@ -8151,6 +8213,14 @@ export class TaskService implements AgentTaskIntegration {
     content: string;
     /** Coalesces repeated wakes for the same source (e.g. one agent_report tool call). */
     queueDedupeKey?: string;
+    /** Queue ahead of hidden turn-end predecessors (see SendMessageInternalOptions). */
+    promoteAheadOfHiddenTurnEnd?: boolean;
+    /**
+     * Synchronous "this wake has been superseded" probe, re-checked at the parent's turn-admission
+     * gates (even after the entry left the queue for PREPARING). A stale wake is refused rather
+     * than dispatched, and never settles the parent's own workspace turn as failed.
+     */
+    admissionStale?: () => boolean;
     queueDispatchMode?: TaskMessageQueueDispatchMode;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
     preTurnMessages?: MuxMessage[];
@@ -8176,6 +8246,33 @@ export class TaskService implements AgentTaskIntegration {
       await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
         parentWorkspaceId
       );
+    // When the parent itself runs as a delegated workspace turn, this wake continues that turn,
+    // so a canceled/failed send normally settles the turn as failed. A wake whose source has been
+    // superseded (params.admissionStale, e.g. a sub-agent progress report outrun by the child's
+    // terminal outcome) is the exception: the parent's live turn is intact and the terminal
+    // delivery is its next wake, so refusing or dropping the stale wake must not interrupt it.
+    const settleContinuationFailure = async (
+      status: "interrupted" | "error",
+      message: string
+    ): Promise<void> => {
+      if (workspaceTurnMuxMetadata == null) {
+        return;
+      }
+      if (params.admissionStale?.() === true) {
+        log.debug("Superseded parent wake dropped without settling the parent's workspace turn", {
+          parentWorkspaceId,
+          status,
+          message,
+        });
+        return;
+      }
+      await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
+        parentWorkspaceId,
+        workspaceTurnMuxMetadata,
+        status,
+        message
+      );
+    };
 
     const sendResult = await this.workspaceService.sendMessage(
       parentWorkspaceId,
@@ -8204,23 +8301,17 @@ export class TaskService implements AgentTaskIntegration {
         ...(params.queueDedupeKey != null
           ? { queueDedupeKey: params.queueDedupeKey, removableQueueDedupeKey: true }
           : {}),
+        ...(params.promoteAheadOfHiddenTurnEnd === true
+          ? { promoteAheadOfHiddenTurnEnd: true }
+          : {}),
+        ...(params.admissionStale != null ? { admissionStale: params.admissionStale } : {}),
         ...(workspaceTurnMuxMetadata != null
           ? {
               onCanceled: async (reason: string) => {
-                await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                  parentWorkspaceId,
-                  workspaceTurnMuxMetadata,
-                  "interrupted",
-                  reason
-                );
+                await settleContinuationFailure("interrupted", reason);
               },
               onAcceptedPreStreamFailure: async (error: SendMessageError) => {
-                await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-                  parentWorkspaceId,
-                  workspaceTurnMuxMetadata,
-                  "error",
-                  formatSendMessageError(error).message
-                );
+                await settleContinuationFailure("error", formatSendMessageError(error).message);
               },
             }
           : {}),
@@ -8228,14 +8319,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     if (!sendResult.success) {
       const formattedError = formatSendMessageError(sendResult.error);
-      if (workspaceTurnMuxMetadata != null) {
-        await this.getWorkspaceTurnManager().settleWorkspaceTurnContinuationFailure(
-          parentWorkspaceId,
-          workspaceTurnMuxMetadata,
-          "error",
-          formattedError.message
-        );
-      }
+      await settleContinuationFailure("error", formattedError.message);
       return Err(formattedError.message);
     }
     return Ok(undefined);
@@ -12439,6 +12523,26 @@ export class TaskService implements AgentTaskIntegration {
       },
       { allowMissing: true }
     );
+    // Drop queued incremental updates synchronously with the terminal commit: while they sit at
+    // the parent's queue head as tool-end entries, the parent's stream stops at its next step
+    // boundary for them, and a dispatch refused as superseded cannot restore that cut turn.
+    // skipCancelCallbacks: a parent running as a delegated workspace turn queues each report with
+    // continuation-failure callbacks; superseding the report must not interrupt that live turn.
+    const progressParentWorkspaceId = latestEntryBeforeReport?.workspace.parentWorkspaceId;
+    if (progressParentWorkspaceId) {
+      const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+        progressParentWorkspaceId,
+        agentReportProgressDedupePrefix(childWorkspaceId),
+        { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
+      );
+      if (!queuedProgressRemoval.success) {
+        log.warn("Failed to remove queued incremental sub-agent reports", {
+          parentWorkspaceId: progressParentWorkspaceId,
+          childWorkspaceId,
+          error: queuedProgressRemoval.error,
+        });
+      }
+    }
     eventSpine.emit("task.reported", { workspaceId: childWorkspaceId, taskId: childWorkspaceId });
 
     await this.emitWorkspaceMetadata(childWorkspaceId);
@@ -12543,19 +12647,6 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     await this.maybeStartPatchGenerationForReportedTask(childWorkspaceId);
-
-    const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
-      parentWorkspaceId,
-      `agent-report:${childWorkspaceId}:`,
-      { cancelReason: "Incremental sub-agent update superseded by the terminal report." }
-    );
-    if (!queuedProgressRemoval.success) {
-      log.warn("Failed to remove queued incremental sub-agent reports", {
-        parentWorkspaceId,
-        childWorkspaceId,
-        error: queuedProgressRemoval.error,
-      });
-    }
 
     await this.deliverReportToParent(
       parentWorkspaceId,
