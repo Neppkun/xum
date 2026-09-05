@@ -261,7 +261,7 @@ test("a tool in a narrow transcript opens a sheet with literal output and closes
       (_, element) => element?.children.length === 0 && element.textContent === output
     )
   ).toBeNull();
-  fireEvent.click(view.getByRole("button", { name: "bash: Done. git status --short" }));
+  fireEvent.click(view.getByRole("button", { name: "Bash: Done. git status --short" }));
   expect(
     view.getByText((_, element) => element?.children.length === 0 && element.textContent === output)
   ).toBeDefined();
@@ -272,7 +272,7 @@ test("a tool in a narrow transcript opens a sheet with literal output and closes
       (_, element) => element?.children.length === 0 && element.textContent === output
     )
   ).toBeNull();
-  expect(view.getByRole("button", { name: "bash: Done. git status --short" })).toBeDefined();
+  expect(view.getByRole("button", { name: "Bash: Done. git status --short" })).toBeDefined();
 });
 
 test("tool headers distinguish execution, completion, failure, redaction, and interrupted replay", () => {
@@ -292,13 +292,13 @@ test("tool headers distinguish execution, completion, failure, redaction, and in
     />
   );
   const view = render(renderMessage(part, true));
-  expect(view.getByRole("button", { name: "file_read: Pending. src/app.ts" })).toBeDefined();
+  expect(view.getByRole("button", { name: "File read: Pending. src/app.ts" })).toBeDefined();
   view.rerender(renderMessage({ ...part, executionStartedAt: 0 }, true));
-  expect(view.getByRole("button", { name: "file_read: Running. src/app.ts" })).toBeDefined();
+  expect(view.getByRole("button", { name: "File read: Running. src/app.ts" })).toBeDefined();
   view.rerender(renderMessage(part));
-  expect(view.getByRole("button", { name: "file_read: No result. src/app.ts" })).toBeDefined();
+  expect(view.getByRole("button", { name: "File read: No result. src/app.ts" })).toBeDefined();
   view.rerender(renderMessage(part, false, true));
-  expect(view.getByRole("button", { name: "file_read: Interrupted. src/app.ts" })).toBeDefined();
+  expect(view.getByRole("button", { name: "File read: Interrupted. src/app.ts" })).toBeDefined();
   view.rerender(
     renderMessage({
       ...part,
@@ -306,9 +306,9 @@ test("tool headers distinguish execution, completion, failure, redaction, and in
       output: { success: false, error: "denied" },
     })
   );
-  expect(view.getByRole("button", { name: "file_read: Failed. src/app.ts" })).toBeDefined();
+  expect(view.getByRole("button", { name: "File read: Failed. src/app.ts" })).toBeDefined();
   view.rerender(renderMessage({ ...part, state: "output-redacted" }));
-  fireEvent.click(view.getByRole("button", { name: "file_read: Redacted. src/app.ts" }));
+  fireEvent.click(view.getByRole("button", { name: "File read: Redacted. src/app.ts" }));
   expect(view.queryByText("denied")).toBeNull();
 });
 
@@ -324,7 +324,7 @@ test("tool inspection caps large values but does not claim an exact-limit result
   const view = render(
     <Message message={toolMessage(part)} canAnswer={false} onAnswer={async () => {}} />
   );
-  fireEvent.click(view.getByRole("button", { name: "bash: Done" }));
+  fireEvent.click(view.getByRole("button", { name: "Bash: Done" }));
   expect(view.getByText("x".repeat(24000)).textContent).toHaveLength(24000);
   expect(view.queryByText(/Showing the first/)).toBeNull();
   view.rerender(

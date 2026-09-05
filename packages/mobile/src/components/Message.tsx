@@ -165,13 +165,16 @@ function Tool(props: {
     props.part.toolName === "ask_user_question" && props.part.state === "input-available"
       ? questionTexts(props.part.input)
       : [];
+  const name = props.part.toolName
+    .replaceAll("_", " ")
+    .replace(/^./, (letter) => letter.toUpperCase());
   const hint = toolHint(props.part.input);
   const status = toolStatus(props.part, props.streaming, props.interrupted);
   return (
     <View style={{ gap: spacing.sm }}>
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={`${props.part.toolName}: ${status}${hint ? `. ${hint}` : ""}`}
+        accessibilityLabel={`${name}: ${status}${hint ? `. ${hint}` : ""}`}
         accessibilityState={{ expanded: inspecting }}
         onPress={() => setInspecting(true)}
         style={styles.actionRow}
@@ -179,7 +182,7 @@ function Tool(props: {
         <Wrench size={16} color={colors.muted} />
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text numberOfLines={1} style={styles.toolName}>
-            {props.part.toolName}
+            {name}
             {hint && <Text style={styles.toolHint}> {hint}</Text>}
           </Text>
         </View>
@@ -189,7 +192,7 @@ function Tool(props: {
         <ChevronRight size={16} color={colors.muted} />
       </Pressable>
       {inspecting && (
-        <Sheet title={props.part.toolName} onClose={() => setInspecting(false)}>
+        <Sheet title={name} onClose={() => setInspecting(false)}>
           <Text style={[styles.secondary, status === "Failed" && { color: colors.danger }]}>
             {status}
           </Text>

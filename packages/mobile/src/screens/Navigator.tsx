@@ -9,11 +9,9 @@ import {
   View,
 } from "react-native";
 import {
-  Check,
   ChevronDown,
   ChevronRight,
   Folder,
-  GitBranch,
   MessageSquare,
   Plus,
   Search,
@@ -23,7 +21,7 @@ import {
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import type { Projects } from "../useProjects";
 import { Button, IconButton, Loading, Notice } from "../components/Controls";
-import { colors, layout, radii, spacing, typography } from "../theme";
+import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
 
 export function Navigator(props: {
   projects: Projects;
@@ -65,8 +63,8 @@ export function Navigator(props: {
   return (
     <View style={[layout.fill, props.compact && styles.sidebar]}>
       <View style={styles.toolbar}>
-        <Text style={styles.brand}>
-          xum<Text style={{ color: colors.accent }}>.</Text>
+        <Text accessibilityRole="header" style={styles.title}>
+          {props.compact ? "Xum" : "Workspaces"}
         </Text>
         <View style={layout.row}>
           <IconButton label="Settings" icon={Settings} onPress={props.onSettings} />
@@ -90,14 +88,6 @@ export function Navigator(props: {
           />
         }
       >
-        <View style={{ gap: 6 }}>
-          <Text style={[styles.title, props.compact && { fontSize: 24 }]}>Workspaces</Text>
-          <Text style={layout.muted}>
-            {props.workspaces.length === 0
-              ? "Your conversations, organized by project."
-              : `${props.workspaces.length} ${props.workspaces.length === 1 ? "conversation" : "conversations"}`}
-          </Text>
-        </View>
         <View style={styles.search}>
           <Search size={18} color={colors.muted} />
           <TextInput
@@ -171,7 +161,7 @@ export function Navigator(props: {
                 ) : (
                   group.workspaces
                     .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))
-                    .map((workspace, index) => (
+                    .map((workspace) => (
                       <Pressable
                         key={workspace.id}
                         accessibilityRole="button"
@@ -180,22 +170,11 @@ export function Navigator(props: {
                         onPress={() => props.onSelect(workspace)}
                         style={({ pressed }) => [
                           styles.workspace,
-                          index > 0 && styles.separator,
                           (workspace.id === props.selectedId || pressed) && {
                             backgroundColor: colors.elevated,
                           },
                         ]}
                       >
-                        <View style={styles.workspaceIcon}>
-                          {workspace.kind === "scratch" ? (
-                            <MessageSquare size={18} color={colors.accent} />
-                          ) : (
-                            <GitBranch
-                              size={18}
-                              color={workspace.agentId === "plan" ? colors.plan : colors.accent}
-                            />
-                          )}
-                        </View>
                         <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
                           <Text numberOfLines={2} style={styles.workspaceTitle}>
                             {workspace.title ?? workspace.name}
@@ -204,11 +183,6 @@ export function Navigator(props: {
                             {workspace.kind === "scratch" ? "Scratch chat" : workspace.name}
                           </Text>
                         </View>
-                        {workspace.id === props.selectedId ? (
-                          <Check size={18} color={colors.accent} />
-                        ) : (
-                          <ChevronRight size={16} color={colors.dim} />
-                        )}
                       </Pressable>
                     ))
                 )}
@@ -224,29 +198,22 @@ export function Navigator(props: {
 const styles = StyleSheet.create({
   sidebar: { backgroundColor: colors.background },
   toolbar: {
-    minHeight: 52,
+    minHeight: 60,
     paddingHorizontal: spacing.lg,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
   },
-  brand: { color: colors.bright, fontWeight: "700", letterSpacing: -0.8, fontSize: 24 },
   content: {
-    paddingHorizontal: spacing.xl,
+    paddingHorizontal: spacing.lg,
     paddingTop: 8,
     paddingBottom: 32,
-    gap: 20,
+    gap: 16,
     maxWidth: 760,
     width: "100%",
     alignSelf: "center",
   },
-  title: {
-    color: colors.bright,
-    fontWeight: "700",
-    letterSpacing: -0.8,
-    fontSize: 32,
-    lineHeight: 38,
-  },
+  title: { ...typography.header, color: colors.bright, fontSize: 20, letterSpacing: -0.4 },
   search: {
     backgroundColor: colors.panel,
     borderRadius: radii.control,
@@ -261,7 +228,7 @@ const styles = StyleSheet.create({
     flex: 1,
     minWidth: 0,
     minHeight: 44,
-    fontSize: 16,
+    ...typography.body,
     color: colors.bright,
     paddingVertical: 10,
   },
@@ -272,25 +239,23 @@ const styles = StyleSheet.create({
     minHeight: 44,
     paddingHorizontal: 4,
   },
-  sectionTitle: { color: colors.muted, fontSize: 13, fontWeight: "600" },
-  section: { borderRadius: radii.card, overflow: "hidden", backgroundColor: colors.panel },
+  sectionTitle: { ...typography.footnote, color: colors.muted, fontWeight: "500" },
+  section: { gap: 2 },
   workspace: {
     flexDirection: "row",
     alignItems: "center",
     gap: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 15,
-    minHeight: 76,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    minHeight: 60,
+    borderRadius: radii.control,
   },
-  workspaceIcon: {
-    width: 34,
-    height: 34,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.background,
+  workspaceTitle: {
+    fontFamily,
+    color: colors.bright,
+    fontSize: 16,
+    fontWeight: "500",
+    lineHeight: 22,
   },
-  workspaceTitle: { color: colors.bright, fontSize: 16, fontWeight: "500", lineHeight: 22 },
-  separator: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border },
   empty: { paddingVertical: 24, gap: 14, alignItems: "center" },
 });

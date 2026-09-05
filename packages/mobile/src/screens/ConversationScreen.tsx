@@ -28,7 +28,7 @@ import { linkedAbortController } from "../useConnection";
 import { resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
-import { colors, layout, radii, spacing, typography } from "../theme";
+import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
 import { formatModelDisplayName } from "../../../../src/common/utils/ai/modelDisplay";
 import { DEFAULT_THINKING_LEVEL } from "../../../../src/common/types/thinking";
 
@@ -160,16 +160,17 @@ export function ConversationScreen(props: {
         <IconButton
           label="Back to workspaces"
           icon={ChevronLeft}
-          color={colors.accent}
+          color={colors.text}
           onPress={props.onBack}
         />
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={styles.title} numberOfLines={1}>
             {props.workspace.title ?? props.workspace.name}
           </Text>
-          <Text style={[layout.muted, typography.footnote]} numberOfLines={1}>
-            {props.workspace.kind === "scratch" ? "Scratch chat" : props.workspace.name} ·{" "}
-            {props.workspace.runtimeConfig.type}
+          <Text style={styles.subtitle} numberOfLines={1}>
+            {props.workspace.kind === "scratch"
+              ? "Scratch chat"
+              : `${props.workspace.projectName} / ${props.workspace.name}`}
           </Text>
         </View>
         <IconButton
@@ -286,56 +287,51 @@ export function ConversationScreen(props: {
             style={[styles.input, Platform.OS === "web" ? webInputSizing : { height: inputHeight }]}
             selectionColor={colors.accent}
           />
-          <View
-            style={[
-              styles.send,
-              ready &&
-                (running || Boolean(draft.trim())) && {
-                  backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
-                },
-            ]}
-          >
-            <IconButton
-              label={running ? "Interrupt agent" : "Send message"}
-              icon={running ? Square : ArrowUp}
-              color={ready && (running || Boolean(draft.trim())) ? colors.bright : colors.muted}
-              disabled={!ready || busy || (!running && (!draft.trim() || !options?.model))}
-              onPress={running ? interrupt : send}
-            />
-          </View>
-        </View>
-        <View style={styles.composerToolbar}>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel="Choose model, agent, and thinking"
-            accessibilityState={{ disabled: !settings || !options }}
-            disabled={!settings || !options}
-            onPress={() => setShowSettings(true)}
-            style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
-          >
+          <View style={styles.composerToolbar}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Choose model, agent, and thinking"
+              accessibilityState={{ disabled: !settings || !options }}
+              disabled={!settings || !options}
+              onPress={() => setShowSettings(true)}
+              style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
+            >
+              <View
+                style={[
+                  styles.modeDot,
+                  { backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent },
+                ]}
+              />
+              <Text numberOfLines={1} style={styles.modelLabel}>
+                {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Agent"}
+                <Text style={{ color: colors.muted, fontWeight: "400" }}>
+                  {" "}
+                  ·{" "}
+                  {options?.model
+                    ? formatModelDisplayName(options.model.slice(options.model.indexOf(":") + 1))
+                    : "Choose model"}
+                </Text>
+              </Text>
+              <ChevronDown size={14} color={colors.muted} />
+            </Pressable>
             <View
               style={[
-                styles.modeDot,
-                { backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent },
+                styles.send,
+                ready &&
+                  (running || Boolean(draft.trim())) && {
+                    backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
+                  },
               ]}
-            />
-            <Text numberOfLines={1} style={styles.modelLabel}>
-              {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Agent"}
-              <Text style={{ color: colors.muted, fontWeight: "400" }}>
-                {" "}
-                ·{" "}
-                {options?.model
-                  ? formatModelDisplayName(options.model.slice(options.model.indexOf(":") + 1))
-                  : "Choose model"}
-              </Text>
-            </Text>
-            <ChevronDown size={14} color={colors.muted} />
-          </Pressable>
-          {running && (
-            <Text accessibilityLiveRegion="polite" style={styles.activity}>
-              Working
-            </Text>
-          )}
+            >
+              <IconButton
+                label={running ? "Interrupt agent" : "Send message"}
+                icon={running ? Square : ArrowUp}
+                color={ready && (running || Boolean(draft.trim())) ? colors.bright : colors.muted}
+                disabled={!ready || busy || (!running && (!draft.trim() || !options?.model))}
+                onPress={running ? interrupt : send}
+              />
+            </View>
+          </View>
         </View>
       </View>
       {showSettings && settings && options && (
@@ -361,13 +357,12 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 4,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
   },
-  title: { color: colors.bright, fontSize: 17, lineHeight: 22, fontWeight: "600" },
+  title: { ...typography.header, color: colors.bright, textAlign: "center", fontSize: 16 },
+  subtitle: { ...typography.footnote, color: colors.muted, textAlign: "center", fontSize: 12 },
   messages: {
     paddingHorizontal: spacing.xl,
-    paddingTop: 12,
+    paddingTop: 20,
     paddingBottom: spacing.xl,
     width: "100%",
     maxWidth: 760,
@@ -382,10 +377,17 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     gap: 8,
   },
-  emptyTitle: { color: colors.bright, fontSize: 22, fontWeight: "600", letterSpacing: -0.4 },
+  emptyTitle: {
+    fontFamily,
+    color: colors.bright,
+    fontSize: 22,
+    fontWeight: "600",
+    letterSpacing: -0.4,
+  },
   composerWrap: {
-    paddingHorizontal: spacing.lg,
+    paddingHorizontal: spacing.md,
     paddingTop: 8,
+    paddingBottom: 8,
     width: "100%",
     maxWidth: 760,
     alignSelf: "center",
@@ -393,16 +395,14 @@ const styles = StyleSheet.create({
     backgroundColor: colors.background,
   },
   composer: {
-    flexDirection: "row",
-    alignItems: "flex-end",
     borderRadius: radii.sheet,
-    padding: 4,
+    padding: 6,
     backgroundColor: colors.panel,
     borderColor: colors.border,
     borderWidth: StyleSheet.hairlineWidth,
   },
   input: {
-    flex: 1,
+    fontFamily,
     minWidth: 0,
     color: colors.bright,
     fontSize: 16,
@@ -411,13 +411,14 @@ const styles = StyleSheet.create({
     maxHeight: 132,
     textAlignVertical: "top",
     paddingVertical: 10,
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
   },
   composerToolbar: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingBottom: 2,
+    paddingHorizontal: 4,
+    gap: 8,
   },
   modelButton: {
     minHeight: 44,
@@ -428,8 +429,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
   },
   modeDot: { width: 6, height: 6, borderRadius: 3 },
-  modelLabel: { color: colors.text, fontSize: 13, fontWeight: "500", flexShrink: 1 },
-  activity: { color: colors.muted, fontSize: 12, marginLeft: 8 },
+  modelLabel: { fontFamily, color: colors.text, fontSize: 13, fontWeight: "500", flexShrink: 1 },
   send: { borderRadius: 22, overflow: "hidden", backgroundColor: colors.elevated },
   latest: {
     position: "absolute",

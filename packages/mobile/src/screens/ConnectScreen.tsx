@@ -107,7 +107,7 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
             <Loading label="Reading saved connection…" />
           ) : (
             <>
-              <View style={[layout.group, styles.fields]}>
+              <View style={styles.fields}>
                 <Field
                   label="Server URL"
                   placeholder="https://xum.example.com"
@@ -186,5 +186,5 @@ const styles = StyleSheet.create({
     letterSpacing: -1,
     marginBottom: spacing.lg,
   },
-  fields: { padding: spacing.lg, gap: spacing.xl },
+  fields: { gap: spacing.xl },
 });

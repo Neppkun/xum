@@ -59,6 +59,13 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
     await page.getByRole("button", { name: "Back", exact: true }).click();
     await withinViewport(page, apply);
     await page.getByRole("button", { name: "Plan", exact: true }).click();
+    const thinking = page.getByRole("button", { name: "Thinking effort", exact: true });
+    await expect(page.getByRole("button", { name: "High", exact: true })).not.toBeVisible();
+    await thinking.click();
+    await page.getByRole("button", { name: "High", exact: true }).click();
+    await thinking.click();
+    await expect(thinking).toContainText("High");
+    await withinViewport(page, apply);
     await apply.click();
     await expect(page.getByRole("textbox", { name: "Message", exact: true })).toHaveValue(draft);
     await expect(

@@ -157,7 +157,11 @@ export function Header(props: {
 }) {
   return (
     <View style={styles.header}>
-      {props.onBack && <IconButton label="Back" icon={ChevronLeft} onPress={props.onBack} />}
+      {props.onBack ? (
+        <IconButton label="Back" icon={ChevronLeft} onPress={props.onBack} />
+      ) : (
+        <View style={{ width: 44 }} />
+      )}
       <View style={{ flex: 1, minWidth: 0 }}>
         <Text numberOfLines={1} style={styles.headerTitle}>
           {props.title}
@@ -168,7 +172,7 @@ export function Header(props: {
           </Text>
         )}
       </View>
-      {props.trailing}
+      {props.trailing ?? <View style={{ width: 44 }} />}
     </View>
   );
 }
@@ -302,7 +306,7 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.border,
     borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  headerTitle: { ...typography.header, color: colors.bright },
+  headerTitle: { ...typography.header, color: colors.bright, textAlign: "center" },
   webOverlay: { flex: 1, justifyContent: "flex-end", alignItems: "center" },
   scrim: { ...StyleSheet.absoluteFill, backgroundColor: colors.scrim },
   webSheet: {

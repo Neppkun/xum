@@ -28,6 +28,7 @@ export function ModelSettings(props: {
   const [query, setQuery] = useState("");
   const [browsing, setBrowsing] = useState(false);
   const [custom, setCustom] = useState(false);
+  const [showThinking, setShowThinking] = useState(false);
   const agents = props.data.agents.filter((agent) => agent.uiSelectable);
   const models = modelChoices(props.data, value.model).filter((model) =>
     `${model} ${modelName(model)}`.toLowerCase().includes(query.trim().toLowerCase())
@@ -97,25 +98,47 @@ export function ModelSettings(props: {
             </Pressable>
           </View>
           <View style={styles.section}>
-            <Text style={layout.label}>Thinking</Text>
-            <View style={styles.chips}>
-              <Option
-                label="Default"
-                selected={value.thinkingLevel == null}
-                onPress={() => setValue({ ...value, thinkingLevel: undefined })}
-              />
-              {thinkingLevels.map((level) => (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Thinking effort"
+              accessibilityState={{ expanded: showThinking }}
+              onPress={() => setShowThinking(!showThinking)}
+              style={[layout.group, styles.modelRow]}
+            >
+              <Text style={[layout.text, { flex: 1 }]}>Thinking</Text>
+              <Text style={styles.footnote}>
+                {value.thinkingLevel
+                  ? value.thinkingLevel[0].toUpperCase() + value.thinkingLevel.slice(1)
+                  : "Default"}
+              </Text>
+              {showThinking ? (
+                <ChevronDown size={18} color={colors.muted} />
+              ) : (
+                <ChevronRight size={18} color={colors.muted} />
+              )}
+            </Pressable>
+            {showThinking && (
+              <View style={styles.chips}>
                 <Option
-                  key={level}
-                  label={level[0].toUpperCase() + level.slice(1)}
-                  selected={value.thinkingLevel === level}
-                  onPress={() => setValue({ ...value, thinkingLevel: level })}
+                  label="Default"
+                  selected={value.thinkingLevel == null}
+                  onPress={() => setValue({ ...value, thinkingLevel: undefined })}
                 />
-              ))}
-            </View>
-            <Text style={styles.footnote}>
-              Applies to your next message. Model capabilities are checked by your server.
-            </Text>
+                {thinkingLevels.map((level) => (
+                  <Option
+                    key={level}
+                    label={level[0].toUpperCase() + level.slice(1)}
+                    selected={value.thinkingLevel === level}
+                    onPress={() => setValue({ ...value, thinkingLevel: level })}
+                  />
+                ))}
+              </View>
+            )}
+            {showThinking && (
+              <Text style={styles.footnote}>
+                Applies to your next message. Model capabilities are checked by your server.
+              </Text>
+            )}
           </View>
         </>
       )}
@@ -243,8 +266,8 @@ const styles = StyleSheet.create({
     gap: spacing.xs,
   },
   modelRow: {
-    minHeight: 64,
-    padding: spacing.lg,
+    minHeight: 56,
+    padding: spacing.md,
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.md,

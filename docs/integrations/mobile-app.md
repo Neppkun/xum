@@ -5,7 +5,7 @@ description: Develop the React Native Xum companion and connect it to your serve
 
 The experimental mobile companion lives in `packages/mobile`. It uses native React Native views, with React Native Web for browser development—not an embedded copy of the desktop website.
 
-It connects to your existing Xum server for projects, workspace creation, conversations, agent/model selection, and read-only changes. On phones, a searchable workspace list opens conversations in a native navigation stack; wider screens keep the workspace sidebar visible. Drafts and unsent model choices survive returning to the list. Creation and model settings use sheets with pinned actions. Provider configuration, terminal/desktop access, and advanced administration remain in the main Xum app.
+It connects to your existing Xum server for projects, workspace creation, conversations, agent/model selection, and read-only changes. On phones, a searchable workspace list opens conversations in a native navigation stack; wider screens keep the workspace sidebar visible. Drafts and unsent model choices survive returning to the list. Creation and model settings use sheets with pinned actions. Tool activity stays compact in the conversation; tap a tool to inspect its input, output, and status. Expand Thinking in conversation settings to adjust reasoning effort. Provider configuration, terminal/desktop access, and advanced administration remain in the main Xum app.
 
 ## Connect to a server
 
