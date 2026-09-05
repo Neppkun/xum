@@ -161,12 +161,11 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
               </Button>
             </>
           )}
+          {/* The web build previews native UX; storage differences belong in developer docs. */}
           <View style={[layout.row, { alignItems: "flex-start" }]}>
             <ShieldCheck color={colors.muted} size={16} />
             <Text style={[typography.footnote, { color: colors.muted, flex: 1 }]}>
-              {Platform.OS === "web"
-                ? "Your token stays in this tab. It is never saved in browser storage."
-                : "Your connection is saved securely on this device."}
+              Your token authenticates this app with your Xum server.
             </Text>
           </View>
         </View>
