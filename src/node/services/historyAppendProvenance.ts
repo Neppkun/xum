@@ -97,7 +97,11 @@ export class HistoryAppendProvenance {
     let handle: fs.FileHandle | undefined;
     let bytesRead = 0;
     try {
-      handle = await fs.open(this.receiptPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      // Reject special files without blocking on a FIFO before the descriptor check below.
+      handle = await fs.open(
+        this.receiptPath,
+        constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0)
+      );
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size > HISTORY_PROVENANCE_MAX_RECEIPT_BYTES)
         return { receipt: null, bytesRead };

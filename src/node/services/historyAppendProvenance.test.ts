@@ -122,6 +122,27 @@ describe("history append provenance", () => {
     expect((await empty.read()).receipt?.files).toEqual({ chat: null, archive: null });
   });
 
+  test.skipIf(process.platform === "win32")(
+    "a FIFO receipt cannot block history reads or writes",
+    async () => {
+      const cursor = await startCursor();
+      await fs.rm(store.receiptPath);
+      const fifo = spawnSync("mkfifo", [store.receiptPath], { encoding: "utf8" });
+      expect(fifo.status).toBe(0);
+      // Bound a regression's blocking open in a child so it cannot wedge the test runner.
+      child(`
+const provenance = new HistoryAppendProvenance(${JSON.stringify(store.sessionDir)});
+if ((await provenance.read()).receipt !== null) throw new Error("FIFO was trusted");
+const result = await service.appendToHistory(ws, createMuxMessage("after-fifo", "assistant", "still writable"));
+if (!result.success) throw new Error(result.error);
+`);
+      expect((await fs.lstat(store.receiptPath)).isFile()).toBe(true);
+      expect((await store.read()).receipt?.state).toBe("stable");
+      await assertStale(cursor);
+    },
+    30_000
+  );
+
   test("receipt symlinks are not trusted or followed when reconciling", async () => {
     if (process.platform === "win32") return;
     const cursor = await startCursor();
