@@ -249,6 +249,33 @@ describe("session_history real disk recovery", () => {
     }
   );
 
+  test("archived fork keeps an unterminated target separate from retained active reset fragments", async () => {
+    const target = await append("unterminated-target", "retained target facts");
+    await append("later-boundary", "public summary", {
+      compacted: true,
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const archived = await fs.readFile(archivePath);
+    expect(archived.at(-1)).toBe(10);
+    await fs.writeFile(archivePath, archived.subarray(0, -1));
+    await fs.writeFile(chatPath, '{"metadata":{"contextBoundaryKind":"reset"},broken\n');
+    expect(
+      (
+        await fixture.historyService.truncateAfterMessage(workspaceId, target.id, {
+          keepTargetMessage: true,
+        })
+      ).success
+    ).toBe(true);
+    const retained = await fixture.historyService.getLastMessages(workspaceId, 10);
+    expect(retained.success).toBe(true);
+    if (!retained.success) throw new Error(retained.error);
+    expect(retained.data.map((row) => row.id)).toContain(target.id);
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
   test("partial percentage truncation keeps an archive containing only unreadable reset fragments", async () => {
     await append("manual-reset", "", { contextBoundaryKind: "reset" });
     const reset = Buffer.from(' {\n"contextBoundaryKind"\n:\n"reset"\n}\n');

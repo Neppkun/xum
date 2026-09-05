@@ -3293,6 +3293,12 @@ export class HistoryService {
       // The removed tail spans the archive remainder plus the whole active epoch.
       const removedMessages = [...archiveMessages.slice(cutIndex), ...activeEpochMessages];
 
+      // The files were separate JSONL streams. Do not glue an unterminated kept
+      // archive row to a preserved active reset fragment when collapsing them.
+      const lastArchiveRow = archiveRows.at(-1);
+      if (lastArchiveRow && lastArchiveRow.raw.at(-1) !== 10 && activeEpochRows.length > 0) {
+        archiveRows.push({ raw: Buffer.from("\n"), message: undefined });
+      }
       await this.rewriteHistoryFilesUnlocked(
         workspaceId,
         null,
