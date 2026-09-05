@@ -1,12 +1,26 @@
+import { createORPCClient } from "@orpc/client";
+import type { Client, ClientContext } from "@orpc/client";
+import type { AnySchema, InferSchemaInput, InferSchemaOutput } from "@orpc/contract";
 import { RPCLink } from "@orpc/client/websocket";
-import { createClient } from "../../../src/common/orpc/client";
+import type * as schemas from "../../../src/common/orpc/schemas/api";
 import { normalizeEndpoint } from "./endpoint";
 
-export type MobileClient = ReturnType<typeof createClient>;
+// Infer the wire contract without importing the Node router's implementation
+// graph into a native TypeScript program (Expo and Node declare different globals).
+type SchemaClient<T> = T extends {
+  input: infer I extends AnySchema;
+  output: infer O extends AnySchema;
+}
+  ? Client<ClientContext, InferSchemaInput<I>, InferSchemaOutput<O>, Error>
+  : { [K in keyof T]: SchemaClient<T[K]> };
+export type MobileClient = SchemaClient<
+  Pick<typeof schemas, "projects" | "workspace" | "providers" | "agents" | "config">
+>;
 export interface MobileConnection {
   client: MobileClient;
   endpoint: string;
   close: () => void;
+  reconnect: (options?: { signal?: AbortSignal }) => Promise<MobileConnection>;
 }
 
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -62,7 +76,7 @@ export async function connect(
   }, CONNECT_TIMEOUT_MS);
 
   try {
-    const client = createClient(
+    const client = createORPCClient<MobileClient>(
       new RPCLink({
         connect: () => {
           if (closed) throw new Error("Connection closed.");
@@ -82,7 +96,12 @@ export async function connect(
     // An open handshake alone does not prove RPC authentication succeeded.
     await client.workspace.list(undefined, { signal: probe.signal });
     if (closed) throw new Error("Connection closed.");
-    return { client, close, endpoint: normalized };
+    return {
+      client,
+      close,
+      endpoint: normalized,
+      reconnect: (options) => connect(normalized, token, options),
+    };
   } catch {
     close();
     if (options.signal?.aborted) throw new Error("Connection cancelled.");

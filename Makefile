@@ -588,6 +588,55 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 	@# Storybook story transitions can exceed Jest's default 15s timeout on loaded CI runners.
 	@bun x test-storybook --testTimeout 30000
 
+## React Native companion (isolated Expo dependency graph)
+MOBILE_METRO_PORT ?= 8081
+
+.PHONY: mobile-install mobile-web mobile-native mobile-preview mobile-export mobile-export-ios mobile-typecheck mobile-test mobile-lint mobile-fmt mobile-check
+mobile-install: packages/mobile/node_modules/.installed ## Install pinned mobile dependencies
+
+packages/mobile/node_modules/.installed: packages/mobile/package.json packages/mobile/bun.lock
+	@cd packages/mobile && bun install --frozen-lockfile
+	@touch $@
+
+# Node owns the preview's WebSocket upgrades; Bun's node:http compatibility can
+# accept the upgrade but stall forwarding oRPC frames.
+packages/mobile/.expo/preview.mjs: packages/mobile/scripts/preview.ts packages/mobile/src/endpoint.ts packages/mobile/node_modules/.installed
+	@mkdir -p packages/mobile/.expo
+	@bun build packages/mobile/scripts/preview.ts --target=node --format=esm --packages=external --outfile=$@
+
+mobile-web: mobile-install packages/mobile/.expo/preview.mjs ## Run RN Web + fixed-target proxy (set XUM_MOBILE_ENDPOINT)
+	@test -n "$$XUM_MOBILE_ENDPOINT" || (echo 'Set XUM_MOBILE_ENDPOINT to your Xum server URL'; exit 1)
+	@XUM_MOBILE_METRO=http://127.0.0.1:$(MOBILE_METRO_PORT) bun x concurrently -k \
+		"cd packages/mobile && BROWSER=none bun x expo start --web --port $(MOBILE_METRO_PORT)" \
+		"node packages/mobile/.expo/preview.mjs"
+
+mobile-native: mobile-install ## Start Expo for a native device or simulator
+	@cd packages/mobile && bun x expo start --port $(MOBILE_METRO_PORT)
+
+mobile-preview: mobile-install packages/mobile/.expo/preview.mjs ## Serve exported RN Web through the fixed-target proxy
+	@XUM_MOBILE_STATIC_DIR=$(CURDIR)/packages/mobile/dist node packages/mobile/.expo/preview.mjs
+
+mobile-export: mobile-install ## Export production React Native Web
+	@cd packages/mobile && bun x expo export --platform web
+
+mobile-export-ios: mobile-install ## Compile the iOS JS bundle (not a native simulator build)
+	@cd packages/mobile && bun x expo export --platform ios --output-dir dist-ios
+
+mobile-typecheck: mobile-install ## Typecheck the mobile app against shared Xum contracts
+	@cd packages/mobile && bun x tsc --noEmit
+
+mobile-test: mobile-install packages/mobile/.expo/preview.mjs ## Test mobile protocol, transcript, and preview safety
+	@cd packages/mobile && bun test src scripts
+
+mobile-lint: mobile-install ## Lint native components and mobile infrastructure
+	@cd packages/mobile && ../../node_modules/.bin/eslint . --max-warnings 0
+
+mobile-fmt: ## Format mobile source and configuration
+	@cd packages/mobile && ../../node_modules/.bin/prettier --write '**/*.{ts,tsx,json,mjs,cjs}'
+
+mobile-check: mobile-typecheck mobile-test mobile-lint ## Run mobile validation independently of desktop dependencies
+	@cd packages/mobile && ../../node_modules/.bin/prettier --check '**/*.{ts,tsx,json,mjs,cjs}'
+
 ## Benchmarks
 benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
 	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.

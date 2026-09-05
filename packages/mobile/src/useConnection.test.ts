@@ -1,7 +1,8 @@
-import "../../../tests/ui/dom";
+import "./testDom";
 import { afterEach, describe, expect, test } from "bun:test";
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { createClient } from "../../../src/common/orpc/client";
+import { createORPCClient } from "@orpc/client";
+import type { MobileClient } from "./api";
 import type { Connection } from "./screens/ConnectScreen";
 import { linkedAbortController, useConnection } from "./useConnection";
 
@@ -20,7 +21,7 @@ function resource(replacement: Promise<Connection>) {
   const attempts: AbortSignal[] = [];
   const connection: Connection = {
     endpoint: "https://server.example",
-    client: createClient({
+    client: createORPCClient<MobileClient>({
       call: async () => {
         throw new Error("No RPC expected in connection lifecycle test");
       },
