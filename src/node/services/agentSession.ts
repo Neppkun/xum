@@ -190,6 +190,7 @@ import {
   isProviderConfigFixableError,
 } from "@/common/utils/messages/retryEligibility";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
+import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
@@ -4901,7 +4902,6 @@ export class AgentSession {
           },
         };
       });
-      continuation.metadata!.requestPreludeMessageIds = requestPrelude.map((row) => row.id);
       await this.applyContextResetSideEffects();
       if (
         this.activeStreamContext !== context ||
@@ -4925,6 +4925,10 @@ export class AgentSession {
           { ...snapshot, id: createAgentSkillSnapshotMessageId(), metadata: snapshotMetadata },
         ];
       });
+      // The retry owns deduped skill copies too: a terminal rejection must quarantine them.
+      continuation.metadata!.requestPreludeMessageIds = [...skillSnapshots, ...requestPrelude].map(
+        (row) => row.id
+      );
       const rows = [
         ...createRolloverPrefix(rollover),
         ...skillSnapshots,
@@ -4982,7 +4986,30 @@ export class AgentSession {
     // while the final assembled-request preflight still enforces the hard limit.
     const tokenCount = (value: unknown): number | undefined =>
       isNonNegativeInteger(value) && Number.isSafeInteger(value) ? value : undefined;
-    const usage = this.lastUsageState?.lastContextUsage;
+    const persistedUsage: AiSdkUsageLike | undefined = lastAssistant?.metadata?.contextUsage;
+    const persistedProviderMetadata =
+      lastAssistant?.metadata?.contextProviderMetadata ?? lastAssistant?.metadata?.providerMetadata;
+    const persistedCacheWrite = (
+      persistedProviderMetadata?.anthropic as { cacheCreationInputTokens?: unknown } | undefined
+    )?.cacheCreationInputTokens;
+    // A best-effort restart seed may be absent. Validate before display conversion:
+    // SDK input is cache-inclusive, so adding raw cache counters would count them twice.
+    const usage =
+      this.lastUsageState?.lastContextUsage ??
+      createDisplayUsage(
+        {
+          inputTokens: tokenCount(persistedUsage?.inputTokens),
+          cachedInputTokens:
+            tokenCount(persistedUsage?.cachedInputTokens) ??
+            tokenCount(persistedUsage?.inputTokenDetails?.cacheReadTokens),
+          inputTokenDetails: {
+            cacheWriteTokens:
+              tokenCount(persistedCacheWrite) ??
+              tokenCount(persistedUsage?.inputTokenDetails?.cacheWriteTokens),
+          },
+        },
+        options.model
+      );
     const contextTokens =
       (tokenCount(usage?.input.tokens) ?? 0) +
       (tokenCount(usage?.cached.tokens) ?? 0) +

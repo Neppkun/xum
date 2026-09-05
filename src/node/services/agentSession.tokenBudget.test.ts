@@ -393,6 +393,155 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test("a rejected emergency retry quarantines its copied deduplicated skill snapshot", async () => {
+    const first = await setup();
+    const skillName = "owned-retry-skill";
+    const skillDir = path.join(first.config.rootDir, ".xum", "skills", skillName);
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      `---\nname: ${skillName}\ndescription: Skill ownership regression\n---\nAccepted skill instructions.\n`
+    );
+    const skillOptions: SendMessageOptions = {
+      ...options,
+      muxMetadata: {
+        type: "agent-skill",
+        rawCommand: `/${skillName}`,
+        skillName,
+        scope: "project",
+      },
+    };
+    expect((await first.session.sendMessage("Use the skill", skillOptions)).success).toBe(true);
+    first.session.dispose();
+    const h = await setup({
+      previous: first,
+      failure: (attempt) => (attempt <= 2 ? exceeded : undefined),
+    });
+    await seedHistory(h, 20_000);
+    expect(
+      await h.session.sendMessage("Use the unchanged skill again", skillOptions)
+    ).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+    expect(h.requests).toHaveLength(2);
+    const rows = await allRows(h);
+    const snapshots = rows.filter(
+      (row) => row.metadata?.agentSkillSnapshot?.skillName === skillName
+    );
+    expect(snapshots).toHaveLength(2);
+    expect(snapshots[1].metadata?.agentSkillSnapshot?.sha256).toBe(
+      snapshots[0].metadata?.agentSkillSnapshot?.sha256
+    );
+    const rejected = rows.findLast(
+      (row) => row.metadata?.contextBudgetRejected && text(row) === "Use the unchanged skill again"
+    )!;
+    expect(rejected.metadata?.requestPreludeMessageIds).toContain(snapshots[1].id);
+    expect(snapshots[1].metadata?.contextBudgetRejected).toBe(true);
+    expect((await h.session.sendMessage("A new unrelated request", options)).success).toBe(true);
+    const next = prepareProviderRequestMessages(
+      h.requests[2].messages,
+      "openai",
+      "off"
+    ).providerRequestMessages;
+    expect(next.some((row) => row.metadata?.agentSkillSnapshot?.skillName === skillName)).toBe(
+      false
+    );
+  });
+
+  test.each([
+    { name: "input only", usage: { inputTokens: 110_000 }, cacheWrite: 0, rollover: true },
+    {
+      name: "cached floor",
+      usage: { inputTokens: 1000, cachedInputTokens: 70_000 },
+      cacheWrite: 40_000,
+      rollover: true,
+    },
+    {
+      name: "inclusive input",
+      usage: { inputTokens: 80_000, cachedInputTokens: 60_000 },
+      cacheWrite: 15_000,
+      rollover: false,
+    },
+    {
+      name: "invalid cache",
+      usage: { inputTokens: 110_000, cachedInputTokens: "bad" },
+      cacheWrite: {},
+      rollover: true,
+    },
+    {
+      name: "invalid input",
+      usage: { inputTokens: "bad", cachedInputTokens: 100_000 },
+      cacheWrite: 0,
+      rollover: true,
+    },
+    {
+      name: "invalid counters",
+      usage: { inputTokens: {}, cachedInputTokens: -1 },
+      cacheWrite: 1e100,
+      rollover: false,
+    },
+  ])(
+    "restart budget fallback preserves valid persisted counters: $name",
+    async ({ usage, cacheWrite, rollover }) => {
+      const first = await setup();
+      expect(
+        (
+          await first.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("old-user", "user", "Previous request"),
+            createMuxMessage("first-answer", "assistant", "First response", {
+              contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
+            }),
+          ])
+        ).success
+      ).toBe(true);
+      // Model metadata is optional: the best-effort usage seeder cannot initialize
+      // these rows, but their validated counters still describe the active window.
+      const latest = createMuxMessage("persisted-answer", "assistant", "Preserved response", {
+        historySequence: 2,
+      });
+      await fs.appendFile(
+        path.join(first.config.sessionsDir, workspaceId, "chat.jsonl"),
+        JSON.stringify({
+          ...latest,
+          metadata: {
+            ...latest.metadata,
+            contextUsage: usage,
+            contextProviderMetadata: { anthropic: { cacheCreationInputTokens: cacheWrite } },
+          },
+        }) + "\n"
+      );
+      first.session.dispose();
+      const h = await setup({ previous: first });
+      expect(
+        (h.session as unknown as { getUsageState(): unknown }).getUsageState()
+      ).toBeUndefined();
+      expect((await h.session.sendMessage("Continue after restart", options)).success).toBe(true);
+      const rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(rollover ? 1 : 0);
+      expect(rows.find((row) => row.id === latest.id)?.parts).toEqual(latest.parts);
+      const sent = sliceMessagesForProviderFromLatestContextBoundary(h.requests[0].messages);
+      expect(sent.some((row) => row.id === latest.id)).toBe(!rollover);
+    }
+  );
+
+  test.each([0, 20_000, 110_000])(
+    "valid in-memory usage takes precedence over persisted usage (%d tokens)",
+    async (inputTokens) => {
+      const h = await setup();
+      await seedHistory(h, inputTokens === 110_000 ? 20_000 : 110_000);
+      const session = h.session as unknown as {
+        updateUsageStateFromModelUsage(
+          input: Pick<SettledStepBudget, "model" | "usage"> & { live: boolean }
+        ): void;
+      };
+      session.updateUsageStateFromModelUsage({
+        model,
+        usage: { inputTokens, outputTokens: 0, totalTokens: inputTokens },
+        live: false,
+      });
+      expect((await h.session.sendMessage("Use current counters", options)).success).toBe(true);
+      expect(rolloverRows(await allRows(h))).toHaveLength(inputTokens === 110_000 ? 1 : 0);
+    }
+  );
+
   test("restart recomputes pending rollover including a giant final tool result", async () => {
     const first = await setup();
     await seedHistory(first, 30_000, 300_000);
