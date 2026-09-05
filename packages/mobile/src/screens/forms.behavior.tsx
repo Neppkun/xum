@@ -1,7 +1,7 @@
 import "./formTestPlatform";
 import { afterEach, expect, test } from "bun:test";
-import { createRef } from "react";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { createRef, useState } from "react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
 import { View } from "react-native";
 import type { TextInput } from "react-native";
@@ -146,37 +146,144 @@ test("workspace creation cannot be dismissed or submitted twice while the server
   expect(selected).toBe(workspace);
 });
 
-test("model search accepts friendly names and returning preserves the selection", async () => {
-  const data: SettingsData = {
-    config: { agentAiDefaults: {}, defaultModel: "anthropic:claude-sonnet-4-5" },
-    providers: { anthropic: { isConfigured: true, isEnabled: true, apiKeySet: true } },
-    agents: [
-      { id: "exec", name: "Exec", scope: "built-in", uiSelectable: true, subagentRunnable: true },
-    ],
-  };
-  let saved: ChatSettings | undefined;
-  const view = render(
+const pickerValue: ChatSettings = { agentId: "exec", model: "local:one", thinkingLevel: "high" };
+const pickerData: SettingsData = {
+  config: { agentAiDefaults: {}, defaultModel: "local:one" },
+  providers: {
+    local: {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: true,
+      models: ["one", "two", "three", "four", "five"],
+    },
+  },
+  agents: [
+    { id: "exec", name: "Exec", scope: "built-in", uiSelectable: true, subagentRunnable: true },
+    {
+      id: "plan",
+      name: "Plan",
+      description: "Plan before making changes",
+      scope: "built-in",
+      uiSelectable: true,
+      subagentRunnable: true,
+      aiDefaults: { model: "local:other" },
+    },
+  ],
+};
+function PickerHarness(props: {
+  page?: "model" | "agent";
+  onChange: (value: ChatSettings) => void;
+  onClose: () => void;
+}) {
+  const [value, setValue] = useState(pickerValue);
+  return (
     <ModelSettings
+      initialPage={props.page ?? "model"}
+      value={value}
+      data={pickerData}
       workspace={workspace}
-      data={data}
-      value={{ agentId: "exec", model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" }}
-      onClose={() => {}}
-      onSave={(value) => {
-        saved = value;
+      onChange={(next) => {
+        setValue(next);
+        props.onChange(next);
+      }}
+      onClose={props.onClose}
+    />
+  );
+}
+
+test("model picks apply directly while keeping mode and effort", () => {
+  const changes: ChatSettings[] = [];
+  let closed = 0;
+  const view = render(
+    <PickerHarness
+      onChange={(value) => changes.push(value)}
+      onClose={() => {
+        closed++;
       }}
     />
   );
-  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
-  fireEvent.change(view.getByLabelText("Search models"), { target: { value: "Sonnet 4.5" } });
-  await waitFor(() =>
-    expect(view.getByRole("button", { name: "anthropic:claude-sonnet-4-5" })).toBeDefined()
+  expect(view.getByRole("radio", { name: "local:one" }).getAttribute("aria-checked")).toBe("true");
+  expect(view.queryByRole("radio", { name: "local:five" })).toBeNull();
+  fireEvent.click(view.getByRole("radio", { name: "local:two" }));
+  expect(changes).toEqual([{ ...pickerValue, model: "local:two" }]);
+  expect(closed).toBe(1);
+});
+
+test("changing effort returns to the model picker and closing retains the immediate choice", () => {
+  const changes: ChatSettings[] = [];
+  let closed = 0;
+  const view = render(
+    <PickerHarness
+      onChange={(value) => changes.push(value)}
+      onClose={() => {
+        closed++;
+      }}
+    />
   );
-  fireEvent.change(view.getByLabelText("Search models"), { target: { value: "not-a-model" } });
-  expect(view.queryByRole("button", { name: "anthropic:claude-sonnet-4-5" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Effort High" }));
+  fireEvent.click(view.getByRole("radio", { name: "Low" }));
+  expect(changes).toEqual([{ ...pickerValue, thinkingLevel: "low" }]);
+  expect(closed).toBe(0);
+  expect(view.getByRole("button", { name: "Effort Low" })).toBeDefined();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  expect(closed).toBe(1);
+});
+
+test("mode selection preserves an explicit model and effort rather than resetting to agent defaults", () => {
+  const changes: ChatSettings[] = [];
+  let closed = 0;
+  const view = render(
+    <PickerHarness
+      page="agent"
+      onChange={(value) => changes.push(value)}
+      onClose={() => {
+        closed++;
+      }}
+    />
+  );
+  fireEvent.click(view.getByRole("radio", { name: /Plan/ }));
+  expect(changes).toEqual([{ ...pickerValue, agentId: "plan" }]);
+  expect(closed).toBe(1);
+});
+
+test("closing catalog search does not change the selection and all models remain searchable", () => {
+  const changes: ChatSettings[] = [];
+  const view = render(
+    <PickerHarness onChange={(value) => changes.push(value)} onClose={() => {}} />
+  );
+  fireEvent.click(view.getByRole("button", { name: "More models" }));
+  fireEvent.change(view.getByLabelText("Search models"), { target: { value: "FIVE" } });
+  expect(view.getByRole("radio", { name: "local:five" })).toBeDefined();
+  expect(view.queryByRole("radio", { name: "local:one" })).toBeNull();
   fireEvent.click(view.getByRole("button", { name: "Back" }));
-  fireEvent.click(view.getByRole("button", { name: "Use settings" }));
-  expect(saved?.model).toBe("anthropic:claude-sonnet-4-5");
-  expect(saved?.thinkingLevel).toBe("high");
+  expect(changes).toHaveLength(0);
+  expect(view.getByRole("radio", { name: "local:one" }).getAttribute("aria-checked")).toBe("true");
+});
+
+test("custom model drafts require valid input and explicit confirmation", () => {
+  const changes: ChatSettings[] = [];
+  let closed = 0;
+  const view = render(
+    <PickerHarness
+      onChange={(value) => changes.push(value)}
+      onClose={() => {
+        closed++;
+      }}
+    />
+  );
+  fireEvent.click(view.getByRole("button", { name: "More models" }));
+  fireEvent.click(view.getByRole("button", { name: "Custom model" }));
+  fireEvent.change(view.getByLabelText("Model ID"), { target: { value: "missing-provider" } });
+  fireEvent.click(view.getByRole("button", { name: "Use custom model" }));
+  expect(changes).toHaveLength(0);
+  fireEvent.click(view.getByRole("button", { name: "Back" }));
+  expect(changes).toHaveLength(0);
+  fireEvent.click(view.getByRole("button", { name: "Custom model" }));
+  fireEvent.change(view.getByLabelText("Model ID"), { target: { value: " local:custom " } });
+  expect(changes).toHaveLength(0);
+  fireEvent.click(view.getByRole("button", { name: "Use custom model" }));
+  expect(changes).toEqual([{ ...pickerValue, model: "local:custom" }]);
+  expect(closed).toBe(1);
 });
 
 test("disconnect requires confirmation and can be cancelled without clearing credentials", () => {

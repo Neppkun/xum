@@ -1,14 +1,33 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { Check, ChevronDown, ChevronRight, Cpu } from "lucide-react-native";
+import { Bot, Check, ChevronRight, ClipboardList, Code2 } from "lucide-react-native";
+import type { LucideIcon } from "lucide-react-native";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import { formatModelDisplayName } from "../../../../src/common/utils/ai/modelDisplay";
-import { Button, Field, Sheet } from "../components/Controls";
+import { Field, Sheet } from "../components/Controls";
 import { modelChoices, resolveSettings, thinkingLevels } from "../settings";
 import type { ChatSettings, SettingsData } from "../settings";
+import type { ThinkingLevel } from "../../../../src/common/types/thinking";
 import { colors, layout, radii, spacing, typography } from "../theme";
 
-function modelName(id: string) {
+type Page = "model" | "catalog" | "effort" | "agent" | "custom";
+const titles: Record<Page, string> = {
+  model: "Select model",
+  catalog: "More models",
+  effort: "Effort",
+  agent: "Select mode",
+  custom: "Custom model",
+};
+const effortLabels: Record<ThinkingLevel, string> = {
+  off: "Off",
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra high",
+  max: "Maximum",
+};
+
+export function modelName(id: string) {
   return formatModelDisplayName(
     id
       .slice(id.indexOf(":") + 1)
@@ -18,132 +37,103 @@ function modelName(id: string) {
 }
 
 export function ModelSettings(props: {
+  initialPage: "model" | "agent";
   value: ChatSettings;
   data: SettingsData;
   workspace: FrontendWorkspaceMetadata;
-  onSave: (value: ChatSettings) => void;
+  onChange: (value: ChatSettings) => void;
   onClose: () => void;
 }) {
-  const [value, setValue] = useState(props.value);
+  const [page, setPage] = useState<Page>(props.initialPage);
   const [query, setQuery] = useState("");
-  const [browsing, setBrowsing] = useState(false);
-  const [custom, setCustom] = useState(false);
-  const [showThinking, setShowThinking] = useState(false);
-  const agents = props.data.agents.filter((agent) => agent.uiSelectable);
-  const models = modelChoices(props.data, value.model).filter((model) =>
+  const [customModel, setCustomModel] = useState(props.value.model);
+  const models = modelChoices(props.data, props.value.model);
+  const currentProvider = props.value.model.split(":")[0];
+  // Start with the current choice and its provider, not invented recommendations or capability claims.
+  const featured = [
+    ...models.filter((model) => model.split(":")[0] === currentProvider),
+    ...models.filter((model) => model.split(":")[0] !== currentProvider),
+  ].slice(0, 4);
+  const filtered = models.filter((model) =>
     `${model} ${modelName(model)}`.toLowerCase().includes(query.trim().toLowerCase())
   );
   const groups = new Map<string, string[]>();
-  for (const model of models) {
+  for (const model of filtered) {
     const provider = model.split(":")[0];
-    const group = groups.get(provider) ?? [];
-    group.push(model);
-    groups.set(provider, group);
+    groups.set(provider, [...(groups.get(provider) ?? []), model]);
   }
-  const validModel = /^\S+:\S+$/.test(value.model.trim());
-  const currentAgent = agents.find((agent) => agent.id === value.agentId);
+  function providerName(provider: string) {
+    return props.data.providers[provider]?.displayName ?? provider;
+  }
+  function selectModel(model: string) {
+    props.onChange({ ...props.value, model });
+    props.onClose();
+  }
+  function modelRow(model: string, index: number) {
+    return (
+      <PickerRow
+        key={model}
+        label={modelName(model)}
+        subtitle={providerName(model.split(":")[0])}
+        accessibilityLabel={model}
+        selected={model === props.value.model}
+        separator={index > 0}
+        onPress={() => selectModel(model)}
+      />
+    );
+  }
+  const validCustom = /^\S+:\S+$/.test(customModel.trim());
   return (
     <Sheet
-      title={browsing ? "Choose model" : "Conversation settings"}
-      onBack={browsing ? () => setBrowsing(false) : undefined}
+      variant="picker"
+      title={titles[page]}
       onClose={props.onClose}
-      footer={
-        !browsing && (
-          <Button
-            disabled={!validModel || !currentAgent}
-            onPress={() => props.onSave({ ...value, model: value.model.trim() })}
+      onBack={
+        page === "catalog" || page === "effort"
+          ? () => setPage("model")
+          : page === "custom"
+            ? () => setPage("catalog")
+            : undefined
+      }
+      action={
+        page === "custom" && (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Use custom model"
+            accessibilityState={{ disabled: !validCustom }}
+            disabled={!validCustom}
+            onPress={() => selectModel(customModel.trim())}
+            style={styles.done}
           >
-            Use settings
-          </Button>
+            <Text
+              style={[typography.header, { color: validCustom ? colors.selection : colors.dim }]}
+            >
+              Done
+            </Text>
+          </Pressable>
         )
       }
     >
-      {!browsing && (
+      {page === "model" && (
         <>
-          <View style={styles.section}>
-            <Text style={layout.label}>Agent</Text>
-            <View style={styles.chips}>
-              {agents.map((agent) => (
-                <Option
-                  key={agent.id}
-                  label={agent.name}
-                  selected={agent.id === value.agentId}
-                  onPress={() => setValue(resolveSettings(props.workspace, props.data, agent.id))}
-                />
-              ))}
-            </View>
-            <Text style={styles.footnote}>
-              {currentAgent?.description ?? "Choose an agent for your next message."}
-            </Text>
+          <View style={styles.group}>{featured.map(modelRow)}</View>
+          <View style={styles.group}>
+            <PickerRow
+              label="Effort"
+              detail={
+                props.value.thinkingLevel ? effortLabels[props.value.thinkingLevel] : "Default"
+              }
+              onPress={() => setPage("effort")}
+              disclosure
+            />
           </View>
-          <View style={styles.section}>
-            <Text style={layout.label}>Model</Text>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Choose model"
-              accessibilityState={{ expanded: browsing }}
-              onPress={() => setBrowsing(!browsing)}
-              style={[layout.group, styles.modelRow]}
-            >
-              <Cpu size={20} color={colors.accent} />
-              <View style={{ flex: 1, minWidth: 0 }}>
-                <Text numberOfLines={1} style={[layout.text, { color: colors.bright }]}>
-                  {value.model ? modelName(value.model) : "Choose a model"}
-                </Text>
-                <Text numberOfLines={1} style={styles.footnote}>
-                  {value.model.split(":")[0]}
-                </Text>
-              </View>
-              <ChevronDown size={18} color={colors.muted} />
-            </Pressable>
-          </View>
-          <View style={styles.section}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Thinking effort"
-              accessibilityState={{ expanded: showThinking }}
-              onPress={() => setShowThinking(!showThinking)}
-              style={[layout.group, styles.modelRow]}
-            >
-              <Text style={[layout.text, { flex: 1 }]}>Thinking</Text>
-              <Text style={styles.footnote}>
-                {value.thinkingLevel
-                  ? value.thinkingLevel[0].toUpperCase() + value.thinkingLevel.slice(1)
-                  : "Default"}
-              </Text>
-              {showThinking ? (
-                <ChevronDown size={18} color={colors.muted} />
-              ) : (
-                <ChevronRight size={18} color={colors.muted} />
-              )}
-            </Pressable>
-            {showThinking && (
-              <View style={styles.chips}>
-                <Option
-                  label="Default"
-                  selected={value.thinkingLevel == null}
-                  onPress={() => setValue({ ...value, thinkingLevel: undefined })}
-                />
-                {thinkingLevels.map((level) => (
-                  <Option
-                    key={level}
-                    label={level[0].toUpperCase() + level.slice(1)}
-                    selected={value.thinkingLevel === level}
-                    onPress={() => setValue({ ...value, thinkingLevel: level })}
-                  />
-                ))}
-              </View>
-            )}
-            {showThinking && (
-              <Text style={styles.footnote}>
-                Applies to your next message. Model capabilities are checked by your server.
-              </Text>
-            )}
+          <View style={styles.group}>
+            <PickerRow label="More models" onPress={() => setPage("catalog")} disclosure />
           </View>
         </>
       )}
-      {browsing && (
-        <View style={{ gap: spacing.lg }}>
+      {page === "catalog" && (
+        <>
           <Field
             label="Search models"
             placeholder="Model or provider"
@@ -152,127 +142,143 @@ export function ModelSettings(props: {
             returnKeyType="search"
             clearButtonMode="while-editing"
           />
-          {models.length === 0 ? (
-            <Text style={layout.muted}>
-              No models match your search. Try another name or enter a custom model ID below.
-            </Text>
-          ) : (
-            <Text style={styles.footnote}>
-              {models.length} {models.length === 1 ? "model" : "models"}
-            </Text>
-          )}
           {[...groups].map(([provider, choices]) => (
             <View key={provider} style={styles.section}>
-              <Text style={layout.label}>
-                {props.data.providers[provider]?.displayName ??
-                  provider[0].toUpperCase() + provider.slice(1)}
-              </Text>
-              <View style={layout.group}>
-                {choices.map((model, index) => (
-                  <Pressable
-                    key={model}
-                    accessibilityRole="button"
-                    accessibilityLabel={model}
-                    accessibilityState={{ selected: model === value.model }}
-                    onPress={() => {
-                      setValue({ ...value, model });
-                      setBrowsing(false);
-                      setCustom(false);
-                    }}
-                    style={[styles.modelRow, index > 0 && styles.separator]}
-                  >
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text style={layout.text}>{modelName(model)}</Text>
-                      <Text numberOfLines={1} style={styles.footnote}>
-                        {model.slice(model.indexOf(":") + 1)}
-                      </Text>
-                    </View>
-                    {model === value.model && <Check size={20} color={colors.accent} />}
-                  </Pressable>
-                ))}
-              </View>
+              <Text style={styles.sectionLabel}>{providerName(provider)}</Text>
+              <View style={styles.group}>{choices.map(modelRow)}</View>
             </View>
           ))}
+          {filtered.length === 0 && <Text style={layout.muted}>No matching models.</Text>}
+          <View style={styles.group}>
+            <PickerRow label="Custom model" onPress={() => setPage("custom")} disclosure />
+          </View>
+        </>
+      )}
+      {page === "effort" && (
+        <>
+          <View style={styles.group}>
+            <PickerRow
+              label="Default"
+              selected={props.value.thinkingLevel == null}
+              onPress={() => {
+                props.onChange({ ...props.value, thinkingLevel: undefined });
+                setPage("model");
+              }}
+            />
+            {thinkingLevels.map((level) => (
+              <PickerRow
+                key={level}
+                label={effortLabels[level]}
+                separator
+                selected={props.value.thinkingLevel === level}
+                onPress={() => {
+                  props.onChange({ ...props.value, thinkingLevel: level });
+                  setPage("model");
+                }}
+              />
+            ))}
+          </View>
+          <Text style={styles.note}>
+            Available effort levels depend on the model. Your server applies its capabilities.
+          </Text>
+        </>
+      )}
+      {page === "agent" && (
+        <View style={styles.group}>
+          {props.data.agents
+            .filter((agent) => agent.uiSelectable)
+            .map((agent, index) => (
+              <PickerRow
+                key={agent.id}
+                label={agent.name}
+                subtitle={agent.description}
+                separator={index > 0}
+                icon={agent.id === "exec" ? Code2 : agent.id === "plan" ? ClipboardList : Bot}
+                selected={agent.id === props.value.agentId}
+                onPress={() => {
+                  // Mode and model are separate controls: choosing a mode must not replace an explicit model/effort.
+                  if (agent.id !== props.value.agentId)
+                    props.onChange(
+                      props.value.model
+                        ? { ...props.value, agentId: agent.id }
+                        : resolveSettings(props.workspace, props.data, agent.id)
+                    );
+                  props.onClose();
+                }}
+              />
+            ))}
         </View>
       )}
-      <View style={styles.section}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityState={{ expanded: custom }}
-          onPress={() => {
-            setBrowsing(false);
-            setCustom(!custom);
-          }}
-          style={styles.disclosure}
-        >
-          <Text style={[typography.secondary, { color: colors.muted, flex: 1 }]}>
-            Use a custom model ID
+      {page === "custom" && (
+        <>
+          <Field
+            label="Model ID"
+            placeholder="provider:model"
+            value={customModel}
+            onChangeText={setCustomModel}
+            returnKeyType="done"
+            onSubmitEditing={() => {
+              if (validCustom) selectModel(customModel.trim());
+            }}
+          />
+          <Text style={styles.note}>
+            Enter a model supported by a configured server provider, in provider:model format.
           </Text>
-          {custom ? (
-            <ChevronDown size={18} color={colors.muted} />
-          ) : (
-            <ChevronRight size={18} color={colors.muted} />
-          )}
-        </Pressable>
-        {custom && (
-          <>
-            <Field
-              label="Model ID"
-              value={value.model}
-              onChangeText={(model) => setValue({ ...value, model })}
-              placeholder="provider:model"
-              returnKeyType="done"
-            />
-            <Text style={[styles.footnote, !validModel && { color: colors.warning }]}>
-              {validModel
-                ? "Use a model supported by a configured server provider."
-                : "Enter a model in provider:model format."}
-            </Text>
-          </>
-        )}
-      </View>
+        </>
+      )}
     </Sheet>
   );
 }
 
-function Option(props: { label: string; selected: boolean; onPress: () => void }) {
+function PickerRow(props: {
+  label: string;
+  subtitle?: string;
+  detail?: string;
+  accessibilityLabel?: string;
+  selected?: boolean;
+  separator?: boolean;
+  disclosure?: boolean;
+  icon?: LucideIcon;
+  onPress: () => void;
+}) {
+  const Icon = props.icon;
   return (
     <Pressable
-      accessibilityRole="button"
-      accessibilityState={{ selected: props.selected }}
+      accessibilityRole={props.selected == null ? "button" : "radio"}
+      accessibilityLabel={props.accessibilityLabel}
+      accessibilityState={props.selected == null ? undefined : { checked: props.selected }}
+      aria-checked={props.selected}
       onPress={props.onPress}
-      style={[styles.option, props.selected && { backgroundColor: colors.accentSurface }]}
+      style={({ pressed }) => [styles.row, pressed && { backgroundColor: colors.elevated }]}
     >
-      {props.selected && <Check size={14} color={colors.accent} />}
-      <Text
-        style={[typography.secondary, { color: props.selected ? colors.accent : colors.muted }]}
-      >
-        {props.label}
-      </Text>
+      <View style={[styles.rowContent, props.separator && styles.separator]}>
+        {Icon && <Icon size={22} color={colors.muted} />}
+        <View style={{ flex: 1, minWidth: 0, gap: spacing.xs }}>
+          <Text style={styles.rowTitle}>{props.label}</Text>
+          {props.subtitle && <Text style={styles.note}>{props.subtitle}</Text>}
+        </View>
+        {props.detail && <Text style={layout.muted}>{props.detail}</Text>}
+        {props.selected && <Check size={23} color={colors.selection} />}
+        {props.disclosure && <ChevronRight size={20} color={colors.dim} />}
+      </View>
     </Pressable>
   );
 }
 
 const styles = StyleSheet.create({
+  group: { borderRadius: radii.sheet, backgroundColor: colors.panel, overflow: "hidden" },
   section: { gap: spacing.sm },
-  chips: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
-  option: {
-    minHeight: 44,
-    paddingHorizontal: spacing.md,
-    borderRadius: radii.control,
-    backgroundColor: colors.panel,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.xs,
-  },
-  modelRow: {
+  sectionLabel: { ...typography.footnote, color: colors.muted, paddingHorizontal: spacing.lg },
+  row: { paddingHorizontal: spacing.lg },
+  rowContent: {
     minHeight: 56,
-    padding: spacing.md,
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.md,
+    paddingVertical: spacing.md,
   },
   separator: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border },
-  footnote: { ...typography.footnote, color: colors.muted },
-  disclosure: { minHeight: 44, flexDirection: "row", gap: spacing.sm, alignItems: "center" },
+  rowTitle: { ...typography.body, fontSize: 17, color: colors.bright },
+  note: { ...typography.footnote, color: colors.muted },
+  done: { minWidth: 44, minHeight: 44, alignItems: "center", justifyContent: "center" },
 });

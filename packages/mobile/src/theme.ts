@@ -10,6 +10,8 @@ export const colors = {
   bright: "hsl(0, 0%, 97%)",
   muted: "hsl(240, 3%, 64%)",
   dim: "hsl(240, 3%, 45%)",
+  sheet: "hsl(240, 3%, 8%)",
+  selection: "hsl(211, 80%, 65%)",
   accent: "hsl(268.56, 90%, 68%)",
   accentSurface: "hsla(268.56, 90%, 68%, 0.12)",
   plan: "hsl(210, 70%, 68%)",

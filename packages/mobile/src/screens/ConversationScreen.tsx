@@ -27,9 +27,8 @@ import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
 import { resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
-import { ModelSettings } from "./ModelSettings";
+import { ModelSettings, modelName } from "./ModelSettings";
 import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
-import { formatModelDisplayName } from "../../../../src/common/utils/ai/modelDisplay";
 import { DEFAULT_THINKING_LEVEL } from "../../../../src/common/types/thinking";
 
 // RN Web reports scrollHeight, which cannot shrink a fixed-height textarea and
@@ -59,7 +58,7 @@ export function ConversationScreen(props: {
   const [inputHeight, setInputHeight] = useState(44);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
+  const [showSettings, setShowSettings] = useState<"model" | "agent" | null>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [composerHeight, setComposerHeight] = useState(100);
   const list = useRef<FlatList<MuxMessage>>(null);
@@ -288,32 +287,44 @@ export function ConversationScreen(props: {
             selectionColor={colors.accent}
           />
           <View style={styles.composerToolbar}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Choose model, agent, and thinking"
-              accessibilityState={{ disabled: !settings || !options }}
-              disabled={!settings || !options}
-              onPress={() => setShowSettings(true)}
-              style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
-            >
-              <View
-                style={[
-                  styles.modeDot,
-                  { backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent },
+            <View style={styles.pickers}>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Choose mode"
+                accessibilityState={{ disabled: !settings || !options }}
+                disabled={!settings || !options}
+                onPress={() => setShowSettings("agent")}
+                style={({ pressed }) => [
+                  styles.modelButton,
+                  { maxWidth: "45%" },
+                  pressed && { opacity: 0.6 },
                 ]}
-              />
-              <Text numberOfLines={1} style={styles.modelLabel}>
-                {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Agent"}
-                <Text style={{ color: colors.muted, fontWeight: "400" }}>
-                  {" "}
-                  ·{" "}
-                  {options?.model
-                    ? formatModelDisplayName(options.model.slice(options.model.indexOf(":") + 1))
-                    : "Choose model"}
+              >
+                <View
+                  style={[
+                    styles.modeDot,
+                    { backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent },
+                  ]}
+                />
+                <Text numberOfLines={1} style={styles.modelLabel}>
+                  {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Mode"}
                 </Text>
-              </Text>
-              <ChevronDown size={14} color={colors.muted} />
-            </Pressable>
+                <ChevronDown size={12} color={colors.muted} />
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Choose model"
+                accessibilityState={{ disabled: !settings || !options }}
+                disabled={!settings || !options}
+                onPress={() => setShowSettings("model")}
+                style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
+              >
+                <Text numberOfLines={1} style={styles.modelLabel}>
+                  {options?.model ? modelName(options.model) : "Model"}
+                </Text>
+                <ChevronDown size={12} color={colors.muted} />
+              </Pressable>
+            </View>
             <View
               style={[
                 styles.send,
@@ -336,14 +347,12 @@ export function ConversationScreen(props: {
       </View>
       {showSettings && settings && options && (
         <ModelSettings
+          initialPage={showSettings}
           value={options}
           data={settings}
           workspace={props.workspace}
-          onClose={() => setShowSettings(false)}
-          onSave={(value) => {
-            props.onSelectionChange(value);
-            setShowSettings(false);
-          }}
+          onClose={() => setShowSettings(null)}
+          onChange={props.onSelectionChange}
         />
       )}
     </KeyboardAvoidingView>
@@ -420,13 +429,16 @@ const styles = StyleSheet.create({
     paddingHorizontal: 4,
     gap: 8,
   },
+  pickers: { flex: 1, minWidth: 0, flexDirection: "row", gap: 6, alignItems: "center" },
   modelButton: {
     minHeight: 44,
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
     flexShrink: 1,
-    paddingHorizontal: 6,
+    paddingHorizontal: 10,
+    backgroundColor: colors.elevated,
+    borderRadius: radii.pill,
   },
   modeDot: { width: 6, height: 6, borderRadius: 3 },
   modelLabel: { fontFamily, color: colors.text, fontSize: 13, fontWeight: "500", flexShrink: 1 },

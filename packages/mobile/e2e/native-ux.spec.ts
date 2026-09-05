@@ -50,32 +50,33 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
     await page.getByRole("button", { name: title, exact: true }).click();
     await expect(page.getByRole("textbox", { name: "Message", exact: true })).toHaveValue(draft);
 
-    await page.getByRole("button", { name: "Choose model, agent, and thinking" }).click();
-    const apply = page.getByRole("button", { name: "Use settings", exact: true });
-    await withinViewport(page, apply);
-    await page.getByRole("button", { name: "Choose model", exact: true }).click();
-    await expect(page.getByRole("textbox", { name: "Search models" })).toBeVisible();
+    const chooseModel = page.getByRole("button", { name: "Choose model", exact: true });
+    await chooseModel.click();
+    const more = page.getByRole("button", { name: "More models", exact: true });
+    await withinViewport(page, more);
+    await more.click();
     await page.getByRole("textbox", { name: "Search models" }).fill("no-match-model-query");
     await page.getByRole("button", { name: "Back", exact: true }).click();
-    await withinViewport(page, apply);
-    await page.getByRole("button", { name: "Plan", exact: true }).click();
-    const thinking = page.getByRole("button", { name: "Thinking effort", exact: true });
-    await expect(page.getByRole("button", { name: "High", exact: true })).not.toBeVisible();
-    await thinking.click();
-    await page.getByRole("button", { name: "High", exact: true }).click();
-    await thinking.click();
-    await expect(thinking).toContainText("High");
-    await withinViewport(page, apply);
-    await apply.click();
+    await page.getByRole("button", { name: /^Effort/ }).click();
+    await page.getByRole("radio", { name: "High", exact: true }).click();
+    await expect(page.getByRole("button", { name: /^Effort/ })).toContainText("High");
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    const modelBeforeModeChange = await chooseModel.innerText();
+    await page.getByRole("button", { name: "Choose mode", exact: true }).click();
+    await page.getByRole("radio", { name: /^Plan/ }).click();
+    await expect(chooseModel).toHaveText(modelBeforeModeChange);
     await expect(page.getByRole("textbox", { name: "Message", exact: true })).toHaveValue(draft);
-    await expect(
-      page.getByRole("button", { name: "Choose model, agent, and thinking" })
-    ).toContainText("Plan");
+    await expect(page.getByRole("button", { name: "Choose mode", exact: true })).toContainText(
+      "Plan"
+    );
     await page.getByRole("button", { name: "Back to workspaces", exact: true }).click();
     await page.getByRole("button", { name: title, exact: true }).click();
-    await expect(
-      page.getByRole("button", { name: "Choose model, agent, and thinking" })
-    ).toContainText("Plan");
+    await expect(page.getByRole("button", { name: "Choose mode", exact: true })).toContainText(
+      "Plan"
+    );
+    await chooseModel.click();
+    await expect(page.getByRole("button", { name: /^Effort/ })).toContainText("High");
+    await page.getByRole("button", { name: "Close", exact: true }).click();
 
     await message.fill("");
     const viewport = page.viewportSize()!;

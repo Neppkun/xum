@@ -182,6 +182,8 @@ export function Sheet(props: {
   children: ReactNode;
   onClose: () => void;
   footer?: ReactNode;
+  variant?: "picker";
+  action?: ReactNode;
   dismissDisabled?: boolean;
   onBack?: () => void;
 }) {
@@ -189,6 +191,7 @@ export function Sheet(props: {
     if (!props.dismissDisabled) props.onClose();
   }
   const web = Platform.OS === "web";
+  const picker = props.variant === "picker";
   return (
     <Modal
       animationType="slide"
@@ -197,7 +200,7 @@ export function Sheet(props: {
       allowSwipeDismissal={!props.dismissDisabled}
       onRequestClose={dismiss}
     >
-      <View style={web ? styles.webOverlay : layout.fill}>
+      <View style={web ? [styles.webOverlay, picker && styles.pickerOverlay] : layout.fill}>
         {web && (
           <Pressable
             accessibilityRole="button"
@@ -208,7 +211,11 @@ export function Sheet(props: {
           />
         )}
         <SafeAreaView
-          style={web ? styles.webSheet : layout.fill}
+          style={
+            web
+              ? [styles.webSheet, picker && styles.pickerSheet]
+              : [layout.fill, picker && { backgroundColor: colors.sheet }]
+          }
           edges={
             web || Platform.OS === "ios"
               ? ["left", "right", "bottom"]
@@ -219,22 +226,43 @@ export function Sheet(props: {
             style={styles.sheetContent}
             behavior={Platform.OS === "ios" ? "padding" : undefined}
           >
-            <Header
-              title={props.title}
-              onBack={props.onBack}
-              trailing={
-                <IconButton
-                  label="Close"
-                  icon={X}
-                  onPress={dismiss}
-                  disabled={props.dismissDisabled}
-                />
-              }
-            />
+            {picker ? (
+              <>
+                {/* Native presentation owns swipe dismissal; the web preview shows its visual cue only. */}
+                <View accessible={false} style={styles.grabber} />
+                <View style={styles.pickerHeader}>
+                  <View style={styles.pickerClose}>
+                    <IconButton
+                      label={props.onBack ? "Back" : "Close"}
+                      icon={props.onBack ? ChevronLeft : X}
+                      onPress={props.onBack ?? dismiss}
+                      disabled={props.dismissDisabled}
+                    />
+                  </View>
+                  <Text accessibilityRole="header" numberOfLines={1} style={styles.pickerTitle}>
+                    {props.title}
+                  </Text>
+                  <View style={{ minWidth: 44 }}>{props.action}</View>
+                </View>
+              </>
+            ) : (
+              <Header
+                title={props.title}
+                onBack={props.onBack}
+                trailing={
+                  <IconButton
+                    label="Close"
+                    icon={X}
+                    onPress={dismiss}
+                    disabled={props.dismissDisabled}
+                  />
+                }
+              />
+            )}
             <ScrollView
               keyboardShouldPersistTaps="handled"
               keyboardDismissMode="on-drag"
-              contentContainerStyle={layout.content}
+              contentContainerStyle={[layout.content, picker && styles.pickerContent]}
             >
               {props.children}
             </ScrollView>
@@ -317,6 +345,45 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: radii.sheet,
     borderTopRightRadius: radii.sheet,
     overflow: "hidden",
+  },
+  pickerOverlay: { paddingHorizontal: spacing.sm, paddingBottom: spacing.sm },
+  pickerSheet: {
+    backgroundColor: colors.sheet,
+    borderTopLeftRadius: 32,
+    borderTopRightRadius: 32,
+    borderBottomLeftRadius: 32,
+    borderBottomRightRadius: 32,
+    maxWidth: 520,
+  },
+  grabber: {
+    width: 32,
+    height: 4,
+    borderRadius: radii.pill,
+    backgroundColor: colors.dim,
+    alignSelf: "center",
+    marginTop: spacing.sm,
+  },
+  pickerHeader: {
+    minHeight: 72,
+    paddingHorizontal: spacing.lg,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  pickerClose: {
+    width: 44,
+    height: 44,
+    borderRadius: radii.pill,
+    backgroundColor: colors.panel,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+  },
+  pickerTitle: { ...typography.header, color: colors.bright, flex: 1, textAlign: "center" },
+  pickerContent: {
+    paddingTop: spacing.sm,
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.xl,
+    gap: spacing.lg,
   },
   sheetContent: { flexGrow: 1, flexShrink: 1 },
   footer: {
