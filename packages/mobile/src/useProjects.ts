@@ -1,0 +1,50 @@
+import { useEffect, useState } from "react";
+import type { MobileClient } from "./api";
+import type { FrontendWorkspaceMetadata } from "../../../src/common/types/workspace";
+import { isWorkspaceArchived } from "../../../src/common/utils/archive";
+
+export type Projects = Awaited<ReturnType<MobileClient["projects"]["list"]>>;
+export function useProjects(client: MobileClient) {
+  const [projects, setProjects] = useState<Projects>([]);
+  const [workspaces, setWorkspaces] = useState<FrontendWorkspaceMetadata[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [generation, setGeneration] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    setError(null);
+    async function load() {
+      // Subscribe before listing so metadata changes during the snapshot are not lost.
+      const events = await client.workspace.onMetadata(undefined, { signal: controller.signal });
+      const [projectList, workspaceList] = await Promise.all([
+        client.projects.list(undefined, { signal: controller.signal }),
+        client.workspace.list(undefined, { signal: controller.signal }),
+      ]);
+      if (controller.signal.aborted) return;
+      setProjects(projectList);
+      setWorkspaces(workspaceList);
+      setLoading(false);
+      for await (const event of events) {
+        if (controller.signal.aborted) return;
+        setWorkspaces((current) => {
+          const rest = current.filter((workspace) => workspace.id !== event.workspaceId);
+          return event.metadata &&
+            !isWorkspaceArchived(event.metadata.archivedAt, event.metadata.unarchivedAt)
+            ? [...rest, event.metadata]
+            : rest;
+        });
+      }
+      if (!controller.signal.aborted)
+        throw new Error("Workspace updates disconnected. Refresh the list to reconnect.");
+    }
+    load().catch((cause: unknown) => {
+      if (!controller.signal.aborted) {
+        setError(cause instanceof Error ? cause.message : "Could not load workspaces.");
+        setLoading(false);
+      }
+    });
+    return () => controller.abort();
+  }, [client, generation]);
+  return { projects, workspaces, loading, error, retry: () => setGeneration((value) => value + 1) };
+}
