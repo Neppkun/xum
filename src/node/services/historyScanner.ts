@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createHash } from "node:crypto";
 import assert from "node:assert";
 import {
@@ -49,7 +50,7 @@ export function isReadableHistoryMessage(value: unknown): value is MuxMessage {
     "role" in value &&
     ["user", "assistant", "system"].includes(String(value.role)) &&
     "parts" in value &&
-    Array.isArray(value.parts)
+    MuxMessageSchema.shape.parts.safeParse(value.parts).success
   );
 }
 

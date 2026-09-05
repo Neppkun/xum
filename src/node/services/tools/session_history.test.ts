@@ -276,21 +276,28 @@ describe("session_history real disk recovery", () => {
     );
   });
 
-  test("percentage truncation keeps invalid parsed rows raw without admitting them to typed history", async () => {
-    const invalid = Buffer.from('{"id":"bad","role":"user"}\n');
-    await fs.writeFile(chatPath, Buffer.concat([invalid, await fs.readFile(chatPath)]));
-    await append("last", "retained facts");
-    const result = await fixture.historyService.truncateHistory(workspaceId, 0.2);
-    expect(result.success).toBe(true);
-    if (!result.success) throw new Error(result.error);
-    expect(result.data.length).toBeGreaterThan(0);
-    expect((await fs.readFile(chatPath)).includes(invalid)).toBe(true);
-    expect(
-      (await pages({ action: "search", query: "retained facts" })).flatMap(
-        (page) => page.items ?? []
-      ).length
-    ).toBe(1);
-  });
+  test.each([
+    '{"id":"bad","role":"user"}',
+    '{"id":"bad","role":"user","parts":[null]}',
+    '{"id":"bad","role":"user","parts":[{"type":"text","text":42}]}',
+  ])(
+    "percentage truncation keeps invalid parsed rows raw without typed admission: %s",
+    async (row) => {
+      const invalid = Buffer.from(row + "\n");
+      await fs.writeFile(chatPath, Buffer.concat([invalid, await fs.readFile(chatPath)]));
+      await append("last", "retained facts");
+      const result = await fixture.historyService.truncateHistory(workspaceId, 0.2);
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      expect(result.data.length).toBeGreaterThan(0);
+      expect((await fs.readFile(chatPath)).includes(invalid)).toBe(true);
+      expect(
+        (await pages({ action: "search", query: "retained facts" })).flatMap(
+          (page) => page.items ?? []
+        ).length
+      ).toBe(1);
+    }
+  );
 
   test.each(["active", "archive"])(
     "partial truncation delimits an unterminated %s floor before future appends",
