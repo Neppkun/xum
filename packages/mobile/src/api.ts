@@ -1,0 +1,94 @@
+import { RPCLink } from "@orpc/client/websocket";
+import { createClient } from "../../../src/common/orpc/client";
+import { normalizeEndpoint } from "./endpoint";
+
+export type MobileClient = ReturnType<typeof createClient>;
+export interface MobileConnection {
+  client: MobileClient;
+  endpoint: string;
+  close: () => void;
+}
+
+const CONNECT_TIMEOUT_MS = 10_000;
+
+/**
+ * One owned socket for both authenticated unary RPC and subscriptions. Reconnect
+ * is explicit: never retry a mutation, and reset chat before a new full replay.
+ * The signal owns the connection lifetime, including the pending handshake.
+ */
+export async function connect(
+  endpoint: string,
+  token: string,
+  options: { signal?: AbortSignal } = {}
+): Promise<MobileConnection> {
+  const normalized = normalizeEndpoint(endpoint);
+  if (!token.trim()) throw new Error("Enter a server token.");
+  if (options.signal?.aborted) throw new Error("Connection cancelled.");
+
+  const url = new URL(`${normalized}/orpc/ws`);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.searchParams.set("token", token.trim());
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(url.toString());
+    socket.binaryType = "arraybuffer";
+  } catch {
+    // Native WebSocket errors may include the credential-bearing URL.
+    throw new Error("Unable to open a connection to the server.");
+  }
+
+  const probe = new AbortController();
+  let closed = false;
+  let timedOut = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    options.signal?.removeEventListener("abort", close);
+    socket.removeEventListener("close", close);
+    probe.abort();
+    try {
+      if (socket.readyState < 2) socket.close();
+    } catch {
+      // Some native implementations throw when closing a pending handshake.
+      // Still close if that handshake subsequently succeeds.
+      socket.addEventListener("open", () => socket.close(), { once: true });
+    }
+  };
+  socket.addEventListener("close", close);
+  options.signal?.addEventListener("abort", close, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    close();
+  }, CONNECT_TIMEOUT_MS);
+
+  try {
+    const client = createClient(
+      new RPCLink({
+        connect: () => {
+          if (closed) throw new Error("Connection closed.");
+          return socket;
+        },
+        reconnect: { enabled: false },
+        // The adapter retains its peer after close; reject before it can queue a
+        // call that will never receive a response (or replay a mutation).
+        interceptors: [
+          (options) => {
+            if (closed) throw new Error("Connection closed.");
+            return options.next();
+          },
+        ],
+      })
+    );
+    // An open handshake alone does not prove RPC authentication succeeded.
+    await client.workspace.list(undefined, { signal: probe.signal });
+    if (closed) throw new Error("Connection closed.");
+    return { client, close, endpoint: normalized };
+  } catch {
+    close();
+    if (options.signal?.aborted) throw new Error("Connection cancelled.");
+    if (timedOut) throw new Error("Connection timed out.");
+    throw new Error("Unable to connect. Check the server address and token.");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
