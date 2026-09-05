@@ -23,7 +23,7 @@ import {
 
 const [resetKeyToken, resetValueToken] = SESSION_HISTORY_RESET_NEEDLE.split(":");
 const resetTokenPattern = new RegExp(
-  [resetKeyToken, resetValueToken]
+  [resetKeyToken, resetValueToken, ":"]
     .map((token) =>
       [...token]
         .map((character) => {
@@ -36,10 +36,22 @@ const resetTokenPattern = new RegExp(
         })
         .join("")
     )
-    .concat(":")
     .join("|"),
   "g"
 );
+
+export function isReadableHistoryMessage(value: unknown): value is MuxMessage {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    "id" in value &&
+    typeof value.id === "string" &&
+    "role" in value &&
+    ["user", "assistant", "system"].includes(String(value.role)) &&
+    "parts" in value &&
+    Array.isArray(value.parts)
+  );
+}
 
 function compactResetProbe(text: string): string {
   // Corruption may insert raw or escaped control separators where JSON permits
@@ -47,7 +59,7 @@ function compactResetProbe(text: string): string {
   return text.replace(/[\s\p{Cc}]/gu, "").replace(/\\u00(?:[0189][\da-f]|20|7f)/gi, "");
 }
 
-function hasRawResetMarker(text: string): boolean {
+export function hasRawResetMarker(text: string): boolean {
   const decoded = compactResetProbe(text).replace(
     /\\u([\da-fA-F]{4})/g,
     (_match: string, hex: string) => String.fromCharCode(Number.parseInt(hex, 16))
@@ -263,18 +275,8 @@ export async function scanHistoryFilesBounded(
               rowReset = true;
               possibleReset = true;
             }
-            if (
-              !raw ||
-              typeof raw !== "object" ||
-              !("id" in raw) ||
-              typeof raw.id !== "string" ||
-              !("role" in raw) ||
-              !["user", "assistant", "system"].includes(String(raw.role)) ||
-              !("parts" in raw) ||
-              !Array.isArray(raw.parts)
-            )
-              throw new Error();
-            message = normalizeLegacyMuxMetadata(raw as MuxMessage);
+            if (!isReadableHistoryMessage(raw)) throw new Error();
+            message = normalizeLegacyMuxMetadata(raw);
           } catch {
             result.malformedLines++;
           }

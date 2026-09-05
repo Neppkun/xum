@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { createMuxMessage } from "@/common/types/message";
 import { createTestHistoryService } from "./testHistoryService";
 import { prepareProviderRequestMessages } from "./turnContextAssembler";
@@ -76,6 +78,43 @@ describe("HistoryService context-budget request rejection", () => {
       )
     ).toEqual([prior.id, shared.id, future.id]);
   });
+
+  test.each([42, {}, "p", [null, 7, {}, "", "owned"]].map((ownership) => [ownership] as const))(
+    "sanitizes malformed persisted prelude ownership: %j",
+    async (ownership) => {
+      const unrelated = createMuxMessage("p", "assistant", "Unrelated payload", {
+        synthetic: true,
+      });
+      const owned = createMuxMessage("owned", "assistant", "Owned payload", { synthetic: true });
+      const trigger = createMuxMessage("trigger", "user", "Rejected request");
+      expect(
+        (await h.historyService.appendManyToHistory(workspaceId, [unrelated, owned, trigger]))
+          .success
+      ).toBe(true);
+      // Persist damaged metadata without making the typed caller itself malformed.
+      const historyPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+      const raw = await fs.readFile(historyPath, "utf8");
+      const lines = raw.trimEnd().split("\n");
+      lines[2] = JSON.stringify({
+        ...trigger,
+        metadata: { ...trigger.metadata, requestPreludeMessageIds: ownership },
+      });
+      await fs.writeFile(historyPath, lines.join("\n") + "\n");
+
+      const result = await h.historyService.rejectContextBudgetRequest(workspaceId, trigger);
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      const expectedRejected = Array.isArray(ownership) ? [owned.id, trigger.id] : [trigger.id];
+      expect(result.data.map((row) => row.id)).toEqual(expectedRejected);
+      const persisted = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (!persisted.success) throw new Error(persisted.error);
+      expect(
+        prepareProviderRequestMessages(persisted.data, "openai", "off").providerRequestMessages.map(
+          (row) => row.id
+        )
+      ).toEqual(Array.isArray(ownership) ? [unrelated.id] : [unrelated.id, owned.id]);
+    }
+  );
 
   test("a stale trigger identity leaves the entire request unchanged", async () => {
     const payload = createMuxMessage("payload", "assistant", "Payload", { synthetic: true });

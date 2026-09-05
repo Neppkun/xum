@@ -4,7 +4,13 @@ import {
   invalidateHistoryAppendProvenance,
 } from "./historyAppendProvenance";
 import { SESSION_HISTORY_MAX_SCAN_BYTES } from "@/common/constants/contextBudget";
-import { scanHistoryFilesBounded, type BoundedHistoryScanOptions } from "./historyScanner";
+import {
+  hasRawResetMarker,
+  isReadableHistoryMessage,
+  scanHistoryFilesBounded,
+  type BoundedHistoryScanOptions,
+} from "./historyScanner";
+import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
@@ -64,6 +70,22 @@ import {
  * workspace removal can hold it across its tombstone+delete critical section.
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
+
+interface HistoryRewriteRow {
+  raw: Buffer;
+  message: MuxMessage | undefined;
+}
+
+function splitHistoryLines(raw: Buffer): Buffer[] {
+  const lines: Buffer[] = [];
+  for (let start = 0; start < raw.length; ) {
+    const newline = raw.indexOf(10, start);
+    const end = newline < 0 ? raw.length : newline + 1;
+    lines.push(raw.subarray(start, end));
+    start = end;
+  }
+  return lines;
+}
 
 function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolean {
   if (metadata?.compactionBoundary !== true) {
@@ -1138,7 +1160,8 @@ export class HistoryService {
     filePath: string,
     visitor: (
       messages: MuxMessage[],
-      rawLines: readonly string[]
+      rawLines: readonly string[],
+      rawBytes: Buffer
     ) => boolean | void | Promise<boolean | void>
   ): Promise<boolean> {
     let fileSize: number;
@@ -1204,7 +1227,11 @@ export class HistoryService {
         }
 
         if (messages.length > 0) {
-          const shouldContinue = await visitor(messages, rawLines);
+          const shouldContinue = await visitor(
+            messages,
+            rawLines,
+            buffer.subarray(0, lastNewline + 1)
+          );
           if (shouldContinue === false) return false;
         }
       }
@@ -1215,7 +1242,7 @@ export class HistoryService {
         if (line.length > 0) {
           try {
             const msg = normalizeLegacyMuxMetadata(JSON.parse(line) as MuxMessage);
-            const shouldContinue = await visitor([msg], [line]);
+            const shouldContinue = await visitor([msg], [line], carryoverBytes);
             if (shouldContinue === false) return false;
           } catch {
             // Skip malformed line
@@ -1843,38 +1870,34 @@ export class HistoryService {
 
     invalidateHistoryAppendProvenance();
     const fileBuffer = await fs.readFile(chatPath);
-    const sealedPrefix = fileBuffer.subarray(0, boundaryOffset).toString("utf-8");
+    const sealedPrefix = fileBuffer.subarray(0, boundaryOffset);
     const activeTail = fileBuffer.subarray(boundaryOffset);
 
     // Sequence coverage only identifies possible crash-replay copies. A repaired
     // row (especially a reset) may reuse an old sequence without being archived.
     const archivedMaxSequence = await this.getArchiveTailMaxSequence(workspaceId);
     const candidates = new Set<string>();
-    // Parsed equality loses duplicate-key reset markers. Verify the original
-    // row bytes (trimmed consistently with rotation), never a reserialization.
-    const fingerprint = (line: string) => createHash("sha256").update(line).digest("hex");
-    const prefixRows = sealedPrefix
-      .split("\n")
-      .flatMap<{ line: string; fingerprint: string | undefined }>((line) => {
-        const trimmed = line.trim();
-        if (!trimmed) return [];
-        try {
-          const message = JSON.parse(trimmed) as MuxMessage;
-          const sequence = message.metadata?.historySequence;
-          if (isNonNegativeInteger(sequence) && sequence <= archivedMaxSequence) {
-            const key = fingerprint(trimmed);
-            candidates.add(key);
-            return [{ line: trimmed, fingerprint: key }];
-          }
-        } catch {
-          // Preserve malformed fragments verbatim apart from surrounding whitespace.
+    // Parsed equality loses duplicate-key reset markers. Compare exact bytes,
+    // including whitespace and invalid UTF-8, before discarding a replayed row.
+    const fingerprint = (line: Buffer) => createHash("sha256").update(line).digest("hex");
+    const prefixRows = splitHistoryLines(sealedPrefix).map((line) => {
+      try {
+        const message = JSON.parse(line.toString("utf8")) as MuxMessage;
+        const sequence = message.metadata?.historySequence;
+        if (isNonNegativeInteger(sequence) && sequence <= archivedMaxSequence) {
+          const key = fingerprint(line);
+          candidates.add(key);
+          return { line, fingerprint: key };
         }
-        return [{ line: trimmed, fingerprint: undefined }];
-      });
+      } catch {
+        // Malformed reset fragments must survive rotation byte-for-byte.
+      }
+      return { line, fingerprint: undefined };
+    });
     const verifiedCopies = new Set<string>();
     if (candidates.size > 0) {
-      await this.iterateForward(archivePath, (_messages, rawLines) => {
-        for (const line of rawLines) {
+      await this.iterateForward(archivePath, (_messages, _rawLines, rawBytes) => {
+        for (const line of splitHistoryLines(rawBytes)) {
           const key = fingerprint(line);
           if (candidates.delete(key)) verifiedCopies.add(key);
         }
@@ -1890,7 +1913,7 @@ export class HistoryService {
       // sealed rows, only (at worst) duplicate them, which the dedupe above heals.
       const fh = await fs.open(archivePath, "a");
       try {
-        await fh.writeFile(linesToArchive.join("\n") + "\n");
+        await fh.writeFile(Buffer.concat(linesToArchive));
         await fh.sync();
       } finally {
         await fh.close();
@@ -2359,6 +2382,59 @@ export class HistoryService {
     return messages.map((msg) => JSON.stringify({ ...msg, workspaceId }) + "\n").join("");
   }
 
+  private async readHistoryForRewrite(filePath: string): Promise<{
+    rows: HistoryRewriteRow[];
+    messages: MuxMessage[];
+  }> {
+    const raw = await fs.readFile(filePath).catch((error: unknown) => {
+      if (isErrnoWithCode(error, "ENOENT")) return Buffer.alloc(0);
+      throw error;
+    });
+    const rows = splitHistoryLines(raw).map((line) => ({
+      raw: line,
+      message: this.parseMessages(line.toString("utf8"), filePath, (value) =>
+        normalizeLegacyMuxMetadata(value as MuxMessage)
+      )[0],
+    }));
+    return { rows, messages: rows.flatMap((row) => (row.message ? [row.message] : [])) };
+  }
+
+  private serializeHistoryRewrite(
+    rows: readonly HistoryRewriteRow[],
+    workspaceId: string,
+    transform: (message: MuxMessage, raw: Buffer) => MuxMessage | null,
+    appended: readonly MuxMessage[] = []
+  ): Buffer {
+    // Automatic rewrites must not erase unreadable reset evidence, including
+    // invalid UTF-8, duplicate keys, and markers split across malformed rows.
+    const contents = rows.flatMap((row) => {
+      if (!row.message) return [row.raw];
+      const updated = transform(row.message, row.raw);
+      if (updated === row.message) return [row.raw];
+      if (updated === null) {
+        if (
+          hasRawResetMarker(row.raw.toString("utf8")) &&
+          (!isReadableHistoryMessage(row.message) ||
+            !hasRawResetMarker(JSON.stringify(row.message)))
+        ) {
+          throw new Error("History cleanup would erase unreadable reset evidence");
+        }
+        return [];
+      }
+      const serialized = this.serializeHistoryEntries([updated], workspaceId);
+      if (hasRawResetMarker(row.raw.toString("utf8")) && !hasRawResetMarker(serialized)) {
+        throw new Error("History update would erase unreadable reset evidence");
+      }
+      return [Buffer.from(serialized)];
+    });
+    if (appended.length > 0) {
+      const last = contents.at(-1);
+      if (last && last.at(-1) !== 10) contents.push(Buffer.from("\n"));
+      contents.push(Buffer.from(this.serializeHistoryEntries(appended, workspaceId)));
+    }
+    return Buffer.concat(contents);
+  }
+
   /**
    * Best-effort rotation after a durable boundary lands via append/update.
    * Failures are non-fatal: reads remain correct on unrotated files and the
@@ -2641,22 +2717,7 @@ export class HistoryService {
       async () => {
         invalidateHistoryAppendProvenance();
         const historyPath = this.getChatHistoryPath(workspaceId);
-        const raw = await fs.readFile(historyPath);
-        // Keep every unmodified line byte-for-byte: even unreadable reset rows
-        // remain privacy floors for session_history and must survive this rewrite.
-        const lines: Buffer[] = [];
-        for (let start = 0; start < raw.length; ) {
-          const newline = raw.indexOf(10, start);
-          const end = newline < 0 ? raw.length : newline + 1;
-          lines.push(raw.subarray(start, end));
-          start = end;
-        }
-        const messages = lines.map(
-          (line) =>
-            this.parseMessages(line.toString("utf8"), historyPath, (value) =>
-              normalizeLegacyMuxMetadata(value as MuxMessage)
-            )[0]
-        );
+        const { rows, messages } = await this.readHistoryForRewrite(historyPath);
         const triggerIndex = messages.findIndex(
           (row) =>
             row?.id === trigger.id &&
@@ -2665,26 +2726,27 @@ export class HistoryService {
         const persisted = messages[triggerIndex];
         if (!persisted || persisted.role !== "user")
           return Err("Rejected request no longer exists");
-        const preludeIds = new Set(persisted.metadata?.requestPreludeMessageIds ?? []);
+        const preludeIds = new Set(
+          getRequestPreludeMessageIds(persisted.metadata?.requestPreludeMessageIds)
+        );
         const rejected: MuxMessage[] = [];
-        const updated = lines.map((line, index) => {
-          const row = messages[index];
-          if (!row) return line;
+        const earlier = new Set(messages.slice(0, triggerIndex));
+        const updated = this.serializeHistoryRewrite(rows, workspaceId, (row) => {
           const ownedPrelude =
-            index < triggerIndex &&
+            earlier.has(row) &&
             preludeIds.has(row.id) &&
             !isDurableContextBoundaryMarker(row) &&
             (isSyntheticSnapshotUserMessage(row) ||
               (row.role === "assistant" && row.metadata?.synthetic === true));
-          if (index !== triggerIndex && !ownedPrelude) return line;
+          if (row !== persisted && !ownedPrelude) return row;
           const marked: MuxMessage = {
             ...row,
             metadata: { ...row.metadata, contextBudgetRejected: true },
           };
           rejected.push(marked);
-          return Buffer.from(this.serializeHistoryEntries([marked], workspaceId));
+          return marked;
         });
-        await writeFileAtomic(historyPath, Buffer.concat(updated));
+        await writeFileAtomic(historyPath, updated);
         return Ok(rejected);
       }
     );
@@ -2699,7 +2761,8 @@ export class HistoryService {
       const historyPath = this.getChatHistoryPath(workspaceId);
 
       // Read the active epoch — structural rewrite requires full file content
-      const messages = await this.readChatHistory(workspaceId);
+      const { rows, messages } = await this.readHistoryForRewrite(historyPath);
+      const updates = new Map<MuxMessage, MuxMessage>();
       const targetSequence = message.metadata?.historySequence;
 
       if (targetSequence === undefined) {
@@ -2738,6 +2801,7 @@ export class HistoryService {
             },
           };
           persistedMessage = messages[i];
+          updates.set(existingMessage, persistedMessage);
           found = true;
           break;
         }
@@ -2748,7 +2812,11 @@ export class HistoryService {
       }
 
       // Rewrite entire file
-      const historyEntries = this.serializeHistoryEntries(messages, workspaceId);
+      const historyEntries = this.serializeHistoryRewrite(
+        rows,
+        workspaceId,
+        (row) => updates.get(row) ?? row
+      );
 
       // Atomic write prevents corruption if app crashes mid-write
       await writeFileAtomic(historyPath, historyEntries);
@@ -2805,7 +2873,8 @@ export class HistoryService {
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
           await ensurePrivateDir(this.getSessionDir(workspaceId));
           const historyPath = this.getChatHistoryPath(workspaceId);
-          const messages = await this.readChatHistory(workspaceId);
+          const { rows, messages } = await this.readHistoryForRewrite(historyPath);
+          const updates = new Map<MuxMessage, MuxMessage>();
 
           // Rolling summaries are prepared outside this lock. Edits, resets, and
           // newly appended rows must win over a stale prepared boundary.
@@ -2841,6 +2910,7 @@ export class HistoryService {
                 },
               };
               persistedSummary = messages[i];
+              updates.set(sourceMessages[i], persistedSummary);
               break;
             }
             if (persistedSummary === undefined) {
@@ -2874,7 +2944,12 @@ export class HistoryService {
             messages.push(copy);
           }
 
-          const serialized = this.serializeHistoryEntries(messages, workspaceId);
+          const serialized = this.serializeHistoryRewrite(
+            rows,
+            workspaceId,
+            (row) => updates.get(row) ?? row,
+            messages.slice(sourceMessages.length)
+          );
           if (shouldPersist) {
             const stagedPath = `${historyPath}.continuous-${randomUUID()}`;
             try {
@@ -2915,7 +2990,9 @@ export class HistoryService {
       async () => {
         invalidateHistoryAppendProvenance();
         try {
-          const messages = await this.readChatHistory(workspaceId);
+          const { rows, messages } = await this.readHistoryForRewrite(
+            this.getChatHistoryPath(workspaceId)
+          );
           const foundIds = new Set(
             messages.filter((message) => ids.has(message.id)).map((message) => message.id)
           );
@@ -2927,7 +3004,7 @@ export class HistoryService {
           const filteredMessages = messages.filter((message) => !ids.has(message.id));
           await writeFileAtomic(
             this.getChatHistoryPath(workspaceId),
-            this.serializeHistoryEntries(filteredMessages, workspaceId)
+            this.serializeHistoryRewrite(rows, workspaceId, (row) => (ids.has(row.id) ? null : row))
           );
 
           const maxSeq = filteredMessages.reduce((max, message) => {
@@ -2984,13 +3061,17 @@ export class HistoryService {
     invalidateHistoryAppendProvenance();
     try {
       // Structural rewrite requires full file content
-      const messages = await this.readChatHistory(workspaceId);
+      const { rows, messages } = await this.readHistoryForRewrite(
+        this.getChatHistoryPath(workspaceId)
+      );
       const filteredMessages = messages.filter((msg) => msg.id !== messageId);
 
       if (filteredMessages.length === messages.length) {
         // Not in the active epoch — the row may live in the sealed archive
         // (rare: cleanup paths almost always target recent rows).
-        const archiveMessages = await this.readArchivedHistory(workspaceId);
+        const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
+          this.getChatArchivePath(workspaceId)
+        );
         const filteredArchive = archiveMessages.filter((msg) => msg.id !== messageId);
         if (filteredArchive.length === archiveMessages.length) {
           return Err(`Message with ID ${messageId} not found in history`);
@@ -3000,13 +3081,17 @@ export class HistoryService {
         // can never affect the sequence counter.
         await writeFileAtomic(
           this.getChatArchivePath(workspaceId),
-          this.serializeHistoryEntries(filteredArchive, workspaceId)
+          this.serializeHistoryRewrite(archiveRows, workspaceId, (row) =>
+            row.id === messageId ? null : row
+          )
         );
         return Ok(undefined);
       }
 
       const historyPath = this.getChatHistoryPath(workspaceId);
-      const historyEntries = this.serializeHistoryEntries(filteredMessages, workspaceId);
+      const historyEntries = this.serializeHistoryRewrite(rows, workspaceId, (row) =>
+        row.id === messageId ? null : row
+      );
 
       // Atomic write prevents corruption if app crashes mid-write
       await writeFileAtomic(historyPath, historyEntries);
@@ -3454,17 +3539,32 @@ export class HistoryService {
         try {
           // Migrate the sealed archive first so a crash mid-migration never leaves
           // the active file pointing at a stale-ID archive.
-          const archiveMessages = await this.readArchivedHistory(newWorkspaceId);
+          const migrate = (message: MuxMessage, raw: Buffer): MuxMessage => {
+            // A duplicate-key reset can parse as an ordinary message. Preserve
+            // that damaged row rather than normalizing away its privacy floor.
+            if (
+              !isReadableHistoryMessage(message) ||
+              (hasRawResetMarker(raw.toString("utf8")) &&
+                !hasRawResetMarker(JSON.stringify(message)))
+            )
+              return message;
+            return { ...message };
+          };
+          const { rows: archiveRows, messages: archiveMessages } = await this.readHistoryForRewrite(
+            this.getChatArchivePath(newWorkspaceId)
+          );
           if (archiveMessages.length > 0) {
             await writeFileAtomic(
               this.getChatArchivePath(newWorkspaceId),
-              this.serializeHistoryEntries(archiveMessages, newWorkspaceId)
+              this.serializeHistoryRewrite(archiveRows, newWorkspaceId, migrate)
             );
           }
 
           // Read messages from the NEW workspace location (directory was already renamed).
           // Structural rewrite requires full file content.
-          const messages = await this.readChatHistory(newWorkspaceId);
+          const { rows, messages } = await this.readHistoryForRewrite(
+            this.getChatHistoryPath(newWorkspaceId)
+          );
           if (messages.length === 0) {
             // No active messages to migrate, just transfer the sequence counter.
             // Floor it with the archive max: an archive-only session (active file
@@ -3479,7 +3579,7 @@ export class HistoryService {
 
           // Rewrite all messages with new workspace ID
           const newHistoryPath = this.getChatHistoryPath(newWorkspaceId);
-          const historyEntries = this.serializeHistoryEntries(messages, newWorkspaceId);
+          const historyEntries = this.serializeHistoryRewrite(rows, newWorkspaceId, migrate);
 
           // Atomic write prevents corruption if app crashes mid-write
           await writeFileAtomic(newHistoryPath, historyEntries);

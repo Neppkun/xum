@@ -150,6 +150,160 @@ describe("session_history real disk recovery", () => {
     );
   });
 
+  test.each([
+    "stream update",
+    "partial commit",
+    "boundary update",
+    "boundary append",
+    "single cleanup",
+    "batch cleanup",
+    "archive cleanup",
+    "workspace migration",
+    "rotation",
+  ])("automatic %s preserves unreadable reset bytes and archive privacy", async (operation) => {
+    const privateBoundary = await append("private-summary", "private summary", {
+      compacted: true,
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    await append("manual-reset", "", { contextBoundaryKind: "reset" });
+    const cleanup = await append("cleanup", "temporary payload");
+    const reply = await append("reply", "public facts");
+    const raw = await fs.readFile(chatPath);
+    const malformed = Buffer.concat([
+      Buffer.from(' \t{"metadata":{"contextBoundaryKind"\n:\n"reset"},'),
+      Buffer.from([0xff]),
+      Buffer.from(" \r\n\n"),
+      // Parseable but unreadable as a history message; migration must not normalize it.
+      Buffer.from(' {"role":"assistant", "metadata":{"contextBoundaryKind":"reset"}} \r\n'),
+      // JSON.parse succeeds but drops the first metadata field and its reset evidence.
+      Buffer.from(
+        '{"id":"duplicate","role":"assistant","parts":[],"metadata":{"contextBoundaryKind":"reset"},"metadata":{}}\n'
+      ),
+    ]);
+    await fs.writeFile(chatPath, Buffer.concat([malformed, raw.subarray(raw.indexOf(10) + 1)]));
+    const boundary = createMuxMessage("summary", "assistant", "public summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    if (operation === "stream update") {
+      expect((await fixture.historyService.updateHistory(workspaceId, reply)).success).toBe(true);
+    } else if (operation === "partial commit") {
+      await fixture.historyService.writePartial(workspaceId, reply);
+      expect((await fixture.historyService.commitPartial(workspaceId)).success).toBe(true);
+    } else if (operation === "boundary update" || operation === "boundary append") {
+      const updateExisting = operation === "boundary update";
+      if (updateExisting) {
+        boundary.id = reply.id;
+        boundary.metadata = {
+          ...boundary.metadata,
+          historySequence: reply.metadata!.historySequence,
+        };
+      }
+      expect(
+        (
+          await fixture.historyService.persistBoundaryWithTailCopies(
+            workspaceId,
+            boundary,
+            [createMuxMessage("tail", "user", "public tail")],
+            updateExisting
+          )
+        ).success
+      ).toBe(true);
+    } else if (operation === "batch cleanup") {
+      expect((await fixture.historyService.deleteMessages(workspaceId, [cleanup.id])).success).toBe(
+        true
+      );
+    } else if (operation === "single cleanup" || operation === "archive cleanup") {
+      if (operation === "archive cleanup") {
+        expect((await fixture.historyService.appendToHistory(workspaceId, boundary)).success).toBe(
+          true
+        );
+      }
+      expect((await fixture.historyService.deleteMessage(workspaceId, cleanup.id)).success).toBe(
+        true
+      );
+    } else if (operation === "workspace migration") {
+      expect(
+        (await fixture.historyService.migrateWorkspaceId("previous-id", workspaceId)).success
+      ).toBe(true);
+    } else {
+      expect((await fixture.historyService.appendToHistory(workspaceId, boundary)).success).toBe(
+        true
+      );
+    }
+    const retained = Buffer.concat([await fs.readFile(archivePath), await fs.readFile(chatPath)]);
+    expect(retained.includes(malformed)).toBe(true);
+    expect(
+      (await pages({ action: "search", query: "opening facts" })).flatMap(
+        (page) => page.items ?? []
+      )
+    ).toEqual([]);
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+    expect(
+      (await pages({ action: "list_windows" }))
+        .flatMap((page) => page.windows ?? [])
+        .every(
+          (window) => window.windowId !== `w:${String(privateBoundary.metadata!.historySequence)}`
+        )
+    ).toBe(true);
+    expect(
+      (await pages({ action: "search", query: "public" })).flatMap((page) => page.items ?? [])
+        .length
+    ).toBeGreaterThan(0);
+  });
+
+  test.each([
+    "stream update",
+    "boundary update",
+    "budget rejection",
+    "single cleanup",
+    "batch cleanup",
+  ])("a targeted %s cannot normalize away hidden reset evidence", async (operation) => {
+    await append("manual-reset", "", { contextBoundaryKind: "reset" });
+    const trigger = createMuxMessage("trigger", "user", "Request");
+    expect((await fixture.historyService.appendToHistory(workspaceId, trigger)).success).toBe(true);
+    const raw = Buffer.from(
+      JSON.stringify(trigger).replace(
+        '"metadata":',
+        '"metadata":{"contextBoundaryKind":"reset"},"metadata":'
+      ) + "\n"
+    );
+    await fs.writeFile(chatPath, raw);
+    const result =
+      operation === "stream update"
+        ? await fixture.historyService.updateHistory(workspaceId, trigger)
+        : operation === "boundary update"
+          ? await fixture.historyService.persistBoundaryWithTailCopies(
+              workspaceId,
+              {
+                ...trigger,
+                role: "assistant",
+                metadata: {
+                  ...trigger.metadata,
+                  compacted: true,
+                  compactionBoundary: true,
+                  compactionEpoch: 1,
+                },
+              },
+              [],
+              true
+            )
+          : operation === "single cleanup"
+            ? await fixture.historyService.deleteMessage(workspaceId, trigger.id)
+            : operation === "batch cleanup"
+              ? await fixture.historyService.deleteMessages(workspaceId, [trigger.id])
+              : await fixture.historyService.rejectContextBudgetRequest(workspaceId, trigger);
+    expect(result.success).toBe(false);
+    expect(await fs.readFile(chatPath)).toEqual(raw);
+    expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
   test("budget rejection preserves unreadable reset floors and unrelated raw bytes", async () => {
     await append("manual-reset", "", { contextBoundaryKind: "reset" });
     const payload = createMuxMessage("rejected-payload", "assistant", "Rejected payload", {
@@ -1287,74 +1441,98 @@ describe("session_history real disk recovery", () => {
 
   for (const mode of ["chunk", "initial page", "appended page"] as const) {
     for (const split of [1, 2, 3, 4, 5]) {
-      test(`escaped reset split after byte ${split} across a ${mode} boundary remains private`, async () => {
-        const appended = mode === "appended page";
-        const saved = appended
-          ? (await fixture.historyService.scanHistoryBounded(workspaceId, { visit: () => false }))
-              .cursor
-          : undefined;
-        // Initial scans read one chat snapshot; resumed append checks read four.
-        // Verify the resulting cursor offset below so fixture alignment is explicit.
-        const distance =
-          mode === "chunk"
-            ? SESSION_HISTORY_SCAN_CHUNK_BYTES
-            : SESSION_HISTORY_MAX_SCAN_BYTES -
-              2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES -
-              SESSION_HISTORY_ANCHOR_BYTES * (appended ? 8 : 2);
-        const publicLine =
-          JSON.stringify(createMuxMessage("public-after-split", "assistant", "public facts")) +
-          "\n";
-        const suffix = 'eset"},"tail":"';
-        const end = '"}\n' + publicLine;
-        const padding = distance - (6 - split + suffix.length + end.length);
-        const row =
-          '{"id":"split-reset","role":"assistant","parts":[],"padding":"' +
-          "x".repeat(2 * SESSION_HISTORY_MAX_LINE_BYTES) +
-          '","metadata":{"contextBoundaryKind":"' +
-          "\\u0072" +
-          suffix +
-          "x".repeat(padding) +
-          end;
-        await appendTrackedHistory(chatPath, row);
-        const emitted: string[] = [];
-        const visit = ({ message }: { message: MuxMessage }) => {
-          emitted.push(message.id);
-          return true;
-        };
-        const first = await fixture.historyService.scanHistoryBounded(workspaceId, {
-          cursor: saved,
-          visit,
-        });
-        expect(first.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-        expect(first.cursor).toBeDefined();
-        if (mode === "chunk") expect(first.cursor?.possibleReset).toBe(true);
-        else {
-          const position = appended ? first.cursor?.appendCheck : first.cursor;
-          expect(position?.byteOffset).toBe((await fs.stat(chatPath)).size - distance);
-          expect(position?.possibleReset).toBe(false);
-        }
-        let cursor = first.cursor;
-        let stale = false;
-        let pageCount = 0;
-        while (cursor) {
-          try {
-            const next = await fixture.historyService.scanHistoryBounded(workspaceId, {
-              cursor,
-              visit,
-            });
-            expect(next.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
-            expect(next.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
-            cursor = next.cursor;
-          } catch (error) {
-            expect(error).toMatchObject({ message: "stale_cursor" });
-            stale = true;
-            break;
+      test.each(
+        [
+          {
+            name: "value",
+            prefix: '","metadata":{"contextBoundaryKind":"',
+            escape: "\\u0072",
+            suffix: 'eset"},"tail":"',
+          },
+          {
+            name: "colon",
+            prefix: '","metadata":{"contextBoundaryKind"',
+            escape: "\\u003a",
+            suffix: '"reset"},"tail":"',
+          },
+          {
+            name: "uppercase colon",
+            prefix: '","metadata":{"contextBoundaryKind"',
+            escape: "\\u003A",
+            suffix: '"reset"},"tail":"',
+          },
+        ].map((token) => [token.name, token] as const)
+      )(
+        `escaped reset %s split after byte ${split} across a ${mode} boundary remains private`,
+        async (_name, token) => {
+          const appended = mode === "appended page";
+          const saved = appended
+            ? (await fixture.historyService.scanHistoryBounded(workspaceId, { visit: () => false }))
+                .cursor
+            : undefined;
+          // Initial scans read one chat snapshot; resumed append checks read four.
+          // Verify the resulting cursor offset below so fixture alignment is explicit.
+          const distance =
+            mode === "chunk"
+              ? SESSION_HISTORY_SCAN_CHUNK_BYTES
+              : SESSION_HISTORY_MAX_SCAN_BYTES -
+                2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES -
+                SESSION_HISTORY_ANCHOR_BYTES * (appended ? 8 : 2);
+          const publicLine =
+            JSON.stringify(createMuxMessage("public-after-split", "assistant", "public facts")) +
+            "\n";
+          const suffix = token.suffix;
+          const end = '"}\n' + publicLine;
+          const padding = distance - (6 - split + suffix.length + end.length);
+          const row =
+            '{"id":"split-reset","role":"assistant","parts":[],"padding":"' +
+            "x".repeat(2 * SESSION_HISTORY_MAX_LINE_BYTES) +
+            token.prefix +
+            token.escape +
+            suffix +
+            "x".repeat(padding) +
+            end;
+          await appendTrackedHistory(chatPath, row);
+          const emitted: string[] = [];
+          const visit = ({ message }: { message: MuxMessage }) => {
+            emitted.push(message.id);
+            return true;
+          };
+          const first = await fixture.historyService.scanHistoryBounded(workspaceId, {
+            cursor: saved,
+            visit,
+          });
+          expect(first.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+          expect(first.cursor).toBeDefined();
+          if (mode === "chunk") expect(first.cursor?.possibleReset).toBe(true);
+          else {
+            const position = appended ? first.cursor?.appendCheck : first.cursor;
+            expect(position?.byteOffset).toBe((await fs.stat(chatPath)).size - distance);
+            expect(position?.possibleReset).toBe(false);
           }
-          expect(++pageCount).toBeLessThan(10);
+          let cursor = first.cursor;
+          let stale = false;
+          let pageCount = 0;
+          while (cursor) {
+            try {
+              const next = await fixture.historyService.scanHistoryBounded(workspaceId, {
+                cursor,
+                visit,
+              });
+              expect(next.bytesRead).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_BYTES);
+              expect(next.rowsScanned).toBeLessThanOrEqual(SESSION_HISTORY_MAX_SCAN_ROWS);
+              cursor = next.cursor;
+            } catch (error) {
+              expect(error).toMatchObject({ message: "stale_cursor" });
+              stale = true;
+              break;
+            }
+            expect(++pageCount).toBeLessThan(10);
+          }
+          expect(stale).toBe(appended);
+          expect(emitted).toEqual(appended ? [] : ["public-after-split"]);
         }
-        expect(stale).toBe(appended);
-        expect(emitted).toEqual(appended ? [] : ["public-after-split"]);
-      });
+      );
     }
   }
 
