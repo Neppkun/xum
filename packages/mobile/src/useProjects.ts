@@ -2,18 +2,23 @@ import { useEffect, useState } from "react";
 import type { MobileClient } from "./api";
 import type { FrontendWorkspaceMetadata } from "../../../src/common/types/workspace";
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
+import { linkedAbortController } from "./useConnection";
 
 export type Projects = Awaited<ReturnType<MobileClient["projects"]["list"]>>;
-export function useProjects(client: MobileClient) {
+export function useProjects(client: MobileClient, signal: AbortSignal) {
   const [projects, setProjects] = useState<Projects>([]);
   const [workspaces, setWorkspaces] = useState<FrontendWorkspaceMetadata[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [generation, setGeneration] = useState(0);
   useEffect(() => {
-    const controller = new AbortController();
+    const controller = linkedAbortController(signal);
     setLoading(true);
     setError(null);
+    if (signal.aborted) {
+      setLoading(false);
+      return;
+    }
     async function load() {
       // Subscribe before listing so metadata changes during the snapshot are not lost.
       const events = await client.workspace.onMetadata(undefined, { signal: controller.signal });
@@ -45,6 +50,6 @@ export function useProjects(client: MobileClient) {
       }
     });
     return () => controller.abort();
-  }, [client, generation]);
+  }, [client, signal, generation]);
   return { projects, workspaces, loading, error, retry: () => setGeneration((value) => value + 1) };
 }

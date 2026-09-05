@@ -4,10 +4,13 @@ import { RefreshCw } from "lucide-react-native";
 import type { MobileClient } from "../api";
 import { Header, IconButton, Loading, Notice } from "../components/Controls";
 import { colors, layout, mono } from "../theme";
+import { linkedAbortController } from "../useConnection";
 
 export function ChangesScreen(props: {
   client: MobileClient;
   workspaceId: string;
+  signal: AbortSignal;
+  onReconnect: () => Promise<void>;
   onBack: () => void;
 }) {
   const [output, setOutput] = useState<string | null>(null);
@@ -18,10 +21,14 @@ export function ChangesScreen(props: {
     setGeneration((value) => value + 1);
   }
   useEffect(() => {
-    const controller = new AbortController();
+    const controller = linkedAbortController(props.signal);
     setOutput(null);
     setError(null);
     setNote(null);
+    if (controller.signal.aborted) {
+      setError("Reconnect to load changes.");
+      return;
+    }
     // Fixed argv prevents branch/file names from becoming shell code. Disable external
     // diff/textconv hooks: this view only reads tracked worktree changes against HEAD.
     props.client.workspace
@@ -59,7 +66,7 @@ export function ChangesScreen(props: {
           setError(cause instanceof Error ? cause.message : "Could not load changes.");
       });
     return () => controller.abort();
-  }, [props.client, props.workspaceId, generation]);
+  }, [props.client, props.workspaceId, props.signal, generation]);
   return (
     <View style={layout.fill}>
       <Header
@@ -73,7 +80,7 @@ export function ChangesScreen(props: {
           Read-only. Includes staged and unstaged tracked files; untracked files and changes already
           committed are not included.
         </Text>
-        {error && <Notice onRetry={retry}>{error}</Notice>}
+        {error && <Notice onRetry={props.onReconnect}>{error}</Notice>}
         {output === null && !error && <Loading label="Reading changes…" />}
         {note && <Notice>{note}</Notice>}
         {output === "" && <Text style={layout.text}>No tracked changes against HEAD.</Text>}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Modal, StatusBar, Text, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { Menu, Plus } from "lucide-react-native";
@@ -12,11 +12,11 @@ import { ChangesScreen } from "./src/screens/ChangesScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { Button, Header, IconButton, Loading, Notice } from "./src/components/Controls";
 import { useProjects } from "./src/useProjects";
+import { useConnection } from "./src/useConnection";
 import { colors, layout } from "./src/theme";
 
 export default function App() {
   const [connection, setConnection] = useState<Connection | null>(null);
-  useEffect(() => () => connection?.close(), [connection]);
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={colors.background} />
@@ -34,7 +34,8 @@ export default function App() {
 function ConnectedApp(props: { connection: Connection; onDisconnect: () => void }) {
   const { width } = useWindowDimensions();
   const wide = width >= 900;
-  const data = useProjects(props.connection.client);
+  const session = useConnection(props.connection);
+  const data = useProjects(session.connection.client, session.signal);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [drawer, setDrawer] = useState(false);
   const [create, setCreate] = useState(false);
@@ -43,6 +44,7 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
   const [disconnecting, setDisconnecting] = useState(false);
   const selected = data.workspaces.find((workspace) => workspace.id === selectedId);
   async function disconnect() {
+    session.cancel();
     setDisconnecting(true);
     setDisconnectError(null);
     try {
@@ -59,7 +61,9 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
     <Navigator
       {...data}
       selectedId={selected?.id}
-      onRetry={data.retry}
+      error={session.error ?? data.error}
+      loading={session.reconnecting || data.loading}
+      onRetry={session.reconnect}
       onSelect={(workspace) => {
         setSelectedId(workspace.id);
         setDrawer(false);
@@ -67,7 +71,7 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
       }}
       onCreate={() => {
         setDrawer(false);
-        setCreate(true);
+        if (session.ready) setCreate(true);
       }}
       onSettings={() => {
         setDrawer(false);
@@ -80,6 +84,8 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
     <View style={[layout.fill, { flexDirection: "row" }]}>
       {wide && <View style={{ width: 292 }}>{navigation}</View>}
       <View style={{ flex: 1, minWidth: 0 }}>
+        {session.reconnecting && <Loading label="Reconnecting to your server…" />}
+        {session.error && <Notice onRetry={session.reconnect}>{session.error}</Notice>}
         <View
           style={[
             layout.fill,
@@ -89,8 +95,11 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
           {selected ? (
             <ConversationScreen
               key={selected.id}
-              client={props.connection.client}
+              client={session.connection.client}
               workspace={selected}
+              signal={session.signal}
+              connected={session.ready}
+              onReconnect={session.reconnect}
               onMenu={wide ? undefined : () => setDrawer(true)}
               onChanges={() => setScreen("changes")}
             />
@@ -112,7 +121,7 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
                 {data.loading ? (
                   <Loading label="Loading your workspaces…" />
                 ) : data.error ? (
-                  <Notice onRetry={data.retry}>{data.error}</Notice>
+                  <Notice onRetry={session.reconnect}>{data.error}</Notice>
                 ) : (
                   <>
                     <Text style={layout.title}>Make space for your next idea.</Text>
@@ -120,7 +129,7 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
                       Select a workspace or start a new conversation. Everything stays on your Xum
                       server.
                     </Text>
-                    <Button icon={Plus} onPress={() => setCreate(true)}>
+                    <Button icon={Plus} disabled={!session.ready} onPress={() => setCreate(true)}>
                       New workspace
                     </Button>
                   </>
@@ -132,14 +141,16 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
         {screen === "changes" && selected && (
           <ChangesScreen
             key={selected.id}
-            client={props.connection.client}
+            client={session.connection.client}
             workspaceId={selected.id}
+            signal={session.signal}
+            onReconnect={session.reconnect}
             onBack={() => setScreen("chat")}
           />
         )}
         {screen === "settings" && (
           <SettingsScreen
-            endpoint={props.connection.endpoint}
+            endpoint={session.connection.endpoint}
             onDisconnect={disconnect}
             onBack={() => setScreen("chat")}
             error={disconnectError}
@@ -154,8 +165,11 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
       )}
       {create && (
         <CreateWorkspace
-          client={props.connection.client}
+          client={session.connection.client}
           projects={data.projects}
+          signal={session.signal}
+          connected={session.ready}
+          onReconnect={session.reconnect}
           onClose={() => setCreate(false)}
           onCreated={(workspace) => {
             setSelectedId(workspace.id);

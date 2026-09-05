@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from "react-native";
 import { ArrowRight, ShieldCheck } from "lucide-react-native";
 import { connect } from "../connection";
+import { isInsecureEndpoint } from "../endpoint";
 import { loadCredentials, saveCredentials } from "../credentials";
 import { Button, Field, Loading, Notice } from "../components/Controls";
 import { colors, layout } from "../theme";
@@ -15,6 +16,12 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const request = useRef<AbortController | null>(null);
+  let insecure = false;
+  try {
+    insecure = isInsecureEndpoint(endpoint.trim());
+  } catch {
+    /* A partially entered URL is validated on connect, not while typing. */
+  }
 
   useEffect(() => {
     let active = true;
@@ -117,6 +124,12 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
                   if (endpoint.trim() && token.trim()) return submit();
                 }}
               />
+              {insecure && (
+                <Notice>
+                  This HTTP connection is not encrypted. Your bearer token and conversations can be
+                  read by others on the network. Continue only on a trusted local network.
+                </Notice>
+              )}
               {error && <Notice>{error}</Notice>}
               <Button
                 icon={ArrowRight}
@@ -126,7 +139,7 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
                   return submit();
                 }}
               >
-                Connect to Xum
+                {insecure ? "Connect without encryption" : "Connect to Xum"}
               </Button>
             </>
           )}

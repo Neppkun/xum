@@ -23,6 +23,7 @@ import type { MuxMessage } from "../../../../src/common/types/message";
 import { IconButton, Loading, Notice } from "../components/Controls";
 import { Message } from "../components/Message";
 import { useConversation } from "../useConversation";
+import { linkedAbortController } from "../useConnection";
 import { resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
@@ -31,10 +32,17 @@ import { colors, layout } from "../theme";
 export function ConversationScreen(props: {
   client: MobileClient;
   workspace: FrontendWorkspaceMetadata;
+  signal: AbortSignal;
+  connected: boolean;
+  onReconnect: () => Promise<void>;
   onMenu?: () => void;
   onChanges: () => void;
 }) {
-  const { transcript, settings, error, retry } = useConversation(props.client, props.workspace.id);
+  const { transcript, settings, error } = useConversation(
+    props.client,
+    props.workspace.id,
+    props.signal
+  );
   const [overrides, setOverrides] = useState<ChatSettings | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -47,15 +55,18 @@ export function ConversationScreen(props: {
   // This component is keyed by workspace ID: both subscription and in-flight actions
   // belong to one workspace, and a switch cannot expose the previous draft/history.
   useEffect(() => {
-    const abort = new AbortController();
+    const abort = linkedAbortController(props.signal);
     controller.current = abort;
+    pending.current = false;
+    setBusy(false);
     return () => abort.abort();
-  }, []);
+  }, [props.signal]);
   const agentId = props.workspace.agentId ?? "exec";
   const options =
     overrides ?? (settings ? resolveSettings(props.workspace, settings, agentId) : null);
-  const ready = transcript.caughtUp && !error && settings !== null;
-  const running = transcript.streaming;
+  const ready =
+    props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
+  const running = ready && transcript.streaming;
 
   async function send() {
     if (!ready || !options?.model || !draft.trim() || pending.current || running) return;
@@ -82,8 +93,10 @@ export function ConversationScreen(props: {
           `${cause instanceof Error ? cause.message : "Message could not be sent."} If the connection was lost, reload history before retrying to avoid sending twice.`
         );
     } finally {
-      pending.current = false;
-      if (!signal.aborted) setBusy(false);
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
     }
   }
 
@@ -103,8 +116,10 @@ export function ConversationScreen(props: {
       if (!signal.aborted)
         setActionError(cause instanceof Error ? cause.message : "Could not interrupt the agent.");
     } finally {
-      pending.current = false;
-      if (!signal.aborted) setBusy(false);
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
     }
   }
 
@@ -171,7 +186,7 @@ export function ConversationScreen(props: {
         }
         ListFooterComponent={
           <View style={{ gap: 12 }}>
-            {error && <Notice onRetry={retry}>{error}</Notice>}
+            {error && <Notice onRetry={props.onReconnect}>{error}</Notice>}
             {transcript.error && <Notice>{transcript.error}</Notice>}
             {running && (
               <Text style={[layout.muted, { color: colors.accent }]}>Agent is working…</Text>
@@ -193,7 +208,7 @@ export function ConversationScreen(props: {
           <Notice
             onRetry={() => {
               setActionError(null);
-              retry();
+              return props.onReconnect();
             }}
           >
             {actionError}

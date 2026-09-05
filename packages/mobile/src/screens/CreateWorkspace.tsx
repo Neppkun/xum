@@ -6,9 +6,13 @@ import type { Projects } from "../useProjects";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import { Button, Field, Loading, Notice, Sheet } from "../components/Controls";
 import { colors, layout } from "../theme";
+import { linkedAbortController } from "../useConnection";
 
 export function CreateWorkspace(props: {
   client: MobileClient;
+  signal: AbortSignal;
+  connected: boolean;
+  onReconnect: () => Promise<void>;
   projects: Projects;
   onCreated: (workspace: FrontendWorkspaceMetadata) => void;
   onClose: () => void;
@@ -60,6 +64,9 @@ export function CreateWorkspace(props: {
       <CreateForm
         key={project ?? "scratch"}
         client={props.client}
+        signal={props.signal}
+        connected={props.connected}
+        onReconnect={props.onReconnect}
         project={project}
         onCreated={props.onCreated}
       />
@@ -69,6 +76,9 @@ export function CreateWorkspace(props: {
 
 function CreateForm(props: {
   client: MobileClient;
+  signal: AbortSignal;
+  connected: boolean;
+  onReconnect: () => Promise<void>;
   project: string | null;
   onCreated: (workspace: FrontendWorkspaceMetadata) => void;
 }) {
@@ -79,12 +89,17 @@ function CreateForm(props: {
   const [loading, setLoading] = useState(props.project !== null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [generation, setGeneration] = useState(0);
   const pending = useRef(false);
   const controller = useRef(new AbortController());
   useEffect(() => {
-    const abort = new AbortController();
+    const abort = linkedAbortController(props.signal);
     controller.current = abort;
+    pending.current = false;
+    setBusy(false);
+    if (abort.signal.aborted) {
+      setLoading(false);
+      return;
+    }
     if (props.project) {
       setLoading(true);
       props.client.projects
@@ -104,10 +119,10 @@ function CreateForm(props: {
         });
     }
     return () => abort.abort();
-  }, [props.client, props.project, generation]);
+  }, [props.client, props.project, props.signal]);
 
   async function create() {
-    if (pending.current) return;
+    if (pending.current || !props.connected || props.signal.aborted) return;
     pending.current = true;
     setBusy(true);
     setError(null);
@@ -139,8 +154,10 @@ function CreateForm(props: {
             : "Could not create workspace. Refresh the list before retrying if the connection dropped."
         );
     } finally {
-      pending.current = false;
-      if (!signal.aborted) setBusy(false);
+      if (controller.current.signal === signal) {
+        pending.current = false;
+        if (!signal.aborted) setBusy(false);
+      }
     }
   }
   return (
@@ -191,10 +208,15 @@ function CreateForm(props: {
         </>
       )}
       {loading && <Loading label="Loading base branches…" />}
-      {error && <Notice onRetry={() => setGeneration((value) => value + 1)}>{error}</Notice>}
+      {error && <Notice onRetry={props.onReconnect}>{error}</Notice>}
       <Button
         busy={busy}
-        disabled={loading || (props.project !== null && !trunk.trim())}
+        disabled={
+          !props.connected ||
+          props.signal.aborted ||
+          loading ||
+          (props.project !== null && !trunk.trim())
+        }
         onPress={create}
       >
         {props.project ? "Create worktree" : "Create scratch chat"}

@@ -2,17 +2,20 @@ import { useEffect, useState } from "react";
 import type { MobileClient } from "./api";
 import { applyChatEvent, createTranscriptState } from "./transcript";
 import type { SettingsData } from "./settings";
+import { linkedAbortController } from "./useConnection";
 
-export function useConversation(client: MobileClient, workspaceId: string) {
+export function useConversation(client: MobileClient, workspaceId: string, signal: AbortSignal) {
   const [transcript, setTranscript] = useState(createTranscriptState);
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [generation, setGeneration] = useState(0);
+  const [owner, setOwner] = useState(() => client);
   useEffect(() => {
-    const controller = new AbortController();
+    const controller = linkedAbortController(signal);
     setTranscript(createTranscriptState());
     setSettings(null);
     setError(null);
+    setOwner(() => client);
+    if (signal.aborted) return;
     async function subscribe() {
       const [config, providers, agents] = await Promise.all([
         client.config.getConfig(undefined, { signal: controller.signal }),
@@ -43,6 +46,10 @@ export function useConversation(client: MobileClient, workspaceId: string) {
         );
     });
     return () => controller.abort();
-  }, [client, workspaceId, generation]);
-  return { transcript, settings, error, retry: () => setGeneration((value) => value + 1) };
+  }, [client, workspaceId, signal]);
+  // A replacement client must never inherit the old socket’s caught-up flag, even
+  // for the render before the subscription effect runs. Draft state lives above this hook.
+  return owner === client
+    ? { transcript, settings, error }
+    : { transcript: createTranscriptState(), settings: null, error: null };
 }
