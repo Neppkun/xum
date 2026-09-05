@@ -1,3 +1,9 @@
+import {
+  HistoryAppendProvenance,
+  HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
+} from "@/node/services/historyAppendProvenance";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "@/node/services/workspaceRemoval";
 import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
 import { appendFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -38,6 +44,18 @@ async function append(
   expect((await fixture.historyService.appendToHistory(workspaceId, message)).success).toBe(true);
   return message;
 }
+// Malformed-row fixtures intentionally use the same cooperative append receipt
+// contract as production while bypassing message-shape normalization only.
+async function appendTrackedHistory(filePath: string, data: string | Buffer): Promise<void> {
+  const store = new HistoryAppendProvenance(path.dirname(filePath));
+  await using _lock = await acquireProcessFileLock({
+    lockPath: historyWriteLockPath(fixture.config.rootDir, workspaceId),
+    timeoutMs: 5000,
+    label: "test history append",
+  });
+  await store.runMutation(() => store.appendChat(Buffer.isBuffer(data) ? data : Buffer.from(data)));
+}
+
 async function pages(input: SessionHistoryArgs) {
   const results: SessionHistoryResult[] = [];
   let cursor: string | undefined;
@@ -97,6 +115,41 @@ afterEach(async () => {
 });
 
 describe("session_history real disk recovery", () => {
+  test("an interior same-length rewrite followed by append cannot retain cursor trust", async () => {
+    const victim = JSON.stringify(createMuxMessage("rewrite-victim", "assistant", "x".repeat(600)));
+    const offset = (await fs.stat(chatPath)).size;
+    await fs.appendFile(
+      chatPath,
+      victim +
+        "\n" +
+        [
+          createMuxMessage("private-after-victim", "assistant", "private facts"),
+          createMuxMessage("anchor-padding", "assistant", "z".repeat(500)),
+        ]
+          .map((row) => JSON.stringify(row))
+          .join("\n") +
+        "\n"
+    );
+    const first = await call({ action: "search", query: "facts", limit: 1 });
+    expect(first.nextCursor).toBeString();
+    const reset = JSON.stringify(
+      createMuxMessage("new-manual-reset", "assistant", "", { contextBoundaryKind: "reset" })
+    );
+    const handle = await fs.open(chatPath, "r+");
+    try {
+      await handle.write(Buffer.from(reset.padEnd(victim.length)), 0, victim.length, offset);
+    } finally {
+      await handle.close();
+    }
+    await fs.appendFile(
+      chatPath,
+      JSON.stringify(createMuxMessage("untracked-append", "assistant", "new row")) + "\n"
+    );
+    expect((await call({ action: "search", query: "facts", cursor: first.nextCursor })).error).toBe(
+      "stale_cursor"
+    );
+  });
+
   test("budget rejection preserves unreadable reset floors and unrelated raw bytes", async () => {
     await append("manual-reset", "", { contextBoundaryKind: "reset" });
     const payload = createMuxMessage("rejected-payload", "assistant", "Rejected payload", {
@@ -150,7 +203,7 @@ describe("session_history real disk recovery", () => {
   ]) {
     test(`search consumes ${scenario.name} without aliasing or blocking valid older items`, async () => {
       const addressablePrefix = scenario.id.slice(0, 100);
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         [
           createMuxMessage(scenario.id, "assistant", "match unaddressable", {
@@ -207,7 +260,7 @@ describe("session_history real disk recovery", () => {
         createMuxMessage("addressable-boundary", "assistant", "", rollover),
         createMuxMessage("public", "assistant", "public facts"),
       ];
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         rows.map((message) => JSON.stringify(message)).join("\n") + "\n"
       );
@@ -232,7 +285,7 @@ describe("session_history real disk recovery", () => {
   );
 
   test("negative persisted sequences use legacy IDs without invalidating the next cursor", async () => {
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       [
         createMuxMessage("negative-sequence", "assistant", "match negative", {
@@ -252,7 +305,7 @@ describe("session_history real disk recovery", () => {
 
   test("oversized persisted IDs remain addressable through safe sequences", async () => {
     const id = "s".repeat(20 * 1024);
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       [
         createMuxMessage(id, "assistant", "", {
@@ -306,7 +359,10 @@ describe("session_history real disk recovery", () => {
     const tail = Array.from({ length: 650 }, (_, i) =>
       createMuxMessage(`append-${i}`, "assistant", "match" + "z".repeat(4096))
     );
-    await fs.appendFile(chatPath, tail.map((message) => JSON.stringify(message)).join("\n") + "\n");
+    await appendTrackedHistory(
+      chatPath,
+      tail.map((message) => JSON.stringify(message)).join("\n") + "\n"
+    );
     let cursor = first.nextCursor;
     const results: SessionHistoryResult[] = [];
     do {
@@ -325,14 +381,14 @@ describe("session_history real disk recovery", () => {
   });
 
   test("malformed lines do not hide surviving rows and a legacy reset still protects older IDs", async () => {
-    await fs.appendFile(chatPath, "not-json\nnull\n");
-    await fs.appendFile(
+    await appendTrackedHistory(chatPath, "not-json\nnull\n");
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(
         createMuxMessage("legacy-reset", "assistant", "", { contextBoundaryKind: "reset" })
       ) + "\n"
     );
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       "broken-json\n" +
         JSON.stringify(createMuxMessage("after-legacy-reset", "assistant", "recoverable")) +
@@ -357,12 +413,12 @@ describe("session_history real disk recovery", () => {
       compactionEpoch: 1,
     });
     const hidden = await append("private-item", "private-before-malformed-reset");
-    await fs.appendFile(chatPath, resetLine + "\n");
+    await appendTrackedHistory(chatPath, resetLine + "\n");
     const publicBoundary = createMuxMessage("public-boundary", "assistant", "", {
       ...rollover,
       historySequence: 100,
     });
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       [
         JSON.stringify(publicBoundary),
@@ -460,7 +516,7 @@ describe("session_history real disk recovery", () => {
         '"contextBoundaryKind":"reset"',
         '"contextBoundary\\u004bind" \t: "r\\u0065set"'
       );
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         resetLine +
           "\n" +
@@ -497,14 +553,14 @@ describe("session_history real disk recovery", () => {
       "0" +
       "]".repeat(10000) +
       "}";
-    await fs.appendFile(chatPath, resetLine + "\n");
+    await appendTrackedHistory(chatPath, resetLine + "\n");
     expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
       "item_not_found"
     );
   });
 
   test("a populated reset row cannot impersonate a complete rollover boundary", async () => {
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(
         createMuxMessage("populated-rollover", "assistant", "not a boundary-only row", {
@@ -522,7 +578,7 @@ describe("session_history real disk recovery", () => {
     await append("private-item", "older facts");
     const first = await call({ action: "search", query: "facts", limit: 1 });
     const [boundary, leadIn] = createRolloverPrefix(validRollover);
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       [boundary, leadIn, createMuxMessage("after-rollover", "assistant", "newer facts")]
         .map((message) => JSON.stringify(message))
@@ -543,7 +599,7 @@ describe("session_history real disk recovery", () => {
     await append("two", "match two");
     const first = await call({ action: "search", query: "match", limit: 1 });
     expect(first.nextCursor).toBeString();
-    await fs.appendFile(chatPath, '{"metadata":{"contextBoundaryKind":"reset"},"parts":[\n');
+    await appendTrackedHistory(chatPath, '{"metadata":{"contextBoundaryKind":"reset"},"parts":[\n');
     expect((await call({ action: "search", query: "match", cursor: first.nextCursor })).error).toBe(
       "stale_cursor"
     );
@@ -569,7 +625,7 @@ describe("session_history real disk recovery", () => {
       compactionBoundary: true,
       compactionEpoch: 3,
     });
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(legacy) +
         "\n" +
@@ -606,7 +662,10 @@ describe("session_history real disk recovery", () => {
     const tail = Array.from({ length: 650 }, (_, i) =>
       createMuxMessage(`tail-${i}`, "assistant", `public-${i}`, { historySequence: 1000 + i })
     );
-    await fs.appendFile(chatPath, tail.map((message) => JSON.stringify(message)).join("\n") + "\n");
+    await appendTrackedHistory(
+      chatPath,
+      tail.map((message) => JSON.stringify(message)).join("\n") + "\n"
+    );
     const first = await call({
       action: "read_item",
       item_id: String(hidden.metadata!.historySequence),
@@ -738,7 +797,7 @@ describe("session_history real disk recovery", () => {
   });
 
   test("oversized rows consume bounded bytes and resume mid-line, then recover newer data", async () => {
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(
         createMuxMessage("giant", "assistant", "", undefined, [
@@ -753,7 +812,7 @@ describe("session_history real disk recovery", () => {
         ])
       ) + "\n"
     );
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(createMuxMessage("after", "assistant", "recover me")) + "\n"
     );
@@ -788,7 +847,7 @@ describe("session_history real disk recovery", () => {
       const key =
         junk.length > 1000 ? unicodeEscapes("contextBoundaryKind") : "contextBoundaryKind";
       const value = junk.length > 1000 ? unicodeEscapes("reset") : "reset";
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         `{"id":"junk-reset","role":"assistant","metadata":{"${key}"${junk}:${junk}"${value}"},"parts":[]}\n` +
           JSON.stringify(createMuxMessage("after-junk-reset", "assistant", "public facts")) +
@@ -823,7 +882,7 @@ describe("session_history real disk recovery", () => {
   }
 
   test("valid non-reset fields cannot be joined by the malformed-token recognizer", async () => {
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(
         createMuxMessage("not-a-reset", "assistant", "facts remain readable", {
@@ -844,7 +903,7 @@ describe("session_history real disk recovery", () => {
     '"contextBoundaryKinds" junk : junk "reset"',
     '"contextBoundaryKind" junk : junk "resume"',
   ])("unrelated malformed tokens do not create a reset: %s", async (fragment) => {
-    await fs.appendFile(chatPath, fragment + "\n");
+    await appendTrackedHistory(chatPath, fragment + "\n");
     expect(
       (await pages({ action: "read_item", item_id: "0" }))
         .flatMap((page) => page.items ?? [])
@@ -864,7 +923,7 @@ describe("session_history real disk recovery", () => {
       await append("private", "private facts");
       const first = await call({ action: "search", query: "facts", limit: 1 });
       const marker = `"contextBoundaryKind"${separator}:${separator}"reset"`;
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         `{"id":"control-reset","role":"assistant","parts":[],"metadata":{${marker}}}\n` +
           JSON.stringify(createMuxMessage("public", "assistant", "public facts")) +
@@ -895,7 +954,7 @@ describe("session_history real disk recovery", () => {
         ':"' +
         unicodeEscapes("reset") +
         '"';
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         `{"id":"giant-control-reset","role":"assistant","parts":[],"metadata":{${marker}},"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}\n`
       );
@@ -931,7 +990,7 @@ describe("session_history real disk recovery", () => {
       '"metadata":',
       '"metadata":{"contextBoundaryKind":"reset"},"metadata":'
     );
-    await fs.appendFile(chatPath, repaired + "\n");
+    await appendTrackedHistory(chatPath, repaired + "\n");
     expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
       "item_not_found"
     );
@@ -961,7 +1020,7 @@ describe("session_history real disk recovery", () => {
           historySequence: 0,
         }
       );
-      await fs.appendFile(chatPath, JSON.stringify(reset) + "\n");
+      await appendTrackedHistory(chatPath, JSON.stringify(reset) + "\n");
       expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
         "item_not_found"
       );
@@ -971,7 +1030,7 @@ describe("session_history real disk recovery", () => {
         await fixture.historyService.appendManyToHistory(workspaceId, [boundary, leadIn]);
       else if (mode === "lazy") {
         boundary.metadata = { ...boundary.metadata, historySequence: 3 };
-        await fs.appendFile(chatPath, JSON.stringify(boundary) + "\n");
+        await appendTrackedHistory(chatPath, JSON.stringify(boundary) + "\n");
         expect(
           (await fixture.historyService.getHistoryFromLatestBoundary(workspaceId)).success
         ).toBe(true);
@@ -1036,7 +1095,7 @@ describe("session_history real disk recovery", () => {
     test(`reset fragmented ${fragment.name} blocks initial and resumed recovery`, async () => {
       const hidden = await append("private", "private facts");
       const first = await call({ action: "search", query: "facts", limit: 1 });
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         `{"id":"fragmented-reset","role":"assistant","parts":[],"metadata":{${fragment.marker}}}\n` +
           JSON.stringify(createMuxMessage("public-after-fragments", "assistant", "public facts")) +
@@ -1073,7 +1132,7 @@ describe("session_history real disk recovery", () => {
   }
 
   test("valid-row isolation does not discard a raw reset hidden by duplicate keys", async () => {
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       '{"id":"duplicate-reset","role":"assistant","parts":[],"metadata":{"contextBoundaryKind":"reset","contextBoundaryKind":"normal"}}\n'
     );
@@ -1083,7 +1142,7 @@ describe("session_history real disk recovery", () => {
   });
 
   test("a fully pretty-printed reset still protects the earlier transcript", async () => {
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(
         createMuxMessage("pretty-reset", "assistant", "", { contextBoundaryKind: "reset" }),
@@ -1106,12 +1165,12 @@ describe("session_history real disk recovery", () => {
 
   test("a new append cannot finish an older malformed reset without expiring the cursor", async () => {
     await append("private", "private facts");
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       '{"id":"cross-snapshot-reset","role":"assistant","parts":[],"metadata":{"contextBoundaryKind"\n'
     );
     const first = await call({ action: "search", query: "facts", limit: 1 });
-    await fs.appendFile(chatPath, ':"reset"}}\n');
+    await appendTrackedHistory(chatPath, ':"reset"}}\n');
     expect((await call({ action: "search", query: "facts", cursor: first.nextCursor })).error).toBe(
       "stale_cursor"
     );
@@ -1125,7 +1184,7 @@ describe("session_history real disk recovery", () => {
       const separatingRow = useRollover
         ? createRolloverPrefix(validRollover)[0]
         : createMuxMessage("separator", "assistant", "ordinary data");
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         '"contextBoundaryKind"\n' + JSON.stringify(separatingRow) + '\n:"reset"\n'
       );
@@ -1161,7 +1220,7 @@ describe("session_history real disk recovery", () => {
       const first = await call({ action: "search", query: "facts", limit: 1 });
       const marker = `"${key}"` + " \t".repeat(SESSION_HISTORY_MAX_SCAN_BYTES) + ` : "${value}"`;
       const row = `{"id":"escaped-reset","role":"assistant","metadata":{${marker}},"parts":[],"padding":"${"x".repeat(SESSION_HISTORY_MAX_SCAN_BYTES)}"}\n`;
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         row +
           JSON.stringify(createMuxMessage("after-escaped-reset", "assistant", "public facts")) +
@@ -1214,7 +1273,7 @@ describe("session_history real disk recovery", () => {
     ],
   ]) {
     test(`oversized Unicode data with ${name} remains traversable`, async () => {
-      await fs.appendFile(
+      await appendTrackedHistory(
         chatPath,
         `{"id":"not-reset","role":"assistant","metadata":{${key}:${value}},"parts":[],"padding":"${"x".repeat(2 * SESSION_HISTORY_MAX_LINE_BYTES)}"}\n`
       );
@@ -1239,7 +1298,9 @@ describe("session_history real disk recovery", () => {
         const distance =
           mode === "chunk"
             ? SESSION_HISTORY_SCAN_CHUNK_BYTES
-            : SESSION_HISTORY_MAX_SCAN_BYTES - SESSION_HISTORY_ANCHOR_BYTES * (appended ? 8 : 2);
+            : SESSION_HISTORY_MAX_SCAN_BYTES -
+              2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES -
+              SESSION_HISTORY_ANCHOR_BYTES * (appended ? 8 : 2);
         const publicLine =
           JSON.stringify(createMuxMessage("public-after-split", "assistant", "public facts")) +
           "\n";
@@ -1254,7 +1315,7 @@ describe("session_history real disk recovery", () => {
           suffix +
           "x".repeat(padding) +
           end;
-        await fs.appendFile(chatPath, row);
+        await appendTrackedHistory(chatPath, row);
         const emitted: string[] = [];
         const visit = ({ message }: { message: MuxMessage }) => {
           emitted.push(message.id);
@@ -1306,7 +1367,7 @@ describe("session_history real disk recovery", () => {
       '"contextBoundaryKind":"reset"',
       '"contextBoundaryKind"' + " ".repeat(3 * 1024 * 1024) + '\t:  "reset"'
     );
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       raw +
         "\n" +
@@ -1381,7 +1442,7 @@ describe("session_history real disk recovery", () => {
     const first = await call({ action: "search", query: "match", limit: 1 });
     // Simulate a cross-process append without rotation: the reset must still
     // invalidate privacy, rather than relying on inode replacement as the gate.
-    await fs.appendFile(
+    await appendTrackedHistory(
       chatPath,
       JSON.stringify(createMuxMessage("reset", "assistant", "", { contextBoundaryKind: "reset" })) +
         "\n"

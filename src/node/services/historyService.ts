@@ -1,3 +1,9 @@
+import {
+  HistoryAppendProvenance,
+  HISTORY_PROVENANCE_MAX_RECEIPT_BYTES,
+  invalidateHistoryAppendProvenance,
+} from "./historyAppendProvenance";
+import { SESSION_HISTORY_MAX_SCAN_BYTES } from "@/common/constants/contextBudget";
 import { scanHistoryFilesBounded, type BoundedHistoryScanOptions } from "./historyScanner";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
@@ -211,38 +217,51 @@ interface SubagentTranscriptDependencies {
 }
 
 export class HistoryService {
-  /** Bounded, read-only recovery browser; never nests the history write lock. */
+  private getAppendProvenance(workspaceId: string): HistoryAppendProvenance {
+    return new HistoryAppendProvenance(this.getSessionDir(workspaceId));
+  }
+
+  /** One bounded page under both history locks; never performs mutation recovery. */
   scanHistoryBounded(workspaceId: string, options: BoundedHistoryScanOptions) {
     assert(workspaceId.trim().length > 0, "history scan requires workspaceId");
-    return this.fileLocks.withLock(workspaceId, async () => {
-      // Recovery rewrites history and takes the write lock. This read-only tool
-      // must instead fail closed while a truncate transaction is unresolved.
-      const assertNoTruncate = async () => {
-        for (const marker of [
-          this.getTruncateTransactionPath(workspaceId),
-          `${this.getChatArchivePath(workspaceId)}.truncate`,
-        ]) {
-          const exists = await fs.stat(marker).then(
-            () => true,
-            (error: NodeJS.ErrnoException) => {
-              if (error.code !== "ENOENT") throw error;
-              return false;
-            }
-          );
-          if (exists) throw new Error("stale_cursor");
-        }
-      };
-      await assertNoTruncate();
-      const result = await scanHistoryFilesBounded(
-        {
-          chat: this.getChatHistoryPath(workspaceId),
-          archive: this.getChatArchivePath(workspaceId),
-        },
-        options
-      );
-      await assertNoTruncate();
-      return result;
-    });
+    return this.fileLocks.withLock(workspaceId, () =>
+      this.withHistoryWriteFileLock(workspaceId, async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId))
+          throw new Error("stale_cursor");
+        // Recovery rewrites history and takes the write lock. This read-only tool
+        // must instead fail closed while a truncate transaction is unresolved.
+        const assertNoTruncate = async () => {
+          for (const marker of [
+            this.getTruncateTransactionPath(workspaceId),
+            `${this.getChatArchivePath(workspaceId)}.truncate`,
+          ]) {
+            const exists = await fs.stat(marker).then(
+              () => true,
+              (error: NodeJS.ErrnoException) => {
+                if (error.code !== "ENOENT") throw error;
+                return false;
+              }
+            );
+            if (exists) throw new Error("stale_cursor");
+          }
+        };
+        await assertNoTruncate();
+        const provenance = this.getAppendProvenance(workspaceId);
+        const { receipt, bytesRead } = await provenance.forScan(options.cursor?.provenanceEpoch);
+        const result = await scanHistoryFilesBounded(
+          {
+            chat: this.getChatHistoryPath(workspaceId),
+            archive: this.getChatArchivePath(workspaceId),
+          },
+          options,
+          receipt.epoch,
+          SESSION_HISTORY_MAX_SCAN_BYTES - 2 * HISTORY_PROVENANCE_MAX_RECEIPT_BYTES
+        );
+        result.bytesRead += bytesRead + (await provenance.validatePage(receipt));
+        await assertNoTruncate();
+        return result;
+      })
+    );
   }
 
   private readonly CHAT_FILE = CHAT_FILE_NAME;
@@ -706,7 +725,10 @@ export class HistoryService {
       if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
         return;
       }
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      await this.getAppendProvenance(workspaceId).runMutation(async () => {
+        invalidateHistoryAppendProvenance();
+        await this.recoverTruncateTransactionUnlocked(workspaceId);
+      });
     });
   }
 
@@ -737,6 +759,7 @@ export class HistoryService {
     finalArchiveContents: string | null,
     finalChatContents: string | null
   ): Promise<void> {
+    invalidateHistoryAppendProvenance();
     const archivePath = this.getChatArchivePath(workspaceId);
     const archiveTombstonePath = `${archivePath}.truncate`;
     const markerPath = this.getTruncateTransactionPath(workspaceId);
@@ -1351,7 +1374,7 @@ export class HistoryService {
       sourceWorkspaceId !== targetWorkspaceId,
       "history snapshot target must be a new workspace"
     );
-    const snapshot = await this.withRecoveredHistoryResultLock(
+    const snapshot = await this.withRecoveredHistoryWriteResultLock(
       sourceWorkspaceId,
       "Failed to read history snapshot",
       async () =>
@@ -1364,22 +1387,24 @@ export class HistoryService {
       return snapshot;
     }
 
-    try {
-      await ensurePrivateDir(this.getSessionDir(targetWorkspaceId));
-      for (const [targetPath, contents] of [
-        [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
-        [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
-      ] as const) {
-        if (contents === null) {
-          await fs.rm(targetPath, { force: true });
-        } else {
-          await writeFileAtomic(targetPath, contents);
+    return this.withRecoveredHistoryWriteResultLock(
+      targetWorkspaceId,
+      "Failed to copy history snapshot",
+      async () => {
+        invalidateHistoryAppendProvenance();
+        for (const [targetPath, contents] of [
+          [this.getChatArchivePath(targetWorkspaceId), snapshot.data.archive],
+          [this.getChatHistoryPath(targetWorkspaceId), snapshot.data.chat],
+        ] as const) {
+          if (contents === null) {
+            await fs.rm(targetPath, { force: true });
+          } else {
+            await writeFileAtomic(targetPath, contents);
+          }
         }
+        return Ok(undefined);
       }
-      return Ok(undefined);
-    } catch (error) {
-      return Err(`Failed to copy history snapshot: ${getErrorMessage(error)}`);
-    }
+    );
   }
 
   private async iterateFullHistoryUnlocked(
@@ -1773,6 +1798,15 @@ export class HistoryService {
     }
 
     try {
+      const provenance = this.getAppendProvenance(workspaceId);
+      if (!provenance.inTransaction()) {
+        await this.withHistoryWriteFileLock(workspaceId, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) return;
+          await ensurePrivateDir(this.getSessionDir(workspaceId));
+          await provenance.runMutation(() => this.ensureSealedHistoryRotatedUnlocked(workspaceId));
+        });
+        return;
+      }
       const offset = await this.findLastBoundaryByteOffset(this.getChatHistoryPath(workspaceId));
       if (offset !== null && offset !== 0) {
         await this.rotateSealedHistoryUnlocked(workspaceId);
@@ -1807,6 +1841,7 @@ export class HistoryService {
       return; // Nothing sealed — boundary already starts the file (or no boundary).
     }
 
+    invalidateHistoryAppendProvenance();
     const fileBuffer = await fs.readFile(chatPath);
     const sealedPrefix = fileBuffer.subarray(0, boundaryOffset).toString("utf-8");
     const activeTail = fileBuffer.subarray(boundaryOffset);
@@ -2240,7 +2275,6 @@ export class HistoryService {
     try {
       const workspaceDir = this.getSessionDir(workspaceId);
       await ensurePrivateDir(workspaceDir);
-      const historyPath = this.getChatHistoryPath(workspaceId);
 
       // DEBUG: Log message append with caller stack trace
       const stack = new Error().stack?.split("\n").slice(2, 6).join("\n") ?? "no stack";
@@ -2310,7 +2344,9 @@ export class HistoryService {
         `[HISTORY APPEND] Assigned historySequence=${message.metadata.historySequence ?? "unknown"} role=${message.role}`
       );
 
-      await fs.appendFile(historyPath, JSON.stringify(historyEntry) + "\n");
+      await this.getAppendProvenance(workspaceId).appendChat(
+        Buffer.from(JSON.stringify(historyEntry) + "\n")
+      );
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);
@@ -2387,8 +2423,12 @@ export class HistoryService {
       // crashed transaction from another backend's live rewrite — rolling
       // back a live transaction mid-flight resurrects discarded history with
       // mismatched archive/chat state.
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
-      return operation();
+      return this.getAppendProvenance(workspaceId).runMutation(async () => {
+        if (await this.truncateRecoveryArtifactsPresent(workspaceId))
+          invalidateHistoryAppendProvenance();
+        await this.recoverTruncateTransactionUnlocked(workspaceId);
+        return operation();
+      });
     });
   }
 
@@ -2443,7 +2483,11 @@ export class HistoryService {
     // recovery would redundantly acquire and release the same file lock.
     try {
       return await this.fileLocks.withLock(workspaceId, () =>
-        this.withCrossProcessWriteLock(workspaceId, operation)
+        this.withCrossProcessWriteLock(workspaceId, async () => {
+          const result = await operation();
+          if (!result.success) invalidateHistoryAppendProvenance();
+          return result;
+        })
       );
     } catch (error) {
       return Err(`${errorPrefix}: ${getErrorMessage(error)}`);
@@ -2489,7 +2533,6 @@ export class HistoryService {
           await this.refreshSequenceCounterUnderWriteLock(workspaceId);
           const workspaceDir = this.getSessionDir(workspaceId);
           await ensurePrivateDir(workspaceDir);
-          const historyPath = this.getChatHistoryPath(workspaceId);
           for (const message of messages) {
             assert(
               message.metadata?.historySequence === undefined,
@@ -2512,23 +2555,9 @@ export class HistoryService {
           // temp-and-rename helper the other history mutations use, under the
           // cross-process append lock (r50) so a foreign backend's row cannot
           // land between this read and the replace and be silently deleted.
-          const existing = await fs.readFile(historyPath, "utf-8").catch((error: unknown) => {
-            if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "";
-            throw error;
-          });
-          // Terminate a torn tail before concatenating (r50): a crash can
-          // leave chat.jsonl ending in an unterminated JSON line. Gluing the
-          // first payload row directly onto those bytes would make the
-          // self-healing reader drop payload+corruption as ONE malformed line
-          // while KEEPING the following trigger row — a durable trigger
-          // referencing an absent payload, breaking the batch's
-          // all-or-nothing contract. With the newline, only the pre-existing
-          // corrupt line is dropped and every batch row survives intact.
-          const healedExisting =
-            existing.length > 0 && !existing.endsWith("\n") ? existing + "\n" : existing;
-          await writeFileAtomic(
-            historyPath,
-            healedExisting + this.serializeHistoryEntries(messages, workspaceId)
+          await this.getAppendProvenance(workspaceId).appendChat(
+            Buffer.from(this.serializeHistoryEntries(messages, workspaceId)),
+            true
           );
           // Publish the entire batch before sealing its previous epoch. Rotation
           // is best-effort: a storage failure must not invite a duplicate batch.
@@ -2610,6 +2639,7 @@ export class HistoryService {
       workspaceId,
       "Failed to reject context-budget request",
       async () => {
+        invalidateHistoryAppendProvenance();
         const historyPath = this.getChatHistoryPath(workspaceId);
         const raw = await fs.readFile(historyPath);
         // Keep every unmodified line byte-for-byte: even unreadable reset rows
@@ -2664,6 +2694,7 @@ export class HistoryService {
     workspaceId: string,
     message: MuxMessage
   ): Promise<Result<void>> {
+    invalidateHistoryAppendProvenance();
     try {
       const historyPath = this.getChatHistoryPath(workspaceId);
 
@@ -2764,6 +2795,7 @@ export class HistoryService {
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           // r52: this path assigns fresh sequences (appended summary + every
           // preserved tail copy) from the cached counter, so it needs the
@@ -2881,6 +2913,7 @@ export class HistoryService {
       workspaceId,
       "Failed to delete messages",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           const messages = await this.readChatHistory(workspaceId);
           const foundIds = new Set(
@@ -2948,6 +2981,7 @@ export class HistoryService {
     workspaceId: string,
     messageId: string
   ): Promise<Result<void>> {
+    invalidateHistoryAppendProvenance();
     try {
       // Structural rewrite requires full file content
       const messages = await this.readChatHistory(workspaceId);
@@ -3040,6 +3074,7 @@ export class HistoryService {
       workspaceId,
       "Failed to truncate history",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           // Structural rewrite requires full file content
           const messages = await this.readChatHistory(workspaceId);
@@ -3263,6 +3298,7 @@ export class HistoryService {
       workspaceId,
       "Failed to truncate history",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           const archivedMessages = await this.readArchivedHistory(workspaceId);
           const chatMessages = await this.readChatHistory(workspaceId);
@@ -3414,6 +3450,7 @@ export class HistoryService {
       newWorkspaceId,
       "Failed to migrate workspace history",
       async () => {
+        invalidateHistoryAppendProvenance();
         try {
           // Migrate the sealed archive first so a crash mid-migration never leaves
           // the active file pointing at a stale-ID archive.

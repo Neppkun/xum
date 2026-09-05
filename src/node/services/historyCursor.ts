@@ -28,6 +28,7 @@ export const HistorySnapshotSchema = z
 export type HistorySnapshot = z.infer<typeof HistorySnapshotSchema>;
 export const HistoryScanStateSchema = z
   .object({
+    provenanceEpoch: z.string().uuid(),
     snapshots: z.object({ chat: HistorySnapshotSchema, archive: HistorySnapshotSchema }).strict(),
     validatedChatSnapshot: HistorySnapshotSchema,
     phase: z.enum(["floor", "browse", "done"]),

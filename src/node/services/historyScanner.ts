@@ -77,7 +77,9 @@ export interface BoundedHistoryScanResult {
 /** One mutex-held page. Never invokes migration/recovery or a full-file reader. */
 export async function scanHistoryFilesBounded(
   paths: Record<HistoryArtifact, string>,
-  options: BoundedHistoryScanOptions
+  options: BoundedHistoryScanOptions,
+  provenanceEpoch: string,
+  maxBytes = SESSION_HISTORY_MAX_SCAN_BYTES
 ): Promise<BoundedHistoryScanResult> {
   const result: BoundedHistoryScanResult = {
     bytesRead: 0,
@@ -122,7 +124,7 @@ export async function scanHistoryFilesBounded(
       return result;
     };
     const read = async (artifact: HistoryArtifact, start: number, length: number) => {
-      assert(length >= 0 && result.bytesRead + length <= SESSION_HISTORY_MAX_SCAN_BYTES);
+      assert(length >= 0 && result.bytesRead + length <= maxBytes);
       const buffer = Buffer.alloc(length);
       const bytesRead = handles.has(artifact)
         ? (await handles.get(artifact)!.read(buffer, 0, length, start)).bytesRead
@@ -139,9 +141,17 @@ export async function scanHistoryFilesBounded(
       const end = previous?.endOffsetSnapshot ?? size;
       const inode = stat ? `${stat.dev}:${stat.ino}` : "missing";
       const modifiedTimeMs = stat?.mtimeMs ?? 0;
-      if (previous && size === end && modifiedTimeMs !== previous.modifiedTimeMs)
+      if (
+        previous &&
+        artifact === "archive" &&
+        size === end &&
+        modifiedTimeMs !== previous.modifiedTimeMs
+      )
         throw new Error("stale_cursor");
-      if (previous && (size < end || inode !== previous.inode)) throw new Error("stale_cursor");
+      // A validated same-epoch receipt certifies prefix-preserving atomic chat
+      // appends even when rename changes its inode. Archive changes still expire.
+      if (previous && (size < end || (artifact === "archive" && inode !== previous.inode)))
+        throw new Error("stale_cursor");
       const hash = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
       const headHash = hash(await read(artifact, 0, Math.min(SESSION_HISTORY_ANCHOR_BYTES, end)));
       const anchorHash = hash(
@@ -159,6 +169,7 @@ export async function scanHistoryFilesBounded(
     const state: HistoryScanState = options.cursor
       ? structuredClone(options.cursor)
       : {
+          provenanceEpoch,
           snapshots: { chat: initialChat!, archive: await snapshot("archive") },
           validatedChatSnapshot: initialChat!,
           phase: "floor",
@@ -175,6 +186,7 @@ export async function scanHistoryFilesBounded(
           windowPending: true,
           appendCheck: null,
         };
+    if (state.provenanceEpoch !== provenanceEpoch) throw new Error("stale_cursor");
     if (!options.cursor) state.byteOffset = state.snapshots.chat.endOffsetSnapshot;
     else {
       await snapshot("chat", state.snapshots.chat);
@@ -189,7 +201,7 @@ export async function scanHistoryFilesBounded(
       )
         throw new Error("stale_cursor");
     }
-    const remaining = () => SESSION_HISTORY_MAX_SCAN_BYTES - result.bytesRead;
+    const remaining = () => maxBytes - result.bytesRead;
     interface Position {
       byteOffset: number;
       skippingOversized: boolean;
