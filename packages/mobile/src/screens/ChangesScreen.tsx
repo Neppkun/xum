@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { ScrollView, Text, View } from "react-native";
-import { RefreshCw } from "lucide-react-native";
+import { ScrollView, StyleSheet, Text, View } from "react-native";
+import { CheckCircle2, FileCode, RefreshCw } from "lucide-react-native";
 import type { MobileClient } from "../api";
 import { Header, IconButton, Loading, Notice } from "../components/Controls";
-import { colors, layout, mono } from "../theme";
+import { colors, layout, mono, radii, spacing, typography } from "../theme";
 import { linkedAbortController } from "../useConnection";
 
 export function ChangesScreen(props: {
@@ -67,50 +67,119 @@ export function ChangesScreen(props: {
       });
     return () => controller.abort();
   }, [props.client, props.workspaceId, props.signal, generation]);
+  const files = output?.split(/(?=^diff --git )/m).filter(Boolean) ?? [];
   return (
     <View style={layout.fill}>
       <Header
         title="Changes"
-        subtitle="Tracked changes · working tree vs HEAD"
+        subtitle="Working tree"
         onBack={props.onBack}
         trailing={<IconButton label="Refresh changes" icon={RefreshCw} onPress={retry} />}
       />
-      <ScrollView contentContainerStyle={{ padding: 16, gap: 14 }}>
-        <Text style={layout.muted}>
-          Read-only. Includes staged and unstaged tracked files; untracked files and changes already
-          committed are not included.
-        </Text>
+      <ScrollView contentContainerStyle={styles.content}>
         {error && <Notice onRetry={props.onReconnect}>{error}</Notice>}
         {output === null && !error && <Loading label="Reading changes…" />}
         {note && <Notice>{note}</Notice>}
-        {output === "" && <Text style={layout.text}>No tracked changes against HEAD.</Text>}
-        {output && (
-          <ScrollView horizontal>
-            <View>
-              {output.split("\n").map((line, index) => (
-                <Text
-                  selectable
-                  key={index}
-                  style={{
-                    fontFamily: mono,
-                    fontSize: 12,
-                    lineHeight: 20,
-                    color: line.startsWith("+")
-                      ? colors.success
-                      : line.startsWith("-")
-                        ? colors.danger
-                        : line.startsWith("@@")
-                          ? colors.plan
-                          : colors.text,
-                  }}
-                >
-                  {line || " "}
+        {output === "" && (
+          <View style={styles.empty}>
+            <CheckCircle2 size={32} color={colors.success} />
+            <Text style={layout.title}>No uncommitted changes</Text>
+            <Text style={[layout.muted, { textAlign: "center" }]}>
+              Tracked files match the latest commit.
+            </Text>
+          </View>
+        )}
+        {files.length > 0 && (
+          <Text style={layout.muted}>
+            {files.length} changed {files.length === 1 ? "file" : "files"}
+          </Text>
+        )}
+        {files.map((file, index) => {
+          const lines = file.trimEnd().split("\n");
+          const filename =
+            lines
+              .find((line) => line.startsWith("+++ "))
+              ?.slice(4)
+              .replace(/^b\//, "") ?? lines[0].replace(/^diff --git /, "");
+          const content = lines.filter((line) => !/^(diff --git |index |--- |\+\+\+ )/.test(line));
+          const additions = content.filter((line) => line.startsWith("+")).length;
+          const deletions = content.filter((line) => line.startsWith("-")).length;
+          return (
+            <View key={index} style={styles.file}>
+              <View style={styles.fileHeader}>
+                <FileCode size={17} color={colors.muted} />
+                <Text numberOfLines={1} ellipsizeMode="middle" style={styles.filename}>
+                  {filename}
                 </Text>
-              ))}
+                <Text style={[styles.count, { color: colors.success }]}>+{additions}</Text>
+                <Text style={[styles.count, { color: colors.danger }]}>−{deletions}</Text>
+              </View>
+              <ScrollView horizontal contentContainerStyle={{ padding: 14 }}>
+                <View>
+                  {content.map((line, lineIndex) => (
+                    <Text
+                      selectable
+                      key={lineIndex}
+                      style={[
+                        styles.code,
+                        {
+                          color: line.startsWith("+")
+                            ? colors.success
+                            : line.startsWith("-")
+                              ? colors.danger
+                              : line.startsWith("@@")
+                                ? colors.plan
+                                : colors.text,
+                        },
+                      ]}
+                    >
+                      {line || " "}
+                    </Text>
+                  ))}
+                </View>
+              </ScrollView>
             </View>
-          </ScrollView>
+          );
+        })}
+        {output !== null && (
+          <Text style={styles.footnote}>
+            Staged and unstaged tracked files, compared with HEAD. Untracked files and committed
+            changes aren’t shown.
+          </Text>
         )}
       </ScrollView>
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  content: {
+    padding: spacing.xl,
+    gap: 16,
+    width: "100%",
+    maxWidth: 900,
+    alignSelf: "center",
+    flexGrow: 1,
+  },
+  empty: { alignItems: "center", justifyContent: "center", gap: 12, paddingVertical: 56 },
+  file: {
+    borderRadius: radii.card,
+    overflow: "hidden",
+    backgroundColor: colors.panel,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+  },
+  fileHeader: {
+    minHeight: 52,
+    paddingHorizontal: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+  },
+  filename: { flex: 1, minWidth: 0, color: colors.bright, fontSize: 15, fontWeight: "500" },
+  count: { fontSize: 12, fontVariant: ["tabular-nums"] },
+  code: { fontFamily: mono, fontSize: 13, lineHeight: 21 },
+  footnote: { ...typography.footnote, color: colors.muted },
+});

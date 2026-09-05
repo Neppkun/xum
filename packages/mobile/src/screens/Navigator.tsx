@@ -1,18 +1,29 @@
 import { useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import {
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
   Folder,
   GitBranch,
   MessageSquare,
   Plus,
-  RefreshCw,
+  Search,
   Settings,
   X,
 } from "lucide-react-native";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import type { Projects } from "../useProjects";
-import { IconButton, Loading, Notice } from "../components/Controls";
-import { colors, layout } from "../theme";
+import { Button, IconButton, Loading, Notice } from "../components/Controls";
+import { colors, layout, radii, spacing, typography } from "../theme";
 
 export function Navigator(props: {
   projects: Projects;
@@ -24,9 +35,10 @@ export function Navigator(props: {
   onSelect: (workspace: FrontendWorkspaceMetadata) => void;
   onCreate: () => void;
   onSettings: () => void;
-  onClose?: () => void;
+  compact?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [query, setQuery] = useState("");
   const groups = new Map<string, { name: string; workspaces: FrontendWorkspaceMetadata[] }>();
   for (const [path, config] of props.projects)
     groups.set(path, {
@@ -39,39 +51,94 @@ export function Navigator(props: {
       name: workspace.kind === "scratch" ? "Scratch chats" : workspace.projectName,
       workspaces: [],
     };
-    group.workspaces.push(workspace);
+    if (
+      `${workspace.title ?? ""} ${workspace.name} ${group.name}`
+        .toLowerCase()
+        .includes(query.trim().toLowerCase())
+    )
+      group.workspaces.push(workspace);
     groups.set(key, group);
   }
+  const visibleGroups = [...groups].filter(
+    ([, group]) => !query.trim() || group.workspaces.length > 0
+  );
   return (
-    <View style={styles.root}>
-      <View style={styles.top}>
+    <View style={[layout.fill, props.compact && styles.sidebar]}>
+      <View style={styles.toolbar}>
         <Text style={styles.brand}>
           xum<Text style={{ color: colors.accent }}>.</Text>
         </Text>
         <View style={layout.row}>
-          <IconButton label="Refresh workspaces" icon={RefreshCw} onPress={props.onRetry} />
-          <IconButton label="New workspace" icon={Plus} onPress={props.onCreate} />
-          {props.onClose && (
-            <IconButton label="Close workspace drawer" icon={X} onPress={props.onClose} />
-          )}
+          <IconButton label="Settings" icon={Settings} onPress={props.onSettings} />
+          <IconButton
+            label="New workspace"
+            icon={Plus}
+            color={colors.accent}
+            onPress={props.onCreate}
+          />
         </View>
       </View>
-      <ScrollView contentContainerStyle={{ padding: 12, gap: 12 }}>
+      <ScrollView
+        keyboardDismissMode="on-drag"
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl
+            refreshing={props.loading && props.workspaces.length > 0}
+            onRefresh={props.onRetry}
+            tintColor={colors.accent}
+          />
+        }
+      >
+        <View style={{ gap: 6 }}>
+          <Text style={[styles.title, props.compact && { fontSize: 24 }]}>Workspaces</Text>
+          <Text style={layout.muted}>
+            {props.workspaces.length === 0
+              ? "Your conversations, organized by project."
+              : `${props.workspaces.length} ${props.workspaces.length === 1 ? "conversation" : "conversations"}`}
+          </Text>
+        </View>
+        <View style={styles.search}>
+          <Search size={18} color={colors.muted} />
+          <TextInput
+            accessibilityLabel="Search workspaces"
+            placeholder="Search workspaces"
+            placeholderTextColor={colors.muted}
+            value={query}
+            onChangeText={setQuery}
+            autoCorrect={false}
+            autoCapitalize="none"
+            returnKeyType="search"
+            style={styles.searchInput}
+          />
+          {query.length > 0 && (
+            <IconButton label="Clear search" icon={X} onPress={() => setQuery("")} />
+          )}
+        </View>
         {props.error && <Notice onRetry={props.onRetry}>{props.error}</Notice>}
-        {props.loading && <Loading label="Loading workspaces…" />}
-        {!props.loading && groups.size === 0 && (
-          <View style={{ padding: 16, gap: 12 }}>
-            <Text style={layout.text}>A little room to think.</Text>
-            <Text style={layout.muted}>
-              Create a scratch chat, or add a project from Xum desktop to get started.
+        {props.loading && props.workspaces.length === 0 && <Loading label="Loading workspaces…" />}
+        {!props.loading && props.workspaces.length === 0 && !props.error && (
+          <View style={styles.empty}>
+            <MessageSquare size={28} color={colors.accent} />
+            <Text style={layout.title}>Start a conversation</Text>
+            <Text style={[layout.muted, { textAlign: "center" }]}>
+              Create a workspace in a project, or a scratch chat for a quick question.
             </Text>
+            <Button onPress={props.onCreate}>New workspace</Button>
           </View>
         )}
-        {[...groups].map(([key, group]) => (
-          <View key={key}>
+        {query.trim() && visibleGroups.length === 0 ? (
+          <View style={styles.empty}>
+            <Text style={layout.title}>No matching workspaces</Text>
+            <Text style={layout.muted}>Try a project name, branch, or conversation title.</Text>
+          </View>
+        ) : null}
+        {visibleGroups.map(([key, group]) => (
+          <View key={key} style={{ gap: 8 }}>
             <Pressable
               accessibilityRole="button"
-              accessibilityState={{ expanded: !collapsed.has(key) }}
+              accessibilityLabel={`${group.name}, ${group.workspaces.length} workspaces`}
+              accessibilityState={{ expanded: Boolean(query.trim()) || !collapsed.has(key) }}
               onPress={() =>
                 setCollapsed((current) => {
                   const next = new Set(current);
@@ -80,100 +147,150 @@ export function Navigator(props: {
                   return next;
                 })
               }
-              style={styles.group}
+              style={styles.groupHeader}
             >
               {key === "scratch" ? (
                 <MessageSquare size={15} color={colors.muted} />
               ) : (
                 <Folder size={15} color={colors.muted} />
               )}
-              <Text numberOfLines={1} style={[layout.label, { flex: 1, letterSpacing: 0 }]}>
+              <Text numberOfLines={1} style={[styles.sectionTitle, { flex: 1 }]}>
                 {group.name}
               </Text>
               <Text style={layout.muted}>{group.workspaces.length}</Text>
+              {collapsed.has(key) && !query.trim() ? (
+                <ChevronRight size={15} color={colors.muted} />
+              ) : (
+                <ChevronDown size={15} color={colors.muted} />
+              )}
             </Pressable>
-            {!collapsed.has(key) &&
-              group.workspaces
-                .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))
-                .map((workspace) => (
-                  <Pressable
-                    key={workspace.id}
-                    accessibilityRole="button"
-                    accessibilityState={{ selected: workspace.id === props.selectedId }}
-                    onPress={() => props.onSelect(workspace)}
-                    style={({ pressed }) => [
-                      styles.workspace,
-                      workspace.id === props.selectedId && styles.selected,
-                      pressed && { opacity: 0.7 },
-                    ]}
-                  >
-                    <GitBranch
-                      size={15}
-                      color={workspace.id === props.selectedId ? colors.accent : colors.dim}
-                    />
-                    <View style={{ flex: 1, minWidth: 0 }}>
-                      <Text numberOfLines={1} style={styles.workspaceTitle}>
-                        {workspace.title ?? workspace.name}
-                      </Text>
-                      <Text numberOfLines={1} style={layout.muted}>
-                        {workspace.name}
-                      </Text>
-                    </View>
-                  </Pressable>
-                ))}
+            {(!collapsed.has(key) || Boolean(query.trim())) && (
+              <View style={styles.section}>
+                {group.workspaces.length === 0 ? (
+                  <Text style={[layout.muted, { padding: 16 }]}>No conversations yet</Text>
+                ) : (
+                  group.workspaces
+                    .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))
+                    .map((workspace, index) => (
+                      <Pressable
+                        key={workspace.id}
+                        accessibilityRole="button"
+                        accessibilityLabel={workspace.title ?? workspace.name}
+                        accessibilityState={{ selected: workspace.id === props.selectedId }}
+                        onPress={() => props.onSelect(workspace)}
+                        style={({ pressed }) => [
+                          styles.workspace,
+                          index > 0 && styles.separator,
+                          (workspace.id === props.selectedId || pressed) && {
+                            backgroundColor: colors.elevated,
+                          },
+                        ]}
+                      >
+                        <View style={styles.workspaceIcon}>
+                          {workspace.kind === "scratch" ? (
+                            <MessageSquare size={18} color={colors.accent} />
+                          ) : (
+                            <GitBranch
+                              size={18}
+                              color={workspace.agentId === "plan" ? colors.plan : colors.accent}
+                            />
+                          )}
+                        </View>
+                        <View style={{ flex: 1, minWidth: 0, gap: 3 }}>
+                          <Text numberOfLines={2} style={styles.workspaceTitle}>
+                            {workspace.title ?? workspace.name}
+                          </Text>
+                          <Text numberOfLines={1} style={[layout.muted, typography.footnote]}>
+                            {workspace.kind === "scratch" ? "Scratch chat" : workspace.name}
+                          </Text>
+                        </View>
+                        {workspace.id === props.selectedId ? (
+                          <Check size={18} color={colors.accent} />
+                        ) : (
+                          <ChevronRight size={16} color={colors.dim} />
+                        )}
+                      </Pressable>
+                    ))
+                )}
+              </View>
+            )}
           </View>
         ))}
       </ScrollView>
-      <Pressable accessibilityRole="button" onPress={props.onSettings} style={styles.footer}>
-        <Settings size={18} color={colors.muted} />
-        <Text style={layout.muted}>Settings & connection</Text>
-      </Pressable>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: colors.panel,
-    borderRightColor: colors.border,
-    borderRightWidth: 1,
-  },
-  top: {
-    minHeight: 68,
-    paddingHorizontal: 16,
+  sidebar: { backgroundColor: colors.background },
+  toolbar: {
+    minHeight: 52,
+    paddingHorizontal: spacing.lg,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
   },
-  brand: { color: colors.bright, fontWeight: "700", letterSpacing: -1, fontSize: 26 },
-  group: {
+  brand: { color: colors.bright, fontWeight: "700", letterSpacing: -0.8, fontSize: 24 },
+  content: {
+    paddingHorizontal: spacing.xl,
+    paddingTop: 8,
+    paddingBottom: 32,
+    gap: 20,
+    maxWidth: 760,
+    width: "100%",
+    alignSelf: "center",
+  },
+  title: {
+    color: colors.bright,
+    fontWeight: "700",
+    letterSpacing: -0.8,
+    fontSize: 32,
+    lineHeight: 38,
+  },
+  search: {
+    backgroundColor: colors.panel,
+    borderRadius: radii.control,
+    minHeight: 46,
     flexDirection: "row",
-    gap: 8,
     alignItems: "center",
-    minHeight: 44,
-    paddingHorizontal: 8,
+    paddingLeft: 14,
+    paddingRight: 4,
+    gap: 8,
   },
+  searchInput: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 44,
+    fontSize: 16,
+    color: colors.bright,
+    paddingVertical: 10,
+  },
+  groupHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    minHeight: 44,
+    paddingHorizontal: 4,
+  },
+  sectionTitle: { color: colors.muted, fontSize: 13, fontWeight: "600" },
+  section: { borderRadius: radii.card, overflow: "hidden", backgroundColor: colors.panel },
   workspace: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
-    padding: 12,
-    minHeight: 60,
-    borderRadius: 8,
-    marginBottom: 3,
+    gap: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 15,
+    minHeight: 76,
   },
-  selected: { backgroundColor: colors.elevated },
-  workspaceTitle: { color: colors.text, fontSize: 14, lineHeight: 21 },
-  footer: {
-    flexDirection: "row",
+  workspaceIcon: {
+    width: 34,
+    height: 34,
+    borderRadius: 10,
     alignItems: "center",
-    gap: 10,
-    minHeight: 60,
-    padding: 16,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
+    justifyContent: "center",
+    backgroundColor: colors.background,
   },
+  workspaceTitle: { color: colors.bright, fontSize: 16, fontWeight: "500", lineHeight: 22 },
+  separator: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border },
+  empty: { paddingVertical: 24, gap: 14, alignItems: "center" },
 });

@@ -53,5 +53,16 @@ export function useProjects(client: MobileClient, signal: AbortSignal) {
     });
     return () => controller.abort();
   }, [client, signal, generation]);
-  return { projects, workspaces, loading, error, retry: () => setGeneration((value) => value + 1) };
+  return {
+    projects,
+    workspaces,
+    loading,
+    error,
+    retry: () => setGeneration((value) => value + 1),
+    addWorkspace: (workspace: FrontendWorkspaceMetadata) =>
+      setWorkspaces((current) => [
+        ...current.filter((item) => item.id !== workspace.id),
+        workspace,
+      ]),
+  };
 }

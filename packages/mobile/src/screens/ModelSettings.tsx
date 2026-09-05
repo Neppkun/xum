@@ -43,75 +43,82 @@ export function ModelSettings(props: {
   const currentAgent = agents.find((agent) => agent.id === value.agentId);
   return (
     <Sheet
-      title="Conversation settings"
+      title={browsing ? "Choose model" : "Conversation settings"}
+      onBack={browsing ? () => setBrowsing(false) : undefined}
       onClose={props.onClose}
       footer={
-        <Button
-          disabled={!validModel || !currentAgent}
-          onPress={() => props.onSave({ ...value, model: value.model.trim() })}
-        >
-          Use settings
-        </Button>
+        !browsing && (
+          <Button
+            disabled={!validModel || !currentAgent}
+            onPress={() => props.onSave({ ...value, model: value.model.trim() })}
+          >
+            Use settings
+          </Button>
+        )
       }
     >
-      <View style={styles.section}>
-        <Text style={layout.label}>Agent</Text>
-        <View style={styles.chips}>
-          {agents.map((agent) => (
-            <Option
-              key={agent.id}
-              label={agent.name}
-              selected={agent.id === value.agentId}
-              onPress={() => setValue(resolveSettings(props.workspace, props.data, agent.id))}
-            />
-          ))}
-        </View>
-        <Text style={styles.footnote}>
-          {currentAgent?.description ?? "Choose an agent for your next message."}
-        </Text>
-      </View>
-      <View style={styles.section}>
-        <Text style={layout.label}>Model</Text>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Choose model"
-          accessibilityState={{ expanded: browsing }}
-          onPress={() => setBrowsing(!browsing)}
-          style={[layout.group, styles.modelRow]}
-        >
-          <Cpu size={20} color={colors.accent} />
-          <View style={{ flex: 1, minWidth: 0 }}>
-            <Text numberOfLines={1} style={[layout.text, { color: colors.bright }]}>
-              {value.model ? modelName(value.model) : "Choose a model"}
-            </Text>
-            <Text numberOfLines={1} style={styles.footnote}>
-              {value.model.split(":")[0]}
+      {!browsing && (
+        <>
+          <View style={styles.section}>
+            <Text style={layout.label}>Agent</Text>
+            <View style={styles.chips}>
+              {agents.map((agent) => (
+                <Option
+                  key={agent.id}
+                  label={agent.name}
+                  selected={agent.id === value.agentId}
+                  onPress={() => setValue(resolveSettings(props.workspace, props.data, agent.id))}
+                />
+              ))}
+            </View>
+            <Text style={styles.footnote}>
+              {currentAgent?.description ?? "Choose an agent for your next message."}
             </Text>
           </View>
-          <ChevronDown size={18} color={colors.muted} />
-        </Pressable>
-      </View>
-      <View style={styles.section}>
-        <Text style={layout.label}>Thinking</Text>
-        <View style={styles.chips}>
-          <Option
-            label="Default"
-            selected={value.thinkingLevel == null}
-            onPress={() => setValue({ ...value, thinkingLevel: undefined })}
-          />
-          {thinkingLevels.map((level) => (
-            <Option
-              key={level}
-              label={level[0].toUpperCase() + level.slice(1)}
-              selected={value.thinkingLevel === level}
-              onPress={() => setValue({ ...value, thinkingLevel: level })}
-            />
-          ))}
-        </View>
-        <Text style={styles.footnote}>
-          Applies to your next message. Model capabilities are checked by your server.
-        </Text>
-      </View>
+          <View style={styles.section}>
+            <Text style={layout.label}>Model</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Choose model"
+              accessibilityState={{ expanded: browsing }}
+              onPress={() => setBrowsing(!browsing)}
+              style={[layout.group, styles.modelRow]}
+            >
+              <Cpu size={20} color={colors.accent} />
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text numberOfLines={1} style={[layout.text, { color: colors.bright }]}>
+                  {value.model ? modelName(value.model) : "Choose a model"}
+                </Text>
+                <Text numberOfLines={1} style={styles.footnote}>
+                  {value.model.split(":")[0]}
+                </Text>
+              </View>
+              <ChevronDown size={18} color={colors.muted} />
+            </Pressable>
+          </View>
+          <View style={styles.section}>
+            <Text style={layout.label}>Thinking</Text>
+            <View style={styles.chips}>
+              <Option
+                label="Default"
+                selected={value.thinkingLevel == null}
+                onPress={() => setValue({ ...value, thinkingLevel: undefined })}
+              />
+              {thinkingLevels.map((level) => (
+                <Option
+                  key={level}
+                  label={level[0].toUpperCase() + level.slice(1)}
+                  selected={value.thinkingLevel === level}
+                  onPress={() => setValue({ ...value, thinkingLevel: level })}
+                />
+              ))}
+            </View>
+            <Text style={styles.footnote}>
+              Applies to your next message. Model capabilities are checked by your server.
+            </Text>
+          </View>
+        </>
+      )}
       {browsing && (
         <View style={{ gap: spacing.lg }}>
           <Field
@@ -169,7 +176,10 @@ export function ModelSettings(props: {
         <Pressable
           accessibilityRole="button"
           accessibilityState={{ expanded: custom }}
-          onPress={() => setCustom(!custom)}
+          onPress={() => {
+            setBrowsing(false);
+            setCustom(!custom);
+          }}
           style={styles.disclosure}
         >
           <Text style={[typography.secondary, { color: colors.muted, flex: 1 }]}>

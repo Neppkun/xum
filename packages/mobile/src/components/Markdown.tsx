@@ -62,12 +62,12 @@ const styles = StyleSheet.create({
   inlineCode: { fontFamily: mono, backgroundColor: colors.elevated, color: colors.bright },
   code: {
     backgroundColor: colors.panel,
-    borderRadius: 8,
-    padding: 12,
+    borderRadius: 14,
+    padding: 16,
     gap: 10,
-    borderWidth: 1,
+    borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
   },
-  codeText: { fontFamily: mono, fontSize: 12, lineHeight: 20, color: colors.text },
+  codeText: { fontFamily: mono, fontSize: 13, lineHeight: 21, color: colors.text },
   heading: { fontSize: 19, lineHeight: 27, fontWeight: "600", color: colors.bright },
 });

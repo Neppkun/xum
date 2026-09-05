@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { SetStateAction } from "react";
 import {
   FlatList,
   KeyboardAvoidingView,
@@ -14,7 +15,7 @@ import {
   ArrowUp,
   ChevronDown,
   GitCompareArrows,
-  Menu,
+  ChevronLeft,
   Square,
 } from "lucide-react-native";
 import type { MobileClient } from "../api";
@@ -27,8 +28,13 @@ import { linkedAbortController } from "../useConnection";
 import { resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
-import { colors, layout } from "../theme";
+import { colors, layout, radii, spacing, typography } from "../theme";
+import { formatModelDisplayName } from "../../../../src/common/utils/ai/modelDisplay";
 import { DEFAULT_THINKING_LEVEL } from "../../../../src/common/types/thinking";
+
+// RN Web reports scrollHeight, which cannot shrink a fixed-height textarea and
+// can expand hidden stack screens. Let the browser size content; native uses its intrinsic measurement.
+const webInputSizing = { fieldSizing: "content", height: "auto" } as const;
 
 export function ConversationScreen(props: {
   client: MobileClient;
@@ -36,7 +42,11 @@ export function ConversationScreen(props: {
   signal: AbortSignal;
   connected: boolean;
   onReconnect: () => Promise<void>;
-  onMenu?: () => void;
+  onBack: () => void;
+  selection: ChatSettings | null;
+  onSelectionChange: (value: ChatSettings) => void;
+  draft: string;
+  onDraftChange: (value: SetStateAction<string>) => void;
   onChanges: () => void;
 }) {
   const { transcript, settings, error, loadOlder, loadingOlder, historyError } = useConversation(
@@ -44,12 +54,14 @@ export function ConversationScreen(props: {
     props.workspace.id,
     props.signal
   );
-  const [overrides, setOverrides] = useState<ChatSettings | null>(null);
-  const [draft, setDraft] = useState("");
+  const draft = props.draft;
+  const setDraft = props.onDraftChange;
+  const [inputHeight, setInputHeight] = useState(44);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [atBottom, setAtBottom] = useState(true);
+  const [composerHeight, setComposerHeight] = useState(100);
   const list = useRef<FlatList<MuxMessage>>(null);
   const controller = useRef(new AbortController());
   const pending = useRef(false);
@@ -64,7 +76,7 @@ export function ConversationScreen(props: {
   }, [props.signal]);
   const agentId = props.workspace.agentId ?? "exec";
   const options =
-    overrides ?? (settings ? resolveSettings(props.workspace, settings, agentId) : null);
+    props.selection ?? (settings ? resolveSettings(props.workspace, settings, agentId) : null);
   const ready =
     props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
   const running = ready && transcript.streaming;
@@ -92,6 +104,7 @@ export function ConversationScreen(props: {
           typeof result.error === "string" ? result.error : JSON.stringify(result.error)
         );
       setDraft((current) => (current === message ? "" : current));
+      setInputHeight(44);
       list.current?.scrollToEnd({ animated: true });
     } catch (cause) {
       if (!signal.aborted)
@@ -144,12 +157,17 @@ export function ConversationScreen(props: {
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
       <View style={styles.header}>
-        {props.onMenu && <IconButton label="Open workspaces" icon={Menu} onPress={props.onMenu} />}
+        <IconButton
+          label="Back to workspaces"
+          icon={ChevronLeft}
+          color={colors.accent}
+          onPress={props.onBack}
+        />
         <View style={{ flex: 1, minWidth: 0 }}>
           <Text style={styles.title} numberOfLines={1}>
             {props.workspace.title ?? props.workspace.name}
           </Text>
-          <Text style={layout.muted} numberOfLines={1}>
+          <Text style={[layout.muted, typography.footnote]} numberOfLines={1}>
             {props.workspace.kind === "scratch" ? "Scratch chat" : props.workspace.name} ·{" "}
             {props.workspace.runtimeConfig.type}
           </Text>
@@ -194,7 +212,12 @@ export function ConversationScreen(props: {
           if (atBottom) list.current?.scrollToEnd({ animated: false });
         }}
         renderItem={({ item }) => (
-          <Message message={item} canAnswer={ready && running} onAnswer={answer} />
+          <Message
+            message={item}
+            streaming={transcript.streamingMessageId === item.id && running}
+            canAnswer={ready && running}
+            onAnswer={answer}
+          />
         )}
         ListEmptyComponent={
           !ready && !error ? (
@@ -219,7 +242,7 @@ export function ConversationScreen(props: {
         }
       />
       {!atBottom && (
-        <View style={styles.latest}>
+        <View style={[styles.latest, { bottom: composerHeight + 12 }]}>
           <IconButton
             icon={ArrowDown}
             label="Jump to latest message"
@@ -227,7 +250,10 @@ export function ConversationScreen(props: {
           />
         </View>
       )}
-      <View style={styles.composerWrap}>
+      <View
+        style={styles.composerWrap}
+        onLayout={(event) => setComposerHeight(event.nativeEvent.layout.height)}
+      >
         {actionError && (
           <Notice
             onRetry={() => {
@@ -242,66 +268,75 @@ export function ConversationScreen(props: {
           <TextInput
             accessibilityLabel="Message"
             placeholder={
-              !ready
-                ? "Waiting for conversation sync…"
-                : running
-                  ? "Agent is working…"
-                  : "Ask Xum anything…"
+              !ready ? "Reconnecting…" : running ? "Write your next message…" : "Message Xum…"
             }
-            placeholderTextColor={colors.dim}
+            placeholderTextColor={colors.muted}
             value={draft}
             onChangeText={setDraft}
             multiline
-            editable={ready && !busy}
-            style={styles.input}
+            editable={!busy}
+            onContentSizeChange={
+              Platform.OS === "web"
+                ? undefined
+                : (event) =>
+                    setInputHeight(
+                      Math.max(44, Math.min(132, event.nativeEvent.contentSize.height))
+                    )
+            }
+            style={[styles.input, Platform.OS === "web" ? webInputSizing : { height: inputHeight }]}
             selectionColor={colors.accent}
           />
-          <View style={[layout.row, { justifyContent: "space-between" }]}>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Choose model, agent, and thinking"
-              disabled={!settings || !options}
-              onPress={() => setShowSettings(true)}
-              style={styles.modelButton}
-            >
-              <View style={{ flexShrink: 1 }}>
-                <Text
-                  numberOfLines={1}
-                  style={{
-                    color: options?.agentId === "plan" ? colors.plan : colors.accent,
-                    fontSize: 13,
-                    fontWeight: "600",
-                  }}
-                >
-                  {options?.agentId ?? "Agent"}
-                  <Text style={{ color: colors.muted, fontWeight: "400" }}>
-                    {" "}
-                    · {options?.model.split(":").slice(1).join(":") || "Choose model"}
-                  </Text>
-                </Text>
-              </View>
-              <ChevronDown size={14} color={colors.muted} />
-            </Pressable>
-            <View style={[styles.send, !ready && { opacity: 0.4 }]}>
-              <IconButton
-                label={running ? "Interrupt agent" : "Send message"}
-                icon={running ? Square : ArrowUp}
-                color={colors.bright}
-                disabled={!ready || busy || (!running && (!draft.trim() || !options?.model))}
-                onPress={running ? interrupt : send}
-              />
-            </View>
+          <View
+            style={[
+              styles.send,
+              ready &&
+                (running || Boolean(draft.trim())) && {
+                  backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
+                },
+            ]}
+          >
+            <IconButton
+              label={running ? "Interrupt agent" : "Send message"}
+              icon={running ? Square : ArrowUp}
+              color={ready && (running || Boolean(draft.trim())) ? colors.bright : colors.muted}
+              disabled={!ready || busy || (!running && (!draft.trim() || !options?.model))}
+              onPress={running ? interrupt : send}
+            />
           </View>
         </View>
-        <Text style={styles.status}>
-          {!ready
-            ? "Syncing required before sending"
-            : running
-              ? "Running on your server"
-              : options?.thinkingLevel
-                ? `${options.thinkingLevel} thinking · Runs on your server`
-                : "Runs on your server"}
-        </Text>
+        <View style={styles.composerToolbar}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Choose model, agent, and thinking"
+            accessibilityState={{ disabled: !settings || !options }}
+            disabled={!settings || !options}
+            onPress={() => setShowSettings(true)}
+            style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
+          >
+            <View
+              style={[
+                styles.modeDot,
+                { backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent },
+              ]}
+            />
+            <Text numberOfLines={1} style={styles.modelLabel}>
+              {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Agent"}
+              <Text style={{ color: colors.muted, fontWeight: "400" }}>
+                {" "}
+                ·{" "}
+                {options?.model
+                  ? formatModelDisplayName(options.model.slice(options.model.indexOf(":") + 1))
+                  : "Choose model"}
+              </Text>
+            </Text>
+            <ChevronDown size={14} color={colors.muted} />
+          </Pressable>
+          {running && (
+            <Text accessibilityLiveRegion="polite" style={styles.activity}>
+              Working
+            </Text>
+          )}
+        </View>
       </View>
       {showSettings && settings && options && (
         <ModelSettings
@@ -310,7 +345,7 @@ export function ConversationScreen(props: {
           workspace={props.workspace}
           onClose={() => setShowSettings(false)}
           onSave={(value) => {
-            setOverrides(value);
+            props.onSelectionChange(value);
             setShowSettings(false);
           }}
         />
@@ -321,64 +356,87 @@ export function ConversationScreen(props: {
 
 const styles = StyleSheet.create({
   header: {
-    minHeight: 68,
-    paddingHorizontal: 12,
+    minHeight: 56,
+    paddingHorizontal: 8,
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
-    borderBottomWidth: 1,
+    gap: 4,
+    borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: colors.border,
   },
-  title: { color: colors.bright, fontSize: 15, fontWeight: "600" },
+  title: { color: colors.bright, fontSize: 17, lineHeight: 22, fontWeight: "600" },
   messages: {
-    padding: 18,
-    paddingBottom: 28,
+    paddingHorizontal: spacing.xl,
+    paddingTop: 12,
+    paddingBottom: spacing.xl,
     width: "100%",
-    maxWidth: 820,
+    maxWidth: 760,
     alignSelf: "center",
     flexGrow: 1,
   },
-  empty: { flex: 1, paddingVertical: 60, alignItems: "center", justifyContent: "center", gap: 12 },
-  emptyTitle: { color: colors.bright, fontSize: 24, fontWeight: "500", letterSpacing: -0.6 },
-  composerWrap: {
-    paddingHorizontal: 12,
-    paddingTop: 8,
+  empty: {
+    flex: 1,
+    paddingVertical: 48,
+    paddingHorizontal: spacing.xl,
+    alignItems: "center",
+    justifyContent: "center",
     gap: 8,
+  },
+  emptyTitle: { color: colors.bright, fontSize: 22, fontWeight: "600", letterSpacing: -0.4 },
+  composerWrap: {
+    paddingHorizontal: spacing.lg,
+    paddingTop: 8,
     width: "100%",
-    maxWidth: 820,
+    maxWidth: 760,
     alignSelf: "center",
+    gap: 8,
+    backgroundColor: colors.background,
   },
   composer: {
-    borderRadius: 14,
-    padding: 10,
+    flexDirection: "row",
+    alignItems: "flex-end",
+    borderRadius: radii.sheet,
+    padding: 4,
     backgroundColor: colors.panel,
     borderColor: colors.border,
-    borderWidth: 1,
+    borderWidth: StyleSheet.hairlineWidth,
   },
   input: {
+    flex: 1,
+    minWidth: 0,
     color: colors.bright,
-    fontSize: 15,
+    fontSize: 16,
     lineHeight: 23,
-    minHeight: 64,
-    maxHeight: 160,
+    minHeight: 44,
+    maxHeight: 132,
     textAlignVertical: "top",
-    padding: 4,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  composerToolbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingBottom: 2,
   },
   modelButton: {
     minHeight: 44,
     flexDirection: "row",
     alignItems: "center",
     gap: 6,
-    paddingHorizontal: 4,
     flexShrink: 1,
+    paddingHorizontal: 6,
   },
-  send: { borderRadius: 9, backgroundColor: colors.elevated, marginLeft: 6 },
-  status: { color: colors.dim, fontSize: 11, textAlign: "center", paddingBottom: 8 },
+  modeDot: { width: 6, height: 6, borderRadius: 3 },
+  modelLabel: { color: colors.text, fontSize: 13, fontWeight: "500", flexShrink: 1 },
+  activity: { color: colors.muted, fontSize: 12, marginLeft: 8 },
+  send: { borderRadius: 22, overflow: "hidden", backgroundColor: colors.elevated },
   latest: {
     position: "absolute",
-    bottom: 190,
-    right: 24,
+    right: 20,
     backgroundColor: colors.elevated,
-    borderRadius: 24,
+    borderRadius: radii.sheet,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
   },
 });

@@ -591,7 +591,7 @@ test-storybook: node_modules/.installed ## Run Storybook interaction tests (requ
 ## React Native companion (isolated Expo dependency graph)
 MOBILE_METRO_PORT ?= 8081
 
-.PHONY: mobile-install mobile-web mobile-native mobile-preview mobile-export mobile-export-ios mobile-typecheck mobile-test mobile-lint mobile-fmt mobile-check
+.PHONY: mobile-install mobile-web mobile-native mobile-preview mobile-export mobile-export-ios mobile-typecheck mobile-test mobile-test-web mobile-lint mobile-fmt mobile-check
 mobile-install: packages/mobile/node_modules/.installed ## Install pinned mobile dependencies
 
 packages/mobile/node_modules/.installed: packages/mobile/package.json packages/mobile/bun.lock
@@ -627,6 +627,9 @@ mobile-typecheck: mobile-install ## Typecheck the mobile app against shared Xum 
 
 mobile-test: mobile-install packages/mobile/.expo/preview.mjs ## Test mobile protocol, transcript, and preview safety
 	@cd packages/mobile && bun test src scripts
+
+mobile-test-web: mobile-install ## Test native-web navigation/layout against a disposable running preview
+	@cd packages/mobile && bun x playwright test
 
 mobile-lint: mobile-install ## Lint native components and mobile infrastructure
 	@cd packages/mobile && ../../node_modules/.bin/eslint . --max-warnings 0

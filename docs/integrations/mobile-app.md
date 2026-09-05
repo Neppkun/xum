@@ -5,7 +5,7 @@ description: Develop the React Native Xum companion and connect it to your serve
 
 The experimental mobile companion lives in `packages/mobile`. It uses native React Native views, with React Native Web for browser development—not an embedded copy of the desktop website.
 
-It connects to your existing Xum server for projects, workspace creation, conversations, agent/model selection, and read-only changes. The project/workspace navigator, bottom composer, and full-screen workspace panels follow Xum's mobile navigation. Provider configuration, terminal/desktop access, and advanced administration remain in the main Xum app.
+It connects to your existing Xum server for projects, workspace creation, conversations, agent/model selection, and read-only changes. On phones, a searchable workspace list opens conversations in a native navigation stack; wider screens keep the workspace sidebar visible. Drafts and unsent model choices survive returning to the list. Creation and model settings use sheets with pinned actions. Provider configuration, terminal/desktop access, and advanced administration remain in the main Xum app.
 
 ## Connect to a server
 
@@ -27,7 +27,7 @@ make mobile-install
 XUM_MOBILE_ENDPOINT=http://127.0.0.1:3000 make mobile-web
 ```
 
-Open `http://127.0.0.1:8082`, then enter that configured **server endpoint** and its token. Metro runs on port 8081; use the proxy on 8082, not Metro's direct URL, for API access.
+Open `http://127.0.0.1:8082` in a current Chromium browser, then enter that configured **server endpoint** and its token. Metro runs on port 8081; use the proxy on 8082, not Metro's direct URL, for API access. The web preview uses CSS content sizing for the composer; native builds use React Native's text measurement.
 
 The preview forwards to exactly one endpoint configured at startup. It checks the request Host and Origin before forwarding, strips preview cookies/forwarded identity, and preserves the upstream path prefix. It does not relax the production server's origin protections. Native builds connect directly and do not need this proxy.
 
@@ -80,6 +80,18 @@ bun test ./scripts/server.integration.test.ts
 ```
 
 That test creates and removes a scratch workspace. It exercises real authentication, persistence, streaming and reconnect/replay; only the model response is deterministic.
+
+With the production preview running against that same disposable server, run the full-app browser regressions from the repository root:
+
+```bash
+# One-time browser installation
+(cd packages/mobile && bun x playwright install chromium)
+XUM_MOBILE_TEST_ENDPOINT=http://127.0.0.1:3000 \
+XUM_MOBILE_TEST_TOKEN=your-disposable-server-token \
+make mobile-test-web
+```
+
+These tests pin 375px, 390px, and 1200px viewports, create and remove scratch chats, and check draft/model retention, keyboard focus, and reachable sheet actions. Set `XUM_MOBILE_TEST_WEB_URL` if the preview is not at `http://127.0.0.1:8082`.
 
 For a browser walkthrough, use the production preview and a phone viewport around 375–390 pixels, then repeat at tablet/desktop width:
 

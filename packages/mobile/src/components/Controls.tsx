@@ -179,6 +179,7 @@ export function Sheet(props: {
   onClose: () => void;
   footer?: ReactNode;
   dismissDisabled?: boolean;
+  onBack?: () => void;
 }) {
   function dismiss() {
     if (!props.dismissDisabled) props.onClose();
@@ -216,6 +217,7 @@ export function Sheet(props: {
           >
             <Header
               title={props.title}
+              onBack={props.onBack}
               trailing={
                 <IconButton
                   label="Close"

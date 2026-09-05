@@ -1,7 +1,11 @@
-import { useState } from "react";
-import { Modal, StatusBar, Text, useWindowDimensions, View } from "react-native";
+import { createContext, useContext, useState } from "react";
+import type { ReactNode, SetStateAction } from "react";
+import { StatusBar, Text, useWindowDimensions, View } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
-import { Menu, Plus } from "lucide-react-native";
+import { DarkTheme, NavigationContainer } from "@react-navigation/native";
+import { createNativeStackNavigator } from "@react-navigation/native-stack";
+import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+import type { FrontendWorkspaceMetadata } from "../../src/common/types/workspace";
 import { clearCredentials } from "./src/credentials";
 import { ConnectScreen } from "./src/screens/ConnectScreen";
 import type { Connection } from "./src/screens/ConnectScreen";
@@ -10,39 +14,66 @@ import { ConversationScreen } from "./src/screens/ConversationScreen";
 import { CreateWorkspace } from "./src/screens/CreateWorkspace";
 import { ChangesScreen } from "./src/screens/ChangesScreen";
 import { SettingsScreen } from "./src/screens/SettingsScreen";
-import { Button, Header, IconButton, Loading, Notice } from "./src/components/Controls";
+import { Button, Header, Loading, Notice } from "./src/components/Controls";
 import { useProjects } from "./src/useProjects";
 import { useConnection } from "./src/useConnection";
 import { colors, layout } from "./src/theme";
+import type { ChatSettings } from "./src/settings";
+
+export type MobileRoutes = {
+  Workspaces: undefined;
+  Conversation: { workspaceId: string };
+  Changes: { workspaceId: string };
+  Settings: undefined;
+};
+const Stack = createNativeStackNavigator<MobileRoutes>();
+
+type SessionContext = {
+  session: ReturnType<typeof useConnection>;
+  data: ReturnType<typeof useProjects>;
+  drafts: Record<string, string>;
+  selections: Record<string, ChatSettings>;
+  setSelection: (id: string, value: ChatSettings) => void;
+  setDraft: (id: string, update: SetStateAction<string>) => void;
+  create: (onCreated: (workspace: FrontendWorkspaceMetadata) => void) => void;
+  disconnect: () => Promise<void>;
+  disconnectError: string | null;
+  disconnecting: boolean;
+};
+const Session = createContext<SessionContext | null>(null);
+function useSession() {
+  const session = useContext(Session);
+  if (!session) throw new Error("Mobile screens require an authenticated session");
+  return session;
+}
 
 export default function App() {
   const [connection, setConnection] = useState<Connection | null>(null);
   return (
     <SafeAreaProvider>
       <StatusBar barStyle="light-content" backgroundColor={colors.background} />
-      <SafeAreaView style={layout.fill}>
-        {connection ? (
-          <ConnectedApp connection={connection} onDisconnect={() => setConnection(null)} />
-        ) : (
+      {connection ? (
+        <ConnectedApp connection={connection} onDisconnect={() => setConnection(null)} />
+      ) : (
+        <SafeAreaView style={layout.fill}>
           <ConnectScreen onConnect={setConnection} />
-        )}
-      </SafeAreaView>
+        </SafeAreaView>
+      )}
     </SafeAreaProvider>
   );
 }
 
 function ConnectedApp(props: { connection: Connection; onDisconnect: () => void }) {
-  const { width } = useWindowDimensions();
-  const wide = width >= 900;
   const session = useConnection(props.connection);
   const data = useProjects(session.connection.client, session.signal);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [drawer, setDrawer] = useState(false);
-  const [create, setCreate] = useState(false);
-  const [screen, setScreen] = useState<"chat" | "changes" | "settings">("chat");
+  // Draft text and unsent model choices survive native back/pop and reconnection.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [selections, setSelections] = useState<Record<string, ChatSettings>>({});
+  const [onCreated, setOnCreated] = useState<
+    ((workspace: FrontendWorkspaceMetadata) => void) | null
+  >(null);
   const [disconnectError, setDisconnectError] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
-  const selected = data.workspaces.find((workspace) => workspace.id === selectedId);
   async function disconnect() {
     session.cancel();
     setDisconnecting(true);
@@ -51,134 +82,208 @@ function ConnectedApp(props: { connection: Connection; onDisconnect: () => void 
       await clearCredentials();
       props.onDisconnect();
     } catch {
-      setDisconnectError(
-        "Could not clear secure credentials. Try again before leaving this device."
-      );
+      setDisconnectError("Could not clear saved credentials. Try disconnecting again.");
       setDisconnecting(false);
     }
   }
-  const navigation = (
-    <Navigator
-      {...data}
-      selectedId={selected?.id}
-      error={session.error ?? data.error}
-      loading={session.reconnecting || data.loading}
-      onRetry={session.reconnect}
-      onSelect={(workspace) => {
-        setSelectedId(workspace.id);
-        setDrawer(false);
-        setScreen("chat");
-      }}
-      onCreate={() => {
-        setDrawer(false);
-        if (session.ready) setCreate(true);
-      }}
-      onSettings={() => {
-        setDrawer(false);
-        setScreen("settings");
-      }}
-      onClose={wide ? undefined : () => setDrawer(false)}
-    />
-  );
+  const value: SessionContext = {
+    session,
+    data,
+    drafts,
+    selections,
+    setSelection(id, settings) {
+      setSelections((current) => ({ ...current, [id]: settings }));
+    },
+    disconnect,
+    disconnectError,
+    disconnecting,
+    setDraft(id, update) {
+      setDrafts((current) => {
+        const next = typeof update === "function" ? update(current[id] ?? "") : update;
+        return current[id] === next ? current : { ...current, [id]: next };
+      });
+    },
+    create(callback) {
+      if (session.ready) setOnCreated(() => callback);
+    },
+  };
   return (
-    <View style={[layout.fill, { flexDirection: "row" }]}>
-      {wide && <View style={{ width: 292 }}>{navigation}</View>}
-      <View style={{ flex: 1, minWidth: 0 }}>
-        {session.reconnecting && <Loading label="Reconnecting to your server…" />}
-        {session.error && <Notice onRetry={session.reconnect}>{session.error}</Notice>}
-        <View
-          style={[
-            layout.fill,
-            (screen === "settings" || (screen === "changes" && selected)) && { display: "none" },
-          ]}
+    <Session.Provider value={value}>
+      <NavigationContainer
+        theme={{
+          ...DarkTheme,
+          colors: {
+            ...DarkTheme.colors,
+            primary: colors.accent,
+            background: colors.background,
+            card: colors.background,
+            text: colors.bright,
+            border: colors.border,
+          },
+        }}
+      >
+        <Stack.Navigator
+          screenOptions={{
+            headerShown: false,
+            contentStyle: { backgroundColor: colors.background },
+            gestureEnabled: true,
+          }}
         >
-          {selected ? (
-            <ConversationScreen
-              key={selected.id}
-              client={session.connection.client}
-              workspace={selected}
-              signal={session.signal}
-              connected={session.ready}
-              onReconnect={session.reconnect}
-              onMenu={wide ? undefined : () => setDrawer(true)}
-              onChanges={() => setScreen("changes")}
-            />
-          ) : (
-            <>
-              <Header
-                title="Workspaces"
-                trailing={
-                  !wide && (
-                    <IconButton
-                      label="Open workspaces"
-                      icon={Menu}
-                      onPress={() => setDrawer(true)}
-                    />
-                  )
-                }
-              />
-              <View style={[layout.content, { flex: 1, justifyContent: "center" }]}>
-                {data.loading ? (
-                  <Loading label="Loading your workspaces…" />
-                ) : data.error ? (
-                  <Notice onRetry={session.reconnect}>{data.error}</Notice>
-                ) : (
-                  <>
-                    <Text style={layout.title}>Make space for your next idea.</Text>
-                    <Text style={layout.muted}>
-                      Select a workspace or start a new conversation. Everything stays on your Xum
-                      server.
-                    </Text>
-                    <Button icon={Plus} disabled={!session.ready} onPress={() => setCreate(true)}>
-                      New workspace
-                    </Button>
-                  </>
-                )}
-              </View>
-            </>
-          )}
-        </View>
-        {screen === "changes" && selected && (
-          <ChangesScreen
-            key={selected.id}
-            client={session.connection.client}
-            workspaceId={selected.id}
-            signal={session.signal}
-            onReconnect={session.reconnect}
-            onBack={() => setScreen("chat")}
+          <Stack.Screen name="Workspaces" component={WorkspacesRoute} />
+          <Stack.Screen
+            name="Conversation"
+            component={ConversationRoute}
+            getId={({ params }) => params.workspaceId}
           />
-        )}
-        {screen === "settings" && (
-          <SettingsScreen
-            endpoint={session.connection.endpoint}
-            onDisconnect={disconnect}
-            onBack={() => setScreen("chat")}
-            error={disconnectError}
-            busy={disconnecting}
-          />
-        )}
-      </View>
-      {!wide && drawer && (
-        <Modal animationType="slide" onRequestClose={() => setDrawer(false)}>
-          <SafeAreaView style={layout.fill}>{navigation}</SafeAreaView>
-        </Modal>
-      )}
-      {create && (
+          <Stack.Screen name="Changes" component={ChangesRoute} />
+          <Stack.Screen name="Settings" component={SettingsRoute} />
+        </Stack.Navigator>
+      </NavigationContainer>
+      {onCreated && (
         <CreateWorkspace
           client={session.connection.client}
           projects={data.projects}
           signal={session.signal}
           connected={session.ready}
           onReconnect={session.reconnect}
-          onClose={() => setCreate(false)}
+          onClose={() => setOnCreated(null)}
           onCreated={(workspace) => {
-            setSelectedId(workspace.id);
-            setScreen("chat");
-            setCreate(false);
+            // Navigation can render immediately; use the server-returned metadata before re-listing.
+            data.addWorkspace(workspace);
             data.retry();
+            onCreated(workspace);
+            setOnCreated(null);
           }}
         />
       )}
-    </View>
+    </Session.Provider>
+  );
+}
+
+function WorkspaceList(props: {
+  selectedId?: string;
+  onSelect: (id: string) => void;
+  onSettings: () => void;
+  compact?: boolean;
+}) {
+  const { data, session, create } = useSession();
+  return (
+    <Navigator
+      {...data}
+      compact={props.compact}
+      selectedId={props.selectedId}
+      loading={data.loading || session.reconnecting}
+      error={session.error ?? data.error}
+      onRetry={session.reconnect}
+      onSelect={(workspace) => props.onSelect(workspace.id)}
+      onCreate={() => create((workspace) => props.onSelect(workspace.id))}
+      onSettings={props.onSettings}
+    />
+  );
+}
+
+function WorkspacesRoute(props: NativeStackScreenProps<MobileRoutes, "Workspaces">) {
+  return (
+    <SafeAreaView style={layout.fill}>
+      <WorkspaceList
+        onSelect={(workspaceId) => props.navigation.navigate("Conversation", { workspaceId })}
+        onSettings={() => props.navigation.navigate("Settings")}
+      />
+    </SafeAreaView>
+  );
+}
+
+function ScreenLayout(props: {
+  children: ReactNode;
+  workspaceId?: string;
+  navigation: Pick<NativeStackScreenProps<MobileRoutes>["navigation"], "navigate">;
+}) {
+  const { width } = useWindowDimensions();
+  return (
+    <SafeAreaView style={[layout.fill, { flexDirection: "row" }]}>
+      {width >= 900 && (
+        <View style={{ width: 300, borderRightWidth: 1, borderRightColor: colors.border }}>
+          <WorkspaceList
+            compact
+            selectedId={props.workspaceId}
+            onSelect={(workspaceId) => props.navigation.navigate("Conversation", { workspaceId })}
+            onSettings={() => props.navigation.navigate("Settings")}
+          />
+        </View>
+      )}
+      <View style={{ flex: 1, minWidth: 0 }}>{props.children}</View>
+    </SafeAreaView>
+  );
+}
+
+function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversation">) {
+  const { session, data, drafts, setDraft, selections, setSelection } = useSession();
+  const { workspaceId } = props.route.params;
+  const workspace = data.workspaces.find((item) => item.id === workspaceId);
+  return (
+    <ScreenLayout navigation={props.navigation} workspaceId={workspaceId}>
+      {session.reconnecting && <Loading label="Reconnecting…" />}
+      {session.error && <Notice onRetry={session.reconnect}>{session.error}</Notice>}
+      {workspace ? (
+        <ConversationScreen
+          key={workspaceId}
+          client={session.connection.client}
+          workspace={workspace}
+          signal={session.signal}
+          connected={session.ready}
+          onReconnect={session.reconnect}
+          onBack={() => props.navigation.popTo("Workspaces")}
+          onChanges={() => props.navigation.navigate("Changes", { workspaceId })}
+          selection={selections[workspaceId] ?? null}
+          onSelectionChange={(value) => setSelection(workspaceId, value)}
+          draft={drafts[workspaceId] ?? ""}
+          onDraftChange={(update) => setDraft(workspaceId, update)}
+        />
+      ) : (
+        <>
+          <Header title="Conversation" onBack={() => props.navigation.goBack()} />
+          {data.loading ? (
+            <Loading label="Opening workspace…" />
+          ) : (
+            <View style={layout.content}>
+              <Text style={layout.text}>This workspace is no longer available.</Text>
+              <Button secondary onPress={() => props.navigation.popTo("Workspaces")}>
+                Back to workspaces
+              </Button>
+            </View>
+          )}
+        </>
+      )}
+    </ScreenLayout>
+  );
+}
+
+function ChangesRoute(props: NativeStackScreenProps<MobileRoutes, "Changes">) {
+  const { session } = useSession();
+  return (
+    <ScreenLayout navigation={props.navigation} workspaceId={props.route.params.workspaceId}>
+      <ChangesScreen
+        client={session.connection.client}
+        workspaceId={props.route.params.workspaceId}
+        signal={session.signal}
+        onReconnect={session.reconnect}
+        onBack={() => props.navigation.goBack()}
+      />
+    </ScreenLayout>
+  );
+}
+
+function SettingsRoute(props: NativeStackScreenProps<MobileRoutes, "Settings">) {
+  const { session, disconnect, disconnectError, disconnecting } = useSession();
+  return (
+    <ScreenLayout navigation={props.navigation}>
+      <SettingsScreen
+        endpoint={session.connection.endpoint}
+        onDisconnect={disconnect}
+        onBack={() => props.navigation.goBack()}
+        error={disconnectError}
+        busy={disconnecting}
+      />
+    </ScreenLayout>
   );
 }

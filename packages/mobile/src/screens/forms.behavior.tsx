@@ -125,7 +125,7 @@ test("workspace creation cannot be dismissed or submitted twice while the server
   expect(selected).toBe(workspace);
 });
 
-test("model search accepts friendly names and keeps the submit action available without clearing the selection", async () => {
+test("model search accepts friendly names and returning preserves the selection", async () => {
   const data: SettingsData = {
     config: { agentAiDefaults: {}, defaultModel: "anthropic:claude-sonnet-4-5" },
     providers: { anthropic: { isConfigured: true, isEnabled: true, apiKeySet: true } },
@@ -152,6 +152,7 @@ test("model search accepts friendly names and keeps the submit action available 
   );
   fireEvent.change(view.getByLabelText("Search models"), { target: { value: "not-a-model" } });
   expect(view.queryByRole("button", { name: "anthropic:claude-sonnet-4-5" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Back" }));
   fireEvent.click(view.getByRole("button", { name: "Use settings" }));
   expect(saved?.model).toBe("anthropic:claude-sonnet-4-5");
   expect(saved?.thinkingLevel).toBe("high");
