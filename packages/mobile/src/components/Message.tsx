@@ -47,13 +47,16 @@ export function Message(props: {
             );
         }
       })}
-      {!user &&
-        props.message.metadata?.partial &&
+      {props.message.role === "assistant" &&
         !props.streaming &&
-        !props.message.metadata.error && (
+        !props.message.metadata?.error &&
+        (props.message.metadata?.partial || props.message.parts.length === 0) && (
           <View style={styles.interrupted}>
-            <Pause size={13} color={colors.muted} />
-            <Text style={layout.muted}>Interrupted</Text>
+            {props.message.metadata?.partial && <Pause size={13} color={colors.muted} />}
+            {/* Empty replay rows may lack an interruption marker; don't invent a stop reason. */}
+            <Text style={layout.muted}>
+              {props.message.metadata?.partial ? "Interrupted" : "No response received"}
+            </Text>
           </View>
         )}
     </View>

@@ -7,6 +7,7 @@ import type { TextInput } from "react-native";
 import type { MobileClient } from "../api";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import { Button, Field, Sheet } from "../components/Controls";
+import { Message } from "../components/Message";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { ModelSettings } from "./ModelSettings";
 import { SettingsScreen } from "./SettingsScreen";
@@ -22,6 +23,23 @@ const workspace: FrontendWorkspaceMetadata = {
   namedWorkspacePath: "/project/feature",
   runtimeConfig: { type: "local" },
 };
+
+test("empty assistant history is explained without mislabeling a live or completed response", () => {
+  const props = { canAnswer: false, onAnswer: async () => {} };
+  const message = { id: "empty", role: "assistant" as const, parts: [] };
+  const view = render(<Message {...props} message={message} streaming />);
+  expect(view.queryByText("No response received")).toBeNull();
+  view.rerender(<Message {...props} message={message} />);
+  expect(view.getByText("No response received")).toBeDefined();
+  view.rerender(<Message {...props} message={{ ...message, metadata: { partial: true } }} />);
+  expect(view.getByText("Interrupted")).toBeDefined();
+  expect(view.queryByText("No response received")).toBeNull();
+  view.rerender(
+    <Message {...props} message={{ ...message, parts: [{ type: "text", text: "A response" }] }} />
+  );
+  expect(view.queryByText("No response received")).toBeNull();
+  expect(view.queryByText("Interrupted")).toBeNull();
+});
 
 test("a field ref focuses the next native input", () => {
   const next = createRef<TextInput>();
