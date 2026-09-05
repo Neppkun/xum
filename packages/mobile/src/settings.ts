@@ -1,10 +1,14 @@
+import { DEFAULT_MODEL, KNOWN_MODELS } from "../../../src/common/constants/knownModels";
 import type { MobileClient } from "./api";
 import type { FrontendWorkspaceMetadata } from "../../../src/common/types/workspace";
 import type { SendMessageOptions } from "../../../src/common/orpc/types";
 import type { ThinkingLevel } from "../../../src/common/types/thinking";
 
 export type SettingsData = {
-  config: Awaited<ReturnType<MobileClient["config"]["getConfig"]>>;
+  config: Pick<
+    Awaited<ReturnType<MobileClient["config"]["getConfig"]>>,
+    "agentAiDefaults" | "defaultModel" | "hiddenModels"
+  >;
   providers: Awaited<ReturnType<MobileClient["providers"]["getConfig"]>>;
   agents: Awaited<ReturnType<MobileClient["agents"]["list"]>>;
 };
@@ -15,7 +19,7 @@ export type ChatSettings = Pick<
 export const thinkingLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
 
 export function resolveSettings(
-  workspace: FrontendWorkspaceMetadata,
+  workspace: Pick<FrontendWorkspaceMetadata, "aiSettingsByAgent" | "agentId" | "aiSettings">,
   data: SettingsData,
   agentId: string
 ): ChatSettings {
@@ -31,7 +35,7 @@ export function resolveSettings(
       globalDefaults?.modelString ??
       agentDefaults?.model ??
       data.config.defaultModel ??
-      "",
+      DEFAULT_MODEL,
     thinkingLevel:
       workspaceDefaults?.thinkingLevel ??
       globalDefaults?.thinkingLevel ??
@@ -44,6 +48,11 @@ export function modelChoices(data: SettingsData, currentModel: string): string[]
   const models = new Set<string>();
   if (currentModel) models.add(currentModel);
   if (data.config.defaultModel) models.add(data.config.defaultModel);
+  // getConfig lists custom/discovered models, not the built-in desktop catalog.
+  for (const model of Object.values(KNOWN_MODELS)) {
+    const provider = data.providers[model.provider];
+    if (provider?.isConfigured && provider.isEnabled) models.add(model.id);
+  }
   for (const [provider, config] of Object.entries(data.providers)) {
     if (!config.isEnabled || !config.isConfigured) continue;
     for (const entry of [...(config.models ?? []), ...(config.discoveredModels ?? [])]) {

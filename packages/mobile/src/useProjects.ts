@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { MobileClient } from "./api";
 import type { FrontendWorkspaceMetadata } from "../../../src/common/types/workspace";
 import { isWorkspaceArchived } from "../../../src/common/utils/archive";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "../../../src/common/constants/scratch";
 import { linkedAbortController } from "./useConnection";
 
 export type Projects = Awaited<ReturnType<MobileClient["projects"]["list"]>>;
@@ -27,7 +28,8 @@ export function useProjects(client: MobileClient, signal: AbortSignal) {
         client.workspace.list(undefined, { signal: controller.signal }),
       ]);
       if (controller.signal.aborted) return;
-      setProjects(projectList);
+      // Scratch chats have their own creation path, not a git worktree target.
+      setProjects(projectList.filter(([path]) => path !== SCRATCH_PROJECT_CONFIG_KEY));
       setWorkspaces(workspaceList);
       setLoading(false);
       for await (const event of events) {

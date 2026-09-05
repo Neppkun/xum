@@ -20,7 +20,7 @@ import {
 import type { MobileClient } from "../api";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import type { MuxMessage } from "../../../../src/common/types/message";
-import { IconButton, Loading, Notice } from "../components/Controls";
+import { Button, IconButton, Loading, Notice } from "../components/Controls";
 import { Message } from "../components/Message";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
@@ -28,6 +28,7 @@ import { resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
 import { ModelSettings } from "./ModelSettings";
 import { colors, layout } from "../theme";
+import { DEFAULT_THINKING_LEVEL } from "../../../../src/common/types/thinking";
 
 export function ConversationScreen(props: {
   client: MobileClient;
@@ -38,7 +39,7 @@ export function ConversationScreen(props: {
   onMenu?: () => void;
   onChanges: () => void;
 }) {
-  const { transcript, settings, error } = useConversation(
+  const { transcript, settings, error, loadOlder, loadingOlder, historyError } = useConversation(
     props.client,
     props.workspace.id,
     props.signal
@@ -77,7 +78,12 @@ export function ConversationScreen(props: {
     const signal = controller.current.signal;
     try {
       const result = await props.client.workspace.sendMessage(
-        { workspaceId: props.workspace.id, message, options },
+        {
+          workspaceId: props.workspace.id,
+          message,
+          // Persist the effective default alongside the model, like the desktop composer.
+          options: { ...options, thinkingLevel: options.thinkingLevel ?? DEFAULT_THINKING_LEVEL },
+        },
         { signal }
       );
       if (signal.aborted) return;
@@ -161,6 +167,24 @@ export function ConversationScreen(props: {
         keyExtractor={(message) => message.id}
         contentContainerStyle={styles.messages}
         keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+        ListHeaderComponent={
+          transcript.hasOlderHistory ? (
+            <View style={{ gap: 12 }}>
+              {historyError && <Notice>{historyError}</Notice>}
+              <Button
+                busy={loadingOlder}
+                disabled={!ready}
+                onPress={() => {
+                  setAtBottom(false);
+                  return loadOlder();
+                }}
+              >
+                Load older messages
+              </Button>
+            </View>
+          ) : null
+        }
         onScroll={(event) => {
           const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
           setAtBottom(contentSize.height - layoutMeasurement.height - contentOffset.y < 80);
