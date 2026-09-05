@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from "react-native";
-import { ArrowRight, ShieldCheck } from "lucide-react-native";
+import { ArrowRight, Eye, EyeOff, ShieldCheck } from "lucide-react-native";
+import type { TextInput } from "react-native";
 import { connect } from "../connection";
 import { isInsecureEndpoint } from "../endpoint";
 import { loadCredentials, saveCredentials } from "../credentials";
-import { Button, Field, Loading, Notice } from "../components/Controls";
-import { colors, layout } from "../theme";
+import { Button, Field, IconButton, Loading, Notice } from "../components/Controls";
+import { colors, layout, spacing, typography } from "../theme";
 
 export type Connection = Awaited<ReturnType<typeof connect>>;
 
@@ -16,6 +17,8 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const request = useRef<AbortController | null>(null);
+  const tokenInput = useRef<TextInput>(null);
+  const [showToken, setShowToken] = useState(false);
   let insecure = false;
   try {
     insecure = isInsecureEndpoint(endpoint.trim());
@@ -85,49 +88,66 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
   return (
     <KeyboardAvoidingView
       style={layout.fill}
-      behavior={Platform.OS === "ios" ? "padding" : "height"}
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
     >
-      <ScrollView contentContainerStyle={styles.page} keyboardShouldPersistTaps="handled">
+      <ScrollView
+        contentContainerStyle={styles.page}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
+      >
         <View style={styles.form}>
-          <Text style={styles.wordmark}>
-            xum<Text style={{ color: colors.accent }}>.</Text>
-          </Text>
-          <View style={{ gap: 10 }}>
-            <Text style={styles.title}>{"Your agents.\nWithin reach."}</Text>
-            <Text style={layout.muted}>
-              Connect to your Xum server to pick up a conversation, review changes, or start
-              something new.
+          <View style={{ gap: spacing.sm }}>
+            <Text style={styles.wordmark}>
+              xum<Text style={{ color: colors.accent }}>.</Text>
             </Text>
+            <Text style={layout.title}>Connect to Xum</Text>
+            <Text style={layout.muted}>Enter the address of your Xum server.</Text>
           </View>
           {loading ? (
             <Loading label="Reading saved connection…" />
           ) : (
             <>
-              <Field
-                label="SERVER URL"
-                placeholder="https://xum.example.com"
-                value={endpoint}
-                onChangeText={setEndpoint}
-                keyboardType="url"
-                editable={!busy}
-                autoComplete="url"
-              />
-              <Field
-                label="BEARER TOKEN"
-                placeholder="Server authentication token"
-                value={token}
-                onChangeText={setToken}
-                secureTextEntry
-                editable={!busy}
-                autoComplete="off"
-                onSubmitEditing={() => {
-                  if (endpoint.trim() && token.trim()) return submit();
-                }}
-              />
+              <View style={[layout.group, styles.fields]}>
+                <Field
+                  label="Server URL"
+                  placeholder="https://xum.example.com"
+                  value={endpoint}
+                  onChangeText={setEndpoint}
+                  keyboardType="url"
+                  editable={!busy}
+                  autoComplete="url"
+                  returnKeyType="next"
+                  submitBehavior="submit"
+                  onSubmitEditing={() => tokenInput.current?.focus()}
+                />
+                <Field
+                  ref={tokenInput}
+                  label="Bearer token"
+                  placeholder="Server authentication token"
+                  value={token}
+                  onChangeText={setToken}
+                  secureTextEntry={!showToken}
+                  editable={!busy}
+                  autoComplete="off"
+                  returnKeyType="done"
+                  onSubmitEditing={() => {
+                    // HTTP requires the explicitly labelled button, not a keyboard shortcut.
+                    if (!insecure && endpoint.trim() && token.trim()) return submit();
+                  }}
+                  trailing={
+                    <IconButton
+                      label={showToken ? "Hide bearer token" : "Show bearer token"}
+                      icon={showToken ? EyeOff : Eye}
+                      onPress={() => setShowToken(!showToken)}
+                      disabled={busy}
+                    />
+                  }
+                />
+              </View>
               {insecure && (
-                <Notice>
-                  This HTTP connection is not encrypted. Your bearer token and conversations can be
-                  read by others on the network. Continue only on a trusted local network.
+                <Notice severity="warning">
+                  HTTP is not encrypted. Your token and conversations can be read by others on the
+                  network. Connect only on a trusted local network.
                 </Notice>
               )}
               {error && <Notice>{error}</Notice>}
@@ -135,21 +155,18 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
                 icon={ArrowRight}
                 busy={busy}
                 disabled={!endpoint.trim() || !token.trim()}
-                onPress={() => {
-                  return submit();
-                }}
+                onPress={submit}
               >
-                {insecure ? "Connect without encryption" : "Connect to Xum"}
+                {insecure ? "Connect without encryption" : "Connect"}
               </Button>
             </>
           )}
           <View style={[layout.row, { alignItems: "flex-start" }]}>
-            <ShieldCheck color={colors.muted} size={18} />
-            <Text style={[layout.muted, { flex: 1 }]}>
+            <ShieldCheck color={colors.muted} size={16} />
+            <Text style={[typography.footnote, { color: colors.muted, flex: 1 }]}>
               {Platform.OS === "web"
-                ? "Your token stays in this tab’s memory. It is never saved in browser storage."
-                : "Your connection is saved in this device’s secure credential storage."}{" "}
-              Use a trusted HTTPS server; unencrypted connections are only for local development.
+                ? "Your token stays in this tab. It is never saved in browser storage."
+                : "Your connection is saved securely on this device."}
             </Text>
           </View>
         </View>
@@ -159,14 +176,15 @@ export function ConnectScreen(props: { onConnect: (connection: Connection) => vo
 }
 
 const styles = StyleSheet.create({
-  page: { flexGrow: 1, justifyContent: "center", padding: 28 },
-  form: { gap: 24, maxWidth: 420, width: "100%", alignSelf: "center" },
-  wordmark: { fontSize: 38, fontWeight: "700", letterSpacing: -2, color: colors.bright },
-  title: {
+  page: { flexGrow: 1, padding: spacing.xl, paddingTop: spacing.xxxl },
+  form: { gap: spacing.xxl, maxWidth: 480, width: "100%", alignSelf: "center" },
+  wordmark: {
     color: colors.bright,
-    fontSize: 30,
-    lineHeight: 38,
-    fontWeight: "600",
-    letterSpacing: -0.8,
+    fontSize: 28,
+    lineHeight: 36,
+    fontWeight: "700",
+    letterSpacing: -1,
+    marginBottom: spacing.lg,
   },
+  fields: { padding: spacing.lg, gap: spacing.xl },
 });

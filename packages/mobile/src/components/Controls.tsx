@@ -1,7 +1,10 @@
+import { forwardRef } from "react";
 import type { ReactNode } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -11,9 +14,9 @@ import {
 } from "react-native";
 import type { TextInputProps } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { AlertCircle, ArrowLeft, X } from "lucide-react-native";
+import { AlertCircle, ChevronLeft, Info, TriangleAlert, X } from "lucide-react-native";
 import type { LucideIcon } from "lucide-react-native";
-import { colors, layout } from "../theme";
+import { colors, layout, radii, spacing, typography } from "../theme";
 
 export function IconButton(props: {
   label: string;
@@ -27,14 +30,12 @@ export function IconButton(props: {
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={props.label}
+      accessibilityState={{ disabled: props.disabled }}
       disabled={props.disabled}
       onPress={props.onPress}
-      style={({ pressed }) => [
-        styles.iconButton,
-        { opacity: props.disabled ? 0.35 : pressed ? 0.6 : 1 },
-      ]}
+      style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
     >
-      <Icon size={20} color={props.color ?? colors.muted} />
+      <Icon size={22} color={props.disabled ? colors.dim : (props.color ?? colors.muted)} />
     </Pressable>
   );
 }
@@ -45,55 +46,88 @@ export function Button(props: {
   disabled?: boolean;
   busy?: boolean;
   secondary?: boolean;
+  destructive?: boolean;
   icon?: LucideIcon;
 }) {
   const Icon = props.icon;
+  const disabled = props.disabled || props.busy;
+  const foreground = props.disabled
+    ? colors.muted
+    : props.destructive
+      ? colors.danger
+      : props.secondary
+        ? colors.bright
+        : colors.background;
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityState={{ disabled: props.disabled || props.busy }}
-      disabled={props.disabled || props.busy}
+      accessibilityState={{ disabled, busy: props.busy }}
+      disabled={disabled}
       onPress={props.onPress}
       style={({ pressed }) => [
         styles.button,
         props.secondary && styles.secondary,
-        { opacity: props.disabled || props.busy ? 0.5 : pressed ? 0.7 : 1 },
+        props.destructive && styles.destructive,
+        props.disabled && styles.secondary,
+        pressed && styles.pressed,
       ]}
     >
       {props.busy ? (
-        <ActivityIndicator color={colors.bright} size="small" />
+        <ActivityIndicator color={foreground} size="small" />
       ) : Icon ? (
-        <Icon size={18} color={colors.bright} />
+        <Icon size={18} color={foreground} />
       ) : null}
-      <Text style={styles.buttonText}>{props.children}</Text>
+      <Text style={[styles.buttonText, { color: foreground }]}>{props.children}</Text>
     </Pressable>
   );
 }
 
-export function Field(props: TextInputProps & { label: string }) {
-  const { label, ...inputProps } = props;
+export const Field = forwardRef<
+  TextInput,
+  TextInputProps & { label: string; trailing?: ReactNode }
+>(function Field(props, ref) {
+  const { label, trailing, ...inputProps } = props;
   return (
-    <View style={{ gap: 8 }}>
+    <View style={{ gap: spacing.sm }}>
       <Text style={layout.label}>{label}</Text>
-      <TextInput
-        placeholderTextColor={colors.dim}
-        selectionColor={colors.accent}
-        autoCapitalize="none"
-        autoCorrect={false}
-        {...inputProps}
-        accessibilityLabel={label}
-        style={[styles.input, inputProps.style]}
-      />
+      <View style={styles.field}>
+        <TextInput
+          ref={ref}
+          placeholderTextColor={colors.dim}
+          selectionColor={colors.accent}
+          autoCapitalize="none"
+          autoCorrect={false}
+          {...inputProps}
+          accessibilityLabel={inputProps.accessibilityLabel ?? label}
+          style={[styles.input, inputProps.style]}
+        />
+        {trailing}
+      </View>
     </View>
   );
-}
+});
 
-export function Notice(props: { children: string; onRetry?: () => void }) {
+export function Notice(props: {
+  children: string;
+  onRetry?: () => void;
+  severity?: "error" | "warning" | "info";
+}) {
+  const severity = props.severity ?? "error";
+  const Icon = severity === "warning" ? TriangleAlert : severity === "info" ? Info : AlertCircle;
+  const tint =
+    severity === "warning" ? colors.warning : severity === "info" ? colors.muted : colors.danger;
   return (
-    <View accessibilityRole="alert" style={styles.notice}>
+    <View
+      accessibilityRole={severity === "info" ? undefined : "alert"}
+      style={[
+        styles.notice,
+        severity === "warning" && { backgroundColor: colors.warningSurface },
+        severity === "error" && { backgroundColor: colors.dangerSurface },
+      ]}
+    >
       <View style={[layout.row, { alignItems: "flex-start" }]}>
-        <AlertCircle size={18} color={colors.danger} />
-        <Text selectable style={[layout.text, { color: colors.danger, flex: 1 }]}>
+        <Icon size={18} color={tint} />
+        <Text selectable style={[typography.footnote, { color: tint, flex: 1 }]}>
           {props.children}
         </Text>
       </View>
@@ -123,13 +157,13 @@ export function Header(props: {
 }) {
   return (
     <View style={styles.header}>
-      {props.onBack && <IconButton label="Back" icon={ArrowLeft} onPress={props.onBack} />}
+      {props.onBack && <IconButton label="Back" icon={ChevronLeft} onPress={props.onBack} />}
       <View style={{ flex: 1, minWidth: 0 }}>
         <Text numberOfLines={1} style={styles.headerTitle}>
           {props.title}
         </Text>
         {props.subtitle && (
-          <Text numberOfLines={1} style={layout.muted}>
+          <Text numberOfLines={1} style={[typography.footnote, { color: colors.muted }]}>
             {props.subtitle}
           </Text>
         )}
@@ -139,18 +173,69 @@ export function Header(props: {
   );
 }
 
-export function Sheet(props: { title: string; children: ReactNode; onClose: () => void }) {
+export function Sheet(props: {
+  title: string;
+  children: ReactNode;
+  onClose: () => void;
+  footer?: ReactNode;
+  dismissDisabled?: boolean;
+}) {
+  function dismiss() {
+    if (!props.dismissDisabled) props.onClose();
+  }
+  const web = Platform.OS === "web";
   return (
-    <Modal animationType="slide" presentationStyle="pageSheet" onRequestClose={props.onClose}>
-      <SafeAreaView style={layout.fill}>
-        <Header
-          title={props.title}
-          trailing={<IconButton label="Close" icon={X} onPress={props.onClose} />}
-        />
-        <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={layout.content}>
-          {props.children}
-        </ScrollView>
-      </SafeAreaView>
+    <Modal
+      animationType="slide"
+      transparent={web}
+      presentationStyle={web ? "overFullScreen" : "pageSheet"}
+      allowSwipeDismissal={!props.dismissDisabled}
+      onRequestClose={dismiss}
+    >
+      <View style={web ? styles.webOverlay : layout.fill}>
+        {web && (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Dismiss ${props.title}`}
+            disabled={props.dismissDisabled}
+            onPress={dismiss}
+            style={styles.scrim}
+          />
+        )}
+        <SafeAreaView
+          style={web ? styles.webSheet : layout.fill}
+          edges={
+            web || Platform.OS === "ios"
+              ? ["left", "right", "bottom"]
+              : ["top", "left", "right", "bottom"]
+          }
+        >
+          <KeyboardAvoidingView
+            style={styles.sheetContent}
+            behavior={Platform.OS === "ios" ? "padding" : undefined}
+          >
+            <Header
+              title={props.title}
+              trailing={
+                <IconButton
+                  label="Close"
+                  icon={X}
+                  onPress={dismiss}
+                  disabled={props.dismissDisabled}
+                />
+              }
+            />
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag"
+              contentContainerStyle={layout.content}
+            >
+              {props.children}
+            </ScrollView>
+            {props.footer && <View style={styles.footer}>{props.footer}</View>}
+          </KeyboardAvoidingView>
+        </SafeAreaView>
+      </View>
     </Modal>
   );
 }
@@ -161,49 +246,77 @@ const styles = StyleSheet.create({
     minHeight: 44,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: 8,
+    borderRadius: radii.control,
   },
+  pressed: { opacity: 0.7 },
   button: {
-    minHeight: 48,
-    borderRadius: 10,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
+    minHeight: 50,
+    borderRadius: radii.control,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    gap: 8,
+    gap: spacing.sm,
     backgroundColor: colors.accent,
   },
   secondary: { backgroundColor: colors.elevated },
-  buttonText: { color: colors.bright, fontSize: 15, fontWeight: "600" },
+  destructive: { backgroundColor: colors.dangerSurface },
+  buttonText: { ...typography.header, textAlign: "center" },
+  field: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: colors.elevated,
+    borderRadius: radii.control,
+    paddingRight: spacing.xs,
+  },
   input: {
+    ...typography.body,
     color: colors.bright,
-    backgroundColor: colors.panel,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 10,
-    minHeight: 48,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
-    fontSize: 15,
+    minWidth: 0,
+    flex: 1,
+    minHeight: 50,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
   },
   notice: {
-    padding: 14,
-    gap: 12,
+    padding: spacing.lg,
+    gap: spacing.md,
     backgroundColor: colors.panel,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 10,
+    borderRadius: radii.control,
   },
-  loading: { padding: 28, gap: 12, alignItems: "center", justifyContent: "center" },
+  loading: {
+    padding: spacing.xxl,
+    gap: spacing.md,
+    alignItems: "center",
+    justifyContent: "center",
+  },
   header: {
     flexDirection: "row",
-    gap: 8,
+    gap: spacing.sm,
     alignItems: "center",
-    paddingHorizontal: 12,
-    minHeight: 68,
+    paddingHorizontal: spacing.lg,
+    minHeight: 56,
     borderBottomColor: colors.border,
-    borderBottomWidth: 1,
+    borderBottomWidth: StyleSheet.hairlineWidth,
   },
-  headerTitle: { color: colors.bright, fontWeight: "600", fontSize: 16 },
+  headerTitle: { ...typography.header, color: colors.bright },
+  webOverlay: { flex: 1, justifyContent: "flex-end", alignItems: "center" },
+  scrim: { ...StyleSheet.absoluteFill, backgroundColor: colors.scrim },
+  webSheet: {
+    backgroundColor: colors.background,
+    width: "100%",
+    maxWidth: 600,
+    maxHeight: "90%",
+    borderTopLeftRadius: radii.sheet,
+    borderTopRightRadius: radii.sheet,
+    overflow: "hidden",
+  },
+  sheetContent: { flexGrow: 1, flexShrink: 1 },
+  footer: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: colors.border,
+    padding: spacing.xl,
+    gap: spacing.md,
+  },
 });

@@ -1,11 +1,21 @@
 import { useState } from "react";
-import { Pressable, Text, View } from "react-native";
-import { Check } from "lucide-react-native";
+import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Check, ChevronDown, ChevronRight, Cpu } from "lucide-react-native";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
+import { formatModelDisplayName } from "../../../../src/common/utils/ai/modelDisplay";
 import { Button, Field, Sheet } from "../components/Controls";
 import { modelChoices, resolveSettings, thinkingLevels } from "../settings";
 import type { ChatSettings, SettingsData } from "../settings";
-import { colors, layout } from "../theme";
+import { colors, layout, radii, spacing, typography } from "../theme";
+
+function modelName(id: string) {
+  return formatModelDisplayName(
+    id
+      .slice(id.indexOf(":") + 1)
+      .split("/")
+      .at(-1) ?? id
+  );
+}
 
 export function ModelSettings(props: {
   value: ChatSettings;
@@ -16,113 +26,220 @@ export function ModelSettings(props: {
 }) {
   const [value, setValue] = useState(props.value);
   const [query, setQuery] = useState("");
+  const [browsing, setBrowsing] = useState(false);
+  const [custom, setCustom] = useState(false);
+  const agents = props.data.agents.filter((agent) => agent.uiSelectable);
   const models = modelChoices(props.data, value.model).filter((model) =>
-    model.toLowerCase().includes(query.toLowerCase())
+    `${model} ${modelName(model)}`.toLowerCase().includes(query.trim().toLowerCase())
   );
+  const groups = new Map<string, string[]>();
+  for (const model of models) {
+    const provider = model.split(":")[0];
+    const group = groups.get(provider) ?? [];
+    group.push(model);
+    groups.set(provider, group);
+  }
+  const validModel = /^\S+:\S+$/.test(value.model.trim());
+  const currentAgent = agents.find((agent) => agent.id === value.agentId);
   return (
-    <Sheet title="Conversation settings" onClose={props.onClose}>
-      <Text style={layout.muted}>
-        Used for your next message. Providers and runtime configuration are managed on your Xum
-        server.
-      </Text>
-      <Text style={layout.label}>AGENT</Text>
-      <View style={{ gap: 6 }}>
-        {props.data.agents
-          .filter((agent) => agent.uiSelectable)
-          .map((agent) => (
-            <Choice
+    <Sheet
+      title="Conversation settings"
+      onClose={props.onClose}
+      footer={
+        <Button
+          disabled={!validModel || !currentAgent}
+          onPress={() => props.onSave({ ...value, model: value.model.trim() })}
+        >
+          Use settings
+        </Button>
+      }
+    >
+      <View style={styles.section}>
+        <Text style={layout.label}>Agent</Text>
+        <View style={styles.chips}>
+          {agents.map((agent) => (
+            <Option
               key={agent.id}
-              title={agent.name}
-              description={agent.description}
+              label={agent.name}
               selected={agent.id === value.agentId}
               onPress={() => setValue(resolveSettings(props.workspace, props.data, agent.id))}
             />
           ))}
+        </View>
+        <Text style={styles.footnote}>
+          {currentAgent?.description ?? "Choose an agent for your next message."}
+        </Text>
       </View>
-      <Text style={layout.label}>MODEL</Text>
-      <Field
-        label="Search server models"
-        value={query}
-        onChangeText={setQuery}
-        placeholder="Filter models…"
-      />
-      {models.map((model) => (
-        <Choice
-          key={model}
-          title={model}
-          selected={model === value.model}
-          onPress={() => setValue({ ...value, model })}
-        />
-      ))}
-      <Field
-        label="Model ID"
-        value={value.model}
-        onChangeText={(model) => setValue({ ...value, model })}
-        placeholder="provider:model"
-      />
-      <Text style={layout.muted}>
-        Enter a provider:model ID if it is not listed. Availability and reasoning support are
-        validated by the server.
-      </Text>
-      <Text style={layout.label}>THINKING</Text>
-      <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
-        <Choice
-          title="Default"
-          selected={value.thinkingLevel == null}
-          onPress={() => setValue({ ...value, thinkingLevel: undefined })}
-        />
-        {thinkingLevels.map((level) => (
-          <Choice
-            key={level}
-            title={level}
-            selected={value.thinkingLevel === level}
-            onPress={() => setValue({ ...value, thinkingLevel: level })}
+      <View style={styles.section}>
+        <Text style={layout.label}>Model</Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Choose model"
+          accessibilityState={{ expanded: browsing }}
+          onPress={() => setBrowsing(!browsing)}
+          style={[layout.group, styles.modelRow]}
+        >
+          <Cpu size={20} color={colors.accent} />
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text numberOfLines={1} style={[layout.text, { color: colors.bright }]}>
+              {value.model ? modelName(value.model) : "Choose a model"}
+            </Text>
+            <Text numberOfLines={1} style={styles.footnote}>
+              {value.model.split(":")[0]}
+            </Text>
+          </View>
+          <ChevronDown size={18} color={colors.muted} />
+        </Pressable>
+      </View>
+      <View style={styles.section}>
+        <Text style={layout.label}>Thinking</Text>
+        <View style={styles.chips}>
+          <Option
+            label="Default"
+            selected={value.thinkingLevel == null}
+            onPress={() => setValue({ ...value, thinkingLevel: undefined })}
           />
-        ))}
+          {thinkingLevels.map((level) => (
+            <Option
+              key={level}
+              label={level[0].toUpperCase() + level.slice(1)}
+              selected={value.thinkingLevel === level}
+              onPress={() => setValue({ ...value, thinkingLevel: level })}
+            />
+          ))}
+        </View>
+        <Text style={styles.footnote}>
+          Applies to your next message. Model capabilities are checked by your server.
+        </Text>
       </View>
-      <Button
-        disabled={
-          !/^\S+:\S+$/.test(value.model.trim()) ||
-          !props.data.agents.some((agent) => agent.id === value.agentId && agent.uiSelectable)
-        }
-        onPress={() => props.onSave({ ...value, model: value.model.trim() })}
-      >
-        Use settings
-      </Button>
+      {browsing && (
+        <View style={{ gap: spacing.lg }}>
+          <Field
+            label="Search models"
+            placeholder="Model or provider"
+            value={query}
+            onChangeText={setQuery}
+            returnKeyType="search"
+            clearButtonMode="while-editing"
+          />
+          {models.length === 0 ? (
+            <Text style={layout.muted}>
+              No models match your search. Try another name or enter a custom model ID below.
+            </Text>
+          ) : (
+            <Text style={styles.footnote}>
+              {models.length} {models.length === 1 ? "model" : "models"}
+            </Text>
+          )}
+          {[...groups].map(([provider, choices]) => (
+            <View key={provider} style={styles.section}>
+              <Text style={layout.label}>
+                {props.data.providers[provider]?.displayName ??
+                  provider[0].toUpperCase() + provider.slice(1)}
+              </Text>
+              <View style={layout.group}>
+                {choices.map((model, index) => (
+                  <Pressable
+                    key={model}
+                    accessibilityRole="button"
+                    accessibilityLabel={model}
+                    accessibilityState={{ selected: model === value.model }}
+                    onPress={() => {
+                      setValue({ ...value, model });
+                      setBrowsing(false);
+                      setCustom(false);
+                    }}
+                    style={[styles.modelRow, index > 0 && styles.separator]}
+                  >
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={layout.text}>{modelName(model)}</Text>
+                      <Text numberOfLines={1} style={styles.footnote}>
+                        {model.slice(model.indexOf(":") + 1)}
+                      </Text>
+                    </View>
+                    {model === value.model && <Check size={20} color={colors.accent} />}
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+          ))}
+        </View>
+      )}
+      <View style={styles.section}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ expanded: custom }}
+          onPress={() => setCustom(!custom)}
+          style={styles.disclosure}
+        >
+          <Text style={[typography.secondary, { color: colors.muted, flex: 1 }]}>
+            Use a custom model ID
+          </Text>
+          {custom ? (
+            <ChevronDown size={18} color={colors.muted} />
+          ) : (
+            <ChevronRight size={18} color={colors.muted} />
+          )}
+        </Pressable>
+        {custom && (
+          <>
+            <Field
+              label="Model ID"
+              value={value.model}
+              onChangeText={(model) => setValue({ ...value, model })}
+              placeholder="provider:model"
+              returnKeyType="done"
+            />
+            <Text style={[styles.footnote, !validModel && { color: colors.warning }]}>
+              {validModel
+                ? "Use a model supported by a configured server provider."
+                : "Enter a model in provider:model format."}
+            </Text>
+          </>
+        )}
+      </View>
     </Sheet>
   );
 }
 
-function Choice(props: {
-  title: string;
-  description?: string;
-  selected: boolean;
-  onPress: () => void;
-}) {
+function Option(props: { label: string; selected: boolean; onPress: () => void }) {
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityState={{ selected: props.selected }}
       onPress={props.onPress}
-      style={{
-        flexDirection: "row",
-        alignItems: "center",
-        gap: 10,
-        padding: 12,
-        minHeight: 44,
-        borderWidth: 1,
-        borderColor: props.selected ? colors.accent : colors.border,
-        borderRadius: 8,
-        backgroundColor: colors.panel,
-      }}
+      style={[styles.option, props.selected && { backgroundColor: colors.accentSurface }]}
     >
-      <View style={{ flexShrink: 1 }}>
-        <Text style={[layout.text, { color: props.selected ? colors.bright : colors.text }]}>
-          {props.title}
-        </Text>
-        {props.description && <Text style={layout.muted}>{props.description}</Text>}
-      </View>
-      {props.selected && <Check color={colors.accent} size={16} />}
+      {props.selected && <Check size={14} color={colors.accent} />}
+      <Text
+        style={[typography.secondary, { color: props.selected ? colors.accent : colors.muted }]}
+      >
+        {props.label}
+      </Text>
     </Pressable>
   );
 }
+
+const styles = StyleSheet.create({
+  section: { gap: spacing.sm },
+  chips: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
+  option: {
+    minHeight: 44,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.control,
+    backgroundColor: colors.panel,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.xs,
+  },
+  modelRow: {
+    minHeight: 64,
+    padding: spacing.lg,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+  separator: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.border },
+  footnote: { ...typography.footnote, color: colors.muted },
+  disclosure: { minHeight: 44, flexDirection: "row", gap: spacing.sm, alignItems: "center" },
+});

@@ -1,7 +1,8 @@
-import { Platform, ScrollView, Text, View } from "react-native";
-import { LogOut, Monitor, ShieldCheck } from "lucide-react-native";
-import { Button, Header, Notice } from "../components/Controls";
-import { colors, layout } from "../theme";
+import { useState } from "react";
+import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ChevronRight, KeyRound, LogOut, Server, ShieldCheck } from "lucide-react-native";
+import { Button, Header, Notice, Sheet } from "../components/Controls";
+import { colors, layout, spacing, typography } from "../theme";
 
 export function SettingsScreen(props: {
   endpoint: string;
@@ -10,48 +11,116 @@ export function SettingsScreen(props: {
   error: string | null;
   busy: boolean;
 }) {
+  const [confirming, setConfirming] = useState(false);
   return (
     <View style={layout.fill}>
       <Header title="Settings" onBack={props.onBack} />
       <ScrollView contentContainerStyle={layout.content}>
-        <Text style={layout.label}>CONNECTION</Text>
-        <View style={{ gap: 10, padding: 16, borderRadius: 10, backgroundColor: colors.panel }}>
-          <View style={layout.row}>
-            <ShieldCheck color={colors.accent} size={18} />
-            <Text style={layout.text}>Your Xum server</Text>
+        <View style={styles.section}>
+          <Text style={layout.label}>Connection</Text>
+          <View style={layout.group}>
+            <View style={styles.row}>
+              <Server size={20} color={colors.accent} />
+              <View style={styles.rowText}>
+                <Text style={layout.text}>Xum server</Text>
+                <Text selectable style={styles.footnote}>
+                  {props.endpoint}
+                </Text>
+              </View>
+            </View>
+            <View style={styles.separator} />
+            <View style={styles.row}>
+              <ShieldCheck size={20} color={colors.muted} />
+              <View style={styles.rowText}>
+                <Text style={layout.text}>
+                  {Platform.OS === "web" ? "This tab only" : "Secure device storage"}
+                </Text>
+                <Text style={styles.footnote}>
+                  {Platform.OS === "web"
+                    ? "Your token is never saved in browser storage."
+                    : "Your token is kept in the device’s credential store."}
+                </Text>
+              </View>
+            </View>
           </View>
-          <Text selectable style={layout.muted}>
-            {props.endpoint}
-          </Text>
-          <Text style={layout.muted}>
-            {Platform.OS === "web"
-              ? "Authentication is held in memory for this tab only."
-              : "Authentication is kept in this device’s secure credential storage."}
-          </Text>
         </View>
-        <Text style={layout.label}>ON THIS DEVICE</Text>
-        <View style={{ gap: 12 }}>
-          <View style={layout.row}>
-            <Monitor color={colors.muted} size={18} />
-            <Text style={layout.text}>A companion to your workspace</Text>
+        <View style={styles.section}>
+          <Text style={layout.label}>Workspace</Text>
+          <View style={layout.group}>
+            <View style={styles.row}>
+              <Server size={20} color={colors.muted} />
+              <View style={styles.rowText}>
+                <Text style={layout.text}>Runs on your server</Text>
+                <Text style={styles.footnote}>
+                  Agents, files, and commands stay on your connected Xum server.
+                </Text>
+              </View>
+            </View>
+            <View style={styles.separator} />
+            <View style={styles.row}>
+              <KeyRound size={20} color={colors.muted} />
+              <View style={styles.rowText}>
+                <Text style={layout.text}>Managed on desktop</Text>
+                <Text style={styles.footnote}>
+                  Providers, runtimes, terminals, and project setup. Attachments are read-only here.
+                </Text>
+              </View>
+            </View>
           </View>
-          <Text style={layout.muted}>
-            Agents, files, and commands run on your connected Xum server, not on this device. You
-            can chat, interrupt an agent, create a worktree or scratch chat, and read tracked
-            changes here.
-          </Text>
-          <Text style={layout.muted}>
-            Use Xum desktop for provider credentials, runtime provisioning, terminals, desktop
-            control, file editing, and project administration. Image and file attachments are
-            currently displayed as filenames only.
-          </Text>
         </View>
-        {props.error && <Notice>{props.error}</Notice>}
-        <Button secondary icon={LogOut} busy={props.busy} onPress={props.onDisconnect}>
-          Disconnect & forget credentials
-        </Button>
-        <Text style={layout.muted}>Disconnecting does not stop agents running on the server.</Text>
+        {props.error && !confirming && <Notice>{props.error}</Notice>}
+        <View style={styles.section}>
+          <Pressable
+            accessibilityRole="button"
+            disabled={props.busy}
+            onPress={() => setConfirming(true)}
+            style={[layout.group, styles.row]}
+          >
+            <LogOut size={20} color={colors.danger} />
+            <Text style={[layout.text, { color: colors.danger, flex: 1 }]}>Disconnect</Text>
+            <ChevronRight size={18} color={colors.muted} />
+          </Pressable>
+          <Text style={styles.footnote}>Disconnecting leaves your agents running.</Text>
+        </View>
       </ScrollView>
+      {confirming && (
+        <Sheet
+          title="Disconnect from Xum?"
+          onClose={() => setConfirming(false)}
+          dismissDisabled={props.busy}
+          footer={
+            <>
+              <Button destructive icon={LogOut} busy={props.busy} onPress={props.onDisconnect}>
+                Disconnect & forget credentials
+              </Button>
+              <Button secondary disabled={props.busy} onPress={() => setConfirming(false)}>
+                Keep connection
+              </Button>
+            </>
+          }
+        >
+          <Text style={layout.text}>
+            This removes the saved connection from this device. You’ll need your server URL and
+            token to reconnect.
+          </Text>
+          <Text style={layout.muted}>Your workspaces and running agents are not affected.</Text>
+          {props.error && <Notice>{props.error}</Notice>}
+        </Sheet>
+      )}
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  section: { gap: spacing.sm },
+  row: {
+    minHeight: 56,
+    padding: spacing.lg,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+  },
+  rowText: { flex: 1, minWidth: 0, gap: spacing.xs },
+  footnote: { ...typography.footnote, color: colors.muted },
+  separator: { height: StyleSheet.hairlineWidth, marginLeft: 48, backgroundColor: colors.border },
+});
