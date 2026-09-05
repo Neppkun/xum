@@ -1,3 +1,8 @@
+import {
+  hasInterruptedStream,
+  isEligibleForAutoRetry,
+  isPreTokenInterruptedUserTurn,
+} from "@/common/utils/messages/retryEligibility";
 import { describe, expect, test } from "bun:test";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createMuxMessage } from "@/common/types/message";
@@ -64,6 +69,38 @@ describe("token-budget replay", () => {
     expect(displayed[2]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: true });
     expect(displayed[4]).toMatchObject({ boundaryKind: "reset", contextWindowRollover: undefined });
     expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
+  });
+
+  test("rejected replay tails are visible terminal barriers, not retry candidates", () => {
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages(
+      [
+        createMuxMessage("completed-user", "user", "Already handled", { historySequence: 1 }),
+        createMuxMessage("completed-answer", "assistant", "Completed response", {
+          historySequence: 2,
+        }),
+        createMuxMessage("rejected-user", "user", "Rejected request", {
+          historySequence: 3,
+          contextBudgetRejected: true,
+        }),
+      ].map((message) => MuxMessageSchema.parse(message)),
+      false
+    );
+    const displayed = aggregator.getDisplayedMessages();
+    const tail = displayed.at(-1);
+    expect(tail).toMatchObject({ type: "user", content: "Rejected request" });
+    expect(hasInterruptedStream(displayed)).toBe(false);
+    expect(isEligibleForAutoRetry(displayed)).toBe(false);
+    expect(isPreTokenInterruptedUserTurn(tail, { reason: "startup", at: 1 })).toBe(false);
+    aggregator.loadHistoricalMessages(
+      [
+        MuxMessageSchema.parse(
+          createMuxMessage("next", "user", "New request", { historySequence: 4 })
+        ),
+      ],
+      false
+    );
+    expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(true);
   });
 
   test.each([false, true])(

@@ -210,6 +210,79 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   }
 
+  test("a rejected tail never retries the older completed turn after restart", async () => {
+    const first = await setup();
+    await seedHistory(first, 20_000);
+    const previous = await allRows(first);
+    expect((await first.session.sendMessage("oversized ".repeat(60_000), options)).success).toBe(
+      false
+    );
+    const rejected = (await allRows(first)).at(-1)!;
+    expect(rejected.metadata?.contextBudgetRejected).toBe(true);
+    first.session.dispose();
+    const h = await setup({ previous: first });
+    h.session.ensureStartupAutoRetryCheck();
+    await (h.session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
+      .startupAutoRetryCheckPromise;
+    expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+    expect(await h.session.getStartupAutoRetryModelHint()).toBeNull();
+    expect((await h.session.resumeStream(options)).success).toBe(false);
+    expect(h.requests).toHaveLength(0);
+    expect((await allRows(h)).filter((row) => previous.some((old) => old.id === row.id))).toEqual(
+      previous
+    );
+    expect((await h.session.sendMessage("A genuinely new request", options)).success).toBe(true);
+    expect(h.requests).toHaveLength(1);
+  });
+
+  test("single-user token-budget sends use append-only storage even when automatic compaction is off", async () => {
+    const h = await setup();
+    h.session.setAutoCompactionThreshold(1);
+    await seedHistory(h, 20_000);
+    const before = await allRows(h);
+    const append = spyOn(h.historyService, "appendToHistory");
+    const batch = spyOn(h.historyService, "appendManyToHistory");
+    expect((await h.session.sendMessage("Ordinary next request", options)).success).toBe(true);
+    expect(batch).not.toHaveBeenCalled();
+    expect(append.mock.calls.some(([, row]) => text(row) === "Ordinary next request")).toBe(true);
+    expect((await allRows(h)).slice(0, before.length)).toEqual(before);
+    expect(h.requests).toHaveLength(1);
+  });
+
+  test("a failed single-user append preserves old history and does not dispatch", async () => {
+    const h = await setup();
+    const before = await allRows(h);
+    spyOn(h.historyService, "appendToHistory").mockResolvedValueOnce(Err("disk full"));
+    expect((await h.session.sendMessage("Not durably accepted", options)).success).toBe(false);
+    expect(await allRows(h)).toEqual(before);
+    expect(h.requests).toHaveLength(0);
+  });
+
+  test("cancellation after a single-user append rolls back only that request", async () => {
+    const h = await setup();
+    await seedHistory(h, 20_000);
+    const before = await allRows(h);
+    const controller = new AbortController();
+    const cancelState = { canceledBeforeAcceptance: false };
+    const append = h.historyService.appendToHistory.bind(h.historyService);
+    spyOn(h.historyService, "appendToHistory").mockImplementationOnce(async (id, row) => {
+      const result = await append(id, row);
+      controller.abort();
+      return result;
+    });
+    expect(
+      (
+        await h.session.sendMessage("Cancel after persistence", options, {
+          cancelSignal: controller.signal,
+          cancelState,
+        })
+      ).success
+    ).toBe(true);
+    expect(cancelState.canceledBeforeAcceptance).toBe(true);
+    expect(await allRows(h)).toEqual(before);
+    expect(h.requests).toHaveLength(0);
+  });
+
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();
     await seedHistory(h, 110_000);
@@ -1083,6 +1156,67 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(
         next.some((row) => row.metadata?.agentSkillSnapshot?.skillName === "rejected-skill")
       ).toBe(true);
+    }
+  );
+
+  test.each(["number", "object", "mixed-array"] as const)(
+    "emergency rollover tolerates malformed persisted prelude IDs (%s)",
+    async (shape) => {
+      const h = await setup({
+        failure: async (attempt) => {
+          if (attempt !== 1) return undefined;
+          const rows = await allRows(h);
+          const user = rows.at(-1)!;
+          const damagedIds: unknown =
+            shape === "number"
+              ? 42
+              : shape === "object"
+                ? { id: "valid-payload" }
+                : ["valid-payload", 42, {}, null];
+          // Simulate unchecked persisted JSON, not an invalid typed API request.
+          await fs.writeFile(
+            path.join(h.config.sessionsDir, workspaceId, "chat.jsonl"),
+            rows
+              .map((row) =>
+                JSON.stringify(
+                  row.id === user.id
+                    ? {
+                        ...row,
+                        metadata: { ...row.metadata, requestPreludeMessageIds: damagedIds },
+                      }
+                    : row
+                )
+              )
+              .join("\n") + "\n"
+          );
+          return exceeded;
+        },
+      });
+      await seedHistory(h, 20_000);
+      const source = await allRows(h);
+      const payload = createMuxMessage("valid-payload", "assistant", "Accepted peer content", {
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata: { type: "family-message" },
+      });
+      expect(
+        (
+          await h.session.sendMessage("Preserve the accepted request", options, {
+            synthetic: true,
+            agentInitiated: true,
+            preTurnMessages: [payload],
+          })
+        ).success
+      ).toBe(true);
+      expect(h.requests).toHaveLength(2);
+      const rows = await allRows(h);
+      expect(rows.filter((row) => source.some((old) => old.id === row.id))).toEqual(source);
+      expect(rows.find((row) => row.id === payload.id)?.parts).toEqual(payload.parts);
+      const active = sliceMessagesForProviderFromLatestContextBoundary(rows);
+      expect(text(active.at(-1)!)).toBe("Preserve the accepted request");
+      expect(active.some((row) => text(row) === "Accepted peer content")).toBe(
+        shape === "mixed-array"
+      );
     }
   );
 

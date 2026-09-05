@@ -130,7 +130,9 @@ export function isPreTokenInterruptedUserTurn(
   tail: DisplayedMessage | undefined,
   lastAbortReason: StreamAbortReasonSnapshot | null | undefined
 ): boolean {
-  return tail?.type === "user" && shouldSuppressAutoRetry(lastAbortReason);
+  return (
+    tail?.type === "user" && !tail.contextBudgetRejected && shouldSuppressAutoRetry(lastAbortReason)
+  );
 }
 
 function isDecorativeTranscriptMessage(message: DisplayedMessage): boolean {
@@ -157,6 +159,7 @@ export function getLastNonDecorativeMessage(
 function isDisplayOnlyCompletedSubagentReport(message: DisplayedMessage): boolean {
   return (
     message.type === "user" &&
+    !message.contextBudgetRejected &&
     message.isSynthetic === true &&
     message.isUiVisible === true &&
     isCompletedSubagentReportEnvelope(message.content)
@@ -211,6 +214,7 @@ function computeHasInterruptedStream(
 
   const lastMessage = getLastMainRetryCandidateMessage(messages);
   if (!lastMessage) return false;
+  if (lastMessage.type === "user" && lastMessage.contextBudgetRejected) return false;
 
   // Don't show retry barrier if workspace init is still running AND no error has occurred yet.
   // The backend waits for init to complete before starting the stream.
@@ -248,9 +252,12 @@ function computeHasInterruptedStream(
     return false;
   }
 
-  // Don't show retry barrier for runtime_not_ready - requires workspace recreation.
-  // StreamErrorMessage already shows a distinct "Runtime Unavailable" UI for this case.
-  if (lastMessage.type === "stream-error" && lastMessage.errorType === "runtime_not_ready") {
+  // These terminal failures require a new request or workspace, not replaying the same turn.
+  if (
+    lastMessage.type === "stream-error" &&
+    (lastMessage.errorType === "runtime_not_ready" ||
+      lastMessage.errorType === "context_budget_blocked")
+  ) {
     return false;
   }
 

@@ -1172,6 +1172,8 @@ export type DisplayedMessage =
       isSynthetic?: boolean;
       /** True only for synthetic messages intentionally rendered in the normal transcript. */
       isUiVisible?: boolean;
+      /** Durable terminal rejection: keep visible, but never retry this or an older turn. */
+      contextBudgetRejected?: true;
       timestamp?: number;
       /** True for synthetic user turns created by the active-goal continuation loop. */
       isGoalContinuation?: boolean;

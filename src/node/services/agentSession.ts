@@ -1,3 +1,4 @@
+import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
@@ -2040,6 +2041,16 @@ export class AgentSession {
     return parseSubagentReportEnvelope(text)?.status === "completed";
   }
 
+  /** A rejected user row terminates retry lookup; it must never expose an older completed turn. */
+  private findLastRetryUserMessage(messages: MuxMessage[]): MuxMessage | undefined {
+    return messages.findLast(
+      (message) =>
+        message.role === "user" &&
+        (Boolean(message.metadata?.contextBudgetRejected) ||
+          this.shouldUseUserMessageForRetry(message))
+    );
+  }
+
   private shouldUseUserMessageForRetry(message: MuxMessage): boolean {
     if (message.role !== "user" || message.metadata?.contextBudgetRejected) {
       return false;
@@ -2080,11 +2091,8 @@ export class AgentSession {
     partial: MuxMessage | null;
     historyTail: MuxMessage[];
   }): Promise<StartupRetrySendOptions | undefined> {
-    const lastUserMessage = [...params.historyTail]
-      .reverse()
-      .find((message): message is MuxMessage & { role: "user" } =>
-        this.shouldUseUserMessageForRetry(message)
-      );
+    const lastUserMessage = this.findLastRetryUserMessage(params.historyTail);
+    if (lastUserMessage?.metadata?.contextBudgetRejected) return undefined;
 
     const lastAssistantMessage =
       params.partial?.role === "assistant"
@@ -2316,10 +2324,6 @@ export class AgentSession {
   async getStartupAutoRetryModelHint(): Promise<string | null> {
     this.assertNotDisposed("getStartupAutoRetryModelHint");
 
-    if (this.lastAutoRetryResumeRequest?.options.model) {
-      return this.lastAutoRetryResumeRequest.options.model;
-    }
-
     const [partial, historyResult] = await Promise.all([
       this.historyService.readPartial(this.workspaceId),
       this.historyService.getLastMessages(this.workspaceId, 20),
@@ -2328,6 +2332,12 @@ export class AgentSession {
       return null;
     }
 
+    if (this.findLastRetryUserMessage(historyResult.data)?.metadata?.contextBudgetRejected) {
+      return null;
+    }
+    if (this.lastAutoRetryResumeRequest?.options.model) {
+      return this.lastAutoRetryResumeRequest.options.model;
+    }
     if (partial && this.isPendingAskUserQuestion(partial)) {
       return null;
     }
@@ -2398,6 +2408,8 @@ export class AgentSession {
 
     this.resetStartupAutoRetryHistoryReadBackoff();
 
+    const startupRetryUserMessage = this.findLastRetryUserMessage(historyResult.data);
+    if (startupRetryUserMessage?.metadata?.contextBudgetRejected) return "completed";
     if (partial && this.isPendingAskUserQuestion(partial)) {
       return "completed";
     }
@@ -2420,12 +2432,6 @@ export class AgentSession {
     if (!interruptedByPartial && !interruptedByHistory) {
       return "completed";
     }
-
-    const startupRetryUserMessage = [...historyResult.data]
-      .reverse()
-      .find((message): message is MuxMessage & { role: "user" } =>
-        this.shouldUseUserMessageForRetry(message)
-      );
 
     if (this.startupAutoRetryAbandon) {
       const abandonReason = this.startupAutoRetryAbandon.reason;
@@ -4126,7 +4132,11 @@ export class AgentSession {
         if (isAdmissionStale() || this.turnAdmissionBlocks > 0 || this.shuttingDown) {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
         }
-        const appended = await this.historyService.appendManyToHistory(this.workspaceId, batch);
+        // Ordinary sends stay append-only; only coupled snapshots/boundaries need an atomic batch.
+        const appended =
+          batch.length === 1
+            ? await this.historyService.appendToHistory(this.workspaceId, userMessage)
+            : await this.historyService.appendManyToHistory(this.workspaceId, batch);
         if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
       } catch (error) {
         return Err(createUnknownSendMessageError(getErrorMessage(error)));
@@ -4849,7 +4859,9 @@ export class AgentSession {
       };
       // Snapshot/payload rows are part of the accepted request, not just its
       // fixed trigger. Preserve their roles and rebind server-owned ID references.
-      const preludeIds = new Set(user.metadata?.requestPreludeMessageIds ?? []);
+      const preludeIds = new Set(
+        getRequestPreludeMessageIds(user.metadata?.requestPreludeMessageIds)
+      );
       const requestPrelude = [...preludeIds].flatMap((id) => {
         const row = history.data.findLast((message) => message.id === id);
         // Tolerant history parsing can drop a damaged snapshot or payload while
@@ -6147,6 +6159,15 @@ export class AgentSession {
       );
     }
 
+    const lastUserMessage = this.findLastRetryUserMessage(historyResult.data);
+    if (lastUserMessage?.metadata?.contextBudgetRejected) {
+      this.activeStreamUserMessageId = lastUserMessage.id;
+      return await this.handleStreamWithHistoryFailure({
+        type: "context_budget_blocked",
+        message: "Cannot retry a rejected request. Edit it or send a new message instead.",
+      });
+    }
+
     if (this.isTokenBudgetActive(options)) {
       this.contextBudgetWarningClaimed ||= historyResult.data.some(
         (row) => row.metadata?.muxMetadata?.type === "context-budget-warning"
@@ -6193,9 +6214,6 @@ export class AgentSession {
     // invisible synthetic row (file-update notification, [CONTINUE] sentinel,
     // snapshot) would persist non-retryable failures against a row recovery
     // never selects and break the tail match after restart.
-    const lastUserMessage = [...requestMessages]
-      .reverse()
-      .find((m) => this.shouldUseUserMessageForRetry(m));
     this.activeStreamUserMessageId = lastUserMessage?.id;
 
     this.activeCompactionRequest = this.resolveCompactionRequest(

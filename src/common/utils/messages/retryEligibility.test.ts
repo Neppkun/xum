@@ -115,6 +115,36 @@ describe("context budget retry suppression", () => {
   });
 });
 
+describe("terminal budget rejection barriers", () => {
+  it("does not skip a rejected user tail to revive older interrupted work", () => {
+    const messages = [
+      assistantMessage({ isPartial: true }),
+      userMessage({ contextBudgetRejected: true }),
+    ];
+    expect(hasInterruptedStream(messages)).toBe(false);
+    expect(isEligibleForAutoRetry(messages)).toBe(false);
+    expect(isPreTokenInterruptedUserTurn(messages.at(-1), { reason: "user", at: 1 })).toBe(false);
+    expect(
+      hasInterruptedStream([
+        ...messages,
+        userMessage({ id: "next", historyId: "next", historySequence: 3 }),
+      ])
+    ).toBe(true);
+  });
+
+  it("does not advertise a live retry action for a terminal context-budget error", () => {
+    expect(
+      hasInterruptedStream([
+        userMessage(),
+        streamErrorMessage({ errorType: "context_budget_blocked" }),
+      ])
+    ).toBe(false);
+    expect(
+      hasInterruptedStream([userMessage(), streamErrorMessage({ errorType: "network" })])
+    ).toBe(true);
+  });
+});
+
 describe("hasInterruptedStream", () => {
   it("returns false for empty messages", () => {
     expect(hasInterruptedStream([])).toBe(false);
