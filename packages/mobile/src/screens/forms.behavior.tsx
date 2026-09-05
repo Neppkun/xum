@@ -3,11 +3,14 @@ import { afterEach, expect, test } from "bun:test";
 import { createRef } from "react";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { createORPCClient } from "@orpc/client";
+import { View } from "react-native";
 import type { TextInput } from "react-native";
+import type { MuxMessage, MuxToolPart } from "../../../../src/common/types/message";
 import type { MobileClient } from "../api";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
 import { Button, Field, Sheet } from "../components/Controls";
 import { Message } from "../components/Message";
+import { Markdown } from "../components/Markdown";
 import { CreateWorkspace } from "./CreateWorkspace";
 import { ModelSettings } from "./ModelSettings";
 import { SettingsScreen } from "./SettingsScreen";
@@ -196,4 +199,200 @@ test("disconnect requires confirmation and can be cancelled without clearing cre
   fireEvent.click(view.getByRole("button", { name: "Disconnect" }));
   fireEvent.click(view.getByRole("button", { name: "Disconnect & forget credentials" }));
   expect(disconnects).toBe(1);
+});
+
+test("Markdown separates headings and hanging list items while preserving literal hostile text", () => {
+  const hostile = '<img src=x onerror="alert(1)">';
+  const view = render(
+    <Markdown
+      text={`## Steps\nIntro **before** the list.\n1. Keep ${hostile}\n   and this continuation\n2. Preserve \`a_b\`\n\n- A bullet\n- Another bullet\n\nAfter the list.`}
+    />
+  );
+  expect(view.getByRole("heading").textContent).toBe("Steps");
+  expect(view.getAllByRole("list")).toHaveLength(2);
+  const items = view.getAllByRole("listitem");
+  expect(items).toHaveLength(4);
+  expect(items[0].textContent).toContain(`1.Keep ${hostile}\nand this continuation`);
+  expect(items[1].textContent).toBe("2.Preserve a_b");
+  expect(view.container.querySelector("img")).toBeNull();
+  expect(view.getByText("After the list.")).toBeDefined();
+});
+
+test("Markdown keeps partial code fences and code whitespace literal throughout streaming", () => {
+  const code = "- not a list\n  <script>literal()</script>  \n";
+  const view = render(<Markdown text={`\`\`\`tsx\n${code}`} />);
+  const codeElement = view.getByText(
+    (_, element) => element?.children.length === 0 && element.textContent === code
+  );
+  expect(codeElement.textContent).toBe(code);
+  expect(view.queryByRole("list")).toBeNull();
+  expect(view.container.querySelector("script")).toBeNull();
+  view.rerender(<Markdown text={`\`\`\`tsx\n${code}\`\`\`\n\nNext paragraph`} />);
+  expect(
+    view.getByText((_, element) => element?.children.length === 0 && element.textContent === code)
+  ).toBeDefined();
+  expect(view.getByText("Next paragraph")).toBeDefined();
+  view.rerender(<Markdown text={"Unfinished ` and ** delimiters stay literal.\n``"} />);
+  expect(view.container.textContent).toContain("Unfinished ` and ** delimiters stay literal.\n``");
+});
+
+function toolMessage(part: MuxToolPart, metadata?: MuxMessage["metadata"]): MuxMessage {
+  return { id: "tool-message", role: "assistant", parts: [part], metadata };
+}
+
+test("a tool in a narrow transcript opens a sheet with literal output and closes without changing the message", () => {
+  const output = "<img src=x>\nactual command output";
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "bash-call",
+    toolName: "bash",
+    input: { script: "git status --short" },
+    state: "output-available",
+    output,
+  };
+  const view = render(
+    <View style={{ width: 375 }}>
+      <Message message={toolMessage(part)} canAnswer={false} onAnswer={async () => {}} />
+    </View>
+  );
+  expect(view.getByRole("group", { name: "Assistant message" })).toBeDefined();
+  expect(
+    view.queryByText(
+      (_, element) => element?.children.length === 0 && element.textContent === output
+    )
+  ).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "bash: Done. git status --short" }));
+  expect(
+    view.getByText((_, element) => element?.children.length === 0 && element.textContent === output)
+  ).toBeDefined();
+  expect(document.querySelector("img")).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Close" }));
+  expect(
+    view.queryByText(
+      (_, element) => element?.children.length === 0 && element.textContent === output
+    )
+  ).toBeNull();
+  expect(view.getByRole("button", { name: "bash: Done. git status --short" })).toBeDefined();
+});
+
+test("tool headers distinguish execution, completion, failure, redaction, and interrupted replay", () => {
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "read-call",
+    toolName: "file_read",
+    input: { path: "src/app.ts", script: { not: "a string" } },
+    state: "input-available",
+  };
+  const renderMessage = (tool: MuxToolPart, streaming = false, partial = false) => (
+    <Message
+      message={toolMessage(tool, { partial })}
+      streaming={streaming}
+      canAnswer={false}
+      onAnswer={async () => {}}
+    />
+  );
+  const view = render(renderMessage(part, true));
+  expect(view.getByRole("button", { name: "file_read: Pending. src/app.ts" })).toBeDefined();
+  view.rerender(renderMessage({ ...part, executionStartedAt: 0 }, true));
+  expect(view.getByRole("button", { name: "file_read: Running. src/app.ts" })).toBeDefined();
+  view.rerender(renderMessage(part));
+  expect(view.getByRole("button", { name: "file_read: No result. src/app.ts" })).toBeDefined();
+  view.rerender(renderMessage(part, false, true));
+  expect(view.getByRole("button", { name: "file_read: Interrupted. src/app.ts" })).toBeDefined();
+  view.rerender(
+    renderMessage({
+      ...part,
+      state: "output-available",
+      output: { success: false, error: "denied" },
+    })
+  );
+  expect(view.getByRole("button", { name: "file_read: Failed. src/app.ts" })).toBeDefined();
+  view.rerender(renderMessage({ ...part, state: "output-redacted" }));
+  fireEvent.click(view.getByRole("button", { name: "file_read: Redacted. src/app.ts" }));
+  expect(view.queryByText("denied")).toBeNull();
+});
+
+test("tool inspection caps large values but does not claim an exact-limit result is truncated", () => {
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "large",
+    toolName: "bash",
+    input: {},
+    state: "output-available",
+    output: "x".repeat(24000),
+  };
+  const view = render(
+    <Message message={toolMessage(part)} canAnswer={false} onAnswer={async () => {}} />
+  );
+  fireEvent.click(view.getByRole("button", { name: "bash: Done" }));
+  expect(view.getByText("x".repeat(24000)).textContent).toHaveLength(24000);
+  expect(view.queryByText(/Showing the first/)).toBeNull();
+  view.rerender(
+    <Message
+      message={toolMessage({ ...part, output: "x".repeat(24000) + "hidden suffix" })}
+      canAnswer={false}
+      onAnswer={async () => {}}
+    />
+  );
+  expect(view.queryByText(/hidden suffix/)).toBeNull();
+  expect(view.getByText(/Showing the first/)).toBeDefined();
+});
+
+test("question answers remain inline and require complete input before submission", async () => {
+  const answers: Array<Record<string, string>> = [];
+  const part: MuxToolPart = {
+    type: "dynamic-tool",
+    toolCallId: "question",
+    toolName: "ask_user_question",
+    state: "input-available",
+    input: { questions: [{ question: "Which branch?" }, { question: "What should change?" }] },
+  };
+  const view = render(
+    <Message
+      message={toolMessage(part)}
+      streaming
+      canAnswer
+      onAnswer={async (_id, value) => {
+        answers.push(value);
+      }}
+    />
+  );
+  fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  expect(answers).toHaveLength(0);
+  fireEvent.change(view.getByLabelText("Which branch?"), { target: { value: "main" } });
+  fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  expect(answers).toHaveLength(0);
+  fireEvent.change(view.getByLabelText("What should change?"), {
+    target: { value: "Keep the API stable" },
+  });
+  await act(async () => {
+    fireEvent.click(view.getByRole("button", { name: "Send answers" }));
+  });
+  expect(answers).toEqual([
+    { "Which branch?": "main", "What should change?": "Keep the API stable" },
+  ]);
+});
+
+test("reasoning stays an inline disclosure and historical errors are not replaced by an empty-response hint", () => {
+  const message: MuxMessage = {
+    id: "reasoning",
+    role: "assistant",
+    parts: [{ type: "reasoning", text: "Consider <unsafe> as literal text." }],
+  };
+  const props = { canAnswer: false, onAnswer: async () => {} };
+  const view = render(<Message {...props} message={message} />);
+  expect(view.queryByText("Consider <unsafe> as literal text.")).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Reasoning" }));
+  expect(view.getByText("Consider <unsafe> as literal text.")).toBeDefined();
+  expect(view.queryByRole("button", { name: "Close" })).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Reasoning" }));
+  expect(view.queryByText("Consider <unsafe> as literal text.")).toBeNull();
+  view.rerender(
+    <Message
+      {...props}
+      message={{ ...message, parts: [], metadata: { error: "Provider rejected the request" } }}
+    />
+  );
+  expect(view.getByRole("alert").textContent).toContain("Provider rejected the request");
+  expect(view.queryByText("No response received")).toBeNull();
 });

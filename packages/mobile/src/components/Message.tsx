@@ -1,11 +1,10 @@
 import { useState } from "react";
-import type { ReactNode } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Brain, ChevronDown, ChevronRight, File, Pause, Wrench } from "lucide-react-native";
 import type { MuxMessage, MuxToolPart } from "../../../../src/common/types/message";
-import { Button, Field, Notice } from "./Controls";
+import { Button, Field, Notice, Sheet } from "./Controls";
 import { Markdown } from "./Markdown";
-import { colors, layout, mono } from "../theme";
+import { colors, layout, mono, radii, spacing, typography } from "../theme";
 
 export function Message(props: {
   message: MuxMessage;
@@ -14,26 +13,27 @@ export function Message(props: {
   onAnswer: (toolCallId: string, answers: Record<string, string>) => Promise<void>;
 }) {
   const user = props.message.role === "user";
+  const label = user
+    ? "Your message"
+    : props.message.role === "assistant"
+      ? "Assistant message"
+      : "System message";
   return (
-    <View style={[styles.message, user && styles.user]}>
-      {!user && (
-        <Text style={styles.role}>{props.message.role === "assistant" ? "Xum" : "System"}</Text>
-      )}
+    <View role="group" accessibilityLabel={label} style={[styles.message, user && styles.user]}>
+      {props.message.role === "system" && <Text style={styles.secondary}>System</Text>}
       {props.message.parts.map((part, index) => {
         switch (part.type) {
           case "text":
             return <Markdown key={index} text={part.text} />;
           case "reasoning":
-            return (
-              <Disclosure key={index} label="Reasoning" reasoning>
-                <Markdown text={part.text || "Thinking…"} />
-              </Disclosure>
-            );
+            return <Reasoning key={index} text={part.text} streaming={Boolean(props.streaming)} />;
           case "dynamic-tool":
             return (
               <Tool
                 key={part.toolCallId}
                 part={part}
+                streaming={Boolean(props.streaming)}
+                interrupted={Boolean(props.message.metadata?.partial)}
                 canAnswer={props.canAnswer}
                 onAnswer={props.onAnswer}
               />
@@ -42,95 +42,169 @@ export function Message(props: {
             return (
               <View key={index} style={layout.row}>
                 <File size={16} color={colors.muted} />
-                <Text style={layout.muted}>{part.filename ?? part.mediaType} · attachment</Text>
+                <Text style={styles.secondary}>{part.filename ?? part.mediaType} · attachment</Text>
               </View>
             );
         }
       })}
       {props.message.role === "assistant" &&
         !props.streaming &&
-        !props.message.metadata?.error &&
-        (props.message.metadata?.partial || props.message.parts.length === 0) && (
-          <View style={styles.interrupted}>
-            {props.message.metadata?.partial && <Pause size={13} color={colors.muted} />}
-            {/* Empty replay rows may lack an interruption marker; don't invent a stop reason. */}
-            <Text style={layout.muted}>
-              {props.message.metadata?.partial ? "Interrupted" : "No response received"}
-            </Text>
-          </View>
-        )}
+        (props.message.metadata?.error ? (
+          <Notice>{props.message.metadata.error}</Notice>
+        ) : (
+          (props.message.metadata?.partial || props.message.parts.length === 0) && (
+            <View style={styles.interrupted}>
+              {props.message.metadata?.partial && <Pause size={13} color={colors.muted} />}
+              {/* Empty replay rows may lack an interruption marker; don't invent a stop reason. */}
+              <Text style={styles.secondary}>
+                {props.message.metadata?.partial ? "Interrupted" : "No response received"}
+              </Text>
+            </View>
+          )
+        ))}
     </View>
   );
 }
 
-function Disclosure(props: { label: string; reasoning?: boolean; children: ReactNode }) {
+function Reasoning(props: { text: string; streaming: boolean }) {
   const [expanded, setExpanded] = useState(false);
-  const Icon = props.reasoning ? Brain : Wrench;
   return (
-    <View style={styles.disclosure}>
+    <View>
       <Pressable
         accessibilityRole="button"
+        accessibilityLabel="Reasoning"
         accessibilityState={{ expanded }}
         onPress={() => setExpanded(!expanded)}
-        style={styles.disclosureHeader}
+        style={styles.actionRow}
       >
-        <Icon size={16} color={props.reasoning ? colors.plan : colors.muted} />
-        <Text numberOfLines={1} style={[layout.muted, { flex: 1 }]}>
-          {props.label}
-        </Text>
+        <Brain size={16} color={colors.muted} />
+        <Text style={[styles.secondary, { flex: 1 }]}>Reasoning</Text>
         {expanded ? (
           <ChevronDown size={16} color={colors.muted} />
         ) : (
           <ChevronRight size={16} color={colors.muted} />
         )}
       </Pressable>
-      {expanded && <View style={{ padding: 12, gap: 12 }}>{props.children}</View>}
+      {expanded && (
+        <View style={styles.reasoningBody}>
+          {props.text ? (
+            <Markdown text={props.text} />
+          ) : (
+            <Text style={styles.secondary}>
+              {props.streaming ? "Thinking…" : "No reasoning text available."}
+            </Text>
+          )}
+        </View>
+      )}
     </View>
   );
 }
 
+function record(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function toolHint(input: unknown): string | undefined {
+  if (!record(input)) return;
+  for (const key of ["path", "file_path", "filePath", "command", "script"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim())
+      return value.replace(/\s+/g, " ").trim().slice(0, 160);
+  }
+}
+
+function toolStatus(part: MuxToolPart, streaming: boolean, interrupted: boolean): string {
+  if (part.state === "output-redacted") return part.failed ? "Failed" : "Redacted";
+  if (part.state === "output-available") {
+    return record(part.output) && (part.output.success === false || part.output.error)
+      ? "Failed"
+      : "Done";
+  }
+  if (!streaming) return interrupted ? "Interrupted" : "No result";
+  if (part.toolName === "ask_user_question") return "Needs input";
+  return part.executionStartedAt != null ? "Running" : "Pending";
+}
+
 const MAX_TOOL_CHARACTERS = 24_000;
 
-function printable(value: unknown): string {
+function ToolValue(props: { label: string; value: unknown }) {
+  const text =
+    typeof props.value === "string"
+      ? props.value
+      : (JSON.stringify(props.value, null, 2) ?? "No output");
   return (
-    typeof value === "string" ? value : (JSON.stringify(value, null, 2) ?? "No output")
-  ).slice(0, MAX_TOOL_CHARACTERS);
+    <View style={{ gap: spacing.sm }}>
+      <Text style={layout.label}>{props.label}</Text>
+      <ScrollView
+        horizontal
+        style={styles.outputSurface}
+        contentContainerStyle={{ padding: spacing.lg }}
+      >
+        <Text selectable style={styles.output}>
+          {text.slice(0, MAX_TOOL_CHARACTERS)}
+        </Text>
+      </ScrollView>
+      {text.length > MAX_TOOL_CHARACTERS && (
+        <Text style={styles.secondary}>
+          Showing the first {MAX_TOOL_CHARACTERS.toLocaleString()} characters.
+        </Text>
+      )}
+    </View>
+  );
 }
 
 function Tool(props: {
   part: MuxToolPart;
+  streaming: boolean;
+  interrupted: boolean;
   canAnswer: boolean;
   onAnswer: (toolCallId: string, answers: Record<string, string>) => Promise<void>;
 }) {
+  const [inspecting, setInspecting] = useState(false);
   const questions =
     props.part.toolName === "ask_user_question" && props.part.state === "input-available"
       ? questionTexts(props.part.input)
       : [];
+  const hint = toolHint(props.part.input);
+  const status = toolStatus(props.part, props.streaming, props.interrupted);
   return (
-    <View style={{ gap: 8 }}>
-      <Disclosure
-        label={`${props.part.toolName.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase())} · ${props.part.state === "input-available" ? "running" : props.part.state === "output-redacted" ? "redacted" : "done"}`}
+    <View style={{ gap: spacing.sm }}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${props.part.toolName}: ${status}${hint ? `. ${hint}` : ""}`}
+        accessibilityState={{ expanded: inspecting }}
+        onPress={() => setInspecting(true)}
+        style={styles.actionRow}
       >
-        <Text style={layout.label}>Input</Text>
-        <Text selectable style={styles.output}>
-          {printable(props.part.input)}
-        </Text>
-        {props.part.state === "output-available" && (
-          <>
-            <Text style={layout.label}>Output</Text>
-            <Text selectable style={styles.output}>
-              {printable(props.part.output)}
-            </Text>
-          </>
-        )}
-        {(printable(props.part.input).length === MAX_TOOL_CHARACTERS ||
-          (props.part.state === "output-available" &&
-            printable(props.part.output).length === MAX_TOOL_CHARACTERS)) && (
-          <Text style={layout.muted}>
-            Showing the first {MAX_TOOL_CHARACTERS.toLocaleString()} characters.
+        <Wrench size={16} color={colors.muted} />
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text numberOfLines={1} style={styles.toolName}>
+            {props.part.toolName}
+            {hint && <Text style={styles.toolHint}> {hint}</Text>}
           </Text>
-        )}
-      </Disclosure>
+        </View>
+        <Text style={[styles.secondary, status === "Failed" && { color: colors.danger }]}>
+          {status}
+        </Text>
+        <ChevronRight size={16} color={colors.muted} />
+      </Pressable>
+      {inspecting && (
+        <Sheet title={props.part.toolName} onClose={() => setInspecting(false)}>
+          <Text style={[styles.secondary, status === "Failed" && { color: colors.danger }]}>
+            {status}
+          </Text>
+          <ToolValue label="Input" value={props.part.input} />
+          {props.part.state === "output-available" ? (
+            <ToolValue label="Output" value={props.part.output} />
+          ) : props.part.state === "output-redacted" ? (
+            <Notice severity="info">The tool output is redacted.</Notice>
+          ) : (
+            <Text style={styles.secondary}>
+              {props.streaming ? "Waiting for tool output…" : "No tool output was recorded."}
+            </Text>
+          )}
+        </Sheet>
+      )}
       {questions.length > 0 && (
         <QuestionForm
           questions={questions}
@@ -213,33 +287,34 @@ function QuestionForm(props: {
 }
 
 const styles = StyleSheet.create({
-  message: { gap: 12, paddingVertical: 16, alignSelf: "stretch" },
-  role: { color: colors.accent, fontSize: 13, fontWeight: "600", lineHeight: 18 },
+  message: { gap: spacing.md, paddingVertical: spacing.lg, alignSelf: "stretch" },
+  secondary: { ...typography.footnote, color: colors.muted },
   user: {
-    backgroundColor: colors.panel,
-    borderRadius: 18,
-    borderBottomRightRadius: 6,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    marginVertical: 10,
+    backgroundColor: colors.user,
+    borderRadius: radii.card,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.lg,
+    marginVertical: spacing.sm,
     alignSelf: "flex-end",
     maxWidth: "94%",
   },
-  interrupted: { flexDirection: "row", alignItems: "center", gap: 6 },
-  disclosure: {
+  interrupted: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  actionRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, minHeight: 44 },
+  reasoningBody: {
+    marginLeft: spacing.sm,
+    paddingLeft: spacing.lg,
+    paddingVertical: spacing.sm,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderLeftColor: colors.border,
+  },
+  toolName: { ...typography.footnote, color: colors.muted },
+  toolHint: { color: colors.text },
+  outputSurface: { backgroundColor: colors.panel, borderRadius: radii.control },
+  output: { ...typography.footnote, color: colors.text, fontFamily: mono, lineHeight: 21 },
+  question: {
+    gap: spacing.lg,
+    borderRadius: radii.card,
     backgroundColor: colors.panel,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    borderRadius: 14,
-    overflow: "hidden",
+    padding: spacing.lg,
   },
-  disclosureHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    minHeight: 48,
-    paddingHorizontal: 14,
-  },
-  output: { color: colors.text, fontFamily: mono, fontSize: 13, lineHeight: 20 },
-  question: { gap: 16, borderRadius: 18, backgroundColor: colors.panel, padding: 16 },
 });
