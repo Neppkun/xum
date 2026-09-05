@@ -71,6 +71,15 @@ import {
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
+interface HistoryTruncateHashes {
+  finalArchiveHash: string | null;
+  finalChatHash: string | null;
+}
+
+interface HistoryTruncateTransaction extends HistoryTruncateHashes {
+  rawHashes?: HistoryTruncateHashes & { version: 1 };
+}
+
 interface HistoryRewriteRow {
   raw: Buffer;
   message: MuxMessage | undefined;
@@ -615,10 +624,7 @@ export class HistoryService {
     return createHash("sha256").update(contents).digest("hex");
   }
 
-  private parseTruncateTransaction(contents: string): {
-    finalArchiveHash: string | null;
-    finalChatHash: string | null;
-  } | null {
+  private parseTruncateTransaction(contents: string): HistoryTruncateTransaction | null {
     try {
       const parsed: unknown = JSON.parse(contents);
       if (parsed === null || typeof parsed !== "object") {
@@ -627,22 +633,48 @@ export class HistoryService {
       const marker = parsed as Record<string, unknown>;
       const finalArchiveHash = marker.finalArchiveHash;
       const finalChatHash = marker.finalChatHash;
-      if (
-        (finalArchiveHash !== null && typeof finalArchiveHash !== "string") ||
-        (finalChatHash !== null && typeof finalChatHash !== "string")
-      ) {
-        return null;
+      const isHash = (value: unknown): value is string | null =>
+        value === null || (typeof value === "string" && /^[a-f0-9]{64}$/.test(value));
+      if (!isHash(finalArchiveHash) || !isHash(finalChatHash)) return null;
+      const result: HistoryTruncateTransaction = { finalArchiveHash, finalChatHash };
+      if ("rawHashes" in marker) {
+        const raw = marker.rawHashes;
+        // An invalid extension is not a legacy marker: never downgrade its
+        // verification to decoded hashes, which can hide changed invalid bytes.
+        if (
+          !raw ||
+          typeof raw !== "object" ||
+          !("version" in raw) ||
+          raw.version !== 1 ||
+          !("finalArchiveHash" in raw) ||
+          !isHash(raw.finalArchiveHash) ||
+          !("finalChatHash" in raw) ||
+          !isHash(raw.finalChatHash)
+        )
+          return null;
+        result.rawHashes = {
+          version: 1,
+          finalArchiveHash: raw.finalArchiveHash,
+          finalChatHash: raw.finalChatHash,
+        };
       }
-      return { finalArchiveHash, finalChatHash };
+      return result;
     } catch {
       return null;
     }
   }
 
-  private historyContentsMatch(contents: Buffer | null, hash: string | null): boolean {
-    return hash === null
-      ? contents === null
-      : contents !== null && this.historyContentsHash(contents) === hash;
+  private historyContentsMatch(
+    contents: Buffer | null,
+    hash: string | null,
+    rawHash?: string | null
+  ): boolean {
+    if (hash === null) return contents === null && (rawHash === undefined || rawHash === null);
+    return (
+      contents !== null &&
+      this.historyContentsHash(contents.toString("utf8")) === hash &&
+      (rawHash === undefined || this.historyContentsHash(contents) === rawHash)
+    );
   }
 
   private async recoverTruncateTransactionUnlocked(workspaceId: string): Promise<boolean> {
@@ -681,8 +713,16 @@ export class HistoryService {
       const archiveContents = await this.readExistingFileBytes(archivePath);
       const chatContents = await this.readExistingFileBytes(this.getChatHistoryPath(workspaceId));
       return (
-        this.historyContentsMatch(archiveContents, marker.finalArchiveHash) &&
-        this.historyContentsMatch(chatContents, marker.finalChatHash)
+        this.historyContentsMatch(
+          archiveContents,
+          marker.finalArchiveHash,
+          marker.rawHashes?.finalArchiveHash
+        ) &&
+        this.historyContentsMatch(
+          chatContents,
+          marker.finalChatHash,
+          marker.rawHashes?.finalChatHash
+        )
       );
     }
 
@@ -690,8 +730,16 @@ export class HistoryService {
       const archiveContents = await this.readExistingFileBytes(archivePath);
       const chatContents = await this.readExistingFileBytes(this.getChatHistoryPath(workspaceId));
       const committed =
-        this.historyContentsMatch(archiveContents, marker.finalArchiveHash) &&
-        this.historyContentsMatch(chatContents, marker.finalChatHash);
+        this.historyContentsMatch(
+          archiveContents,
+          marker.finalArchiveHash,
+          marker.rawHashes?.finalArchiveHash
+        ) &&
+        this.historyContentsMatch(
+          chatContents,
+          marker.finalChatHash,
+          marker.rawHashes?.finalChatHash
+        );
       if (committed) {
         await fs.rm(archiveTombstonePath);
         await fs.rm(markerPath, { force: true });
@@ -811,10 +859,23 @@ export class HistoryService {
     await writeFileAtomic(
       markerPath,
       JSON.stringify({
+        // Older builds hash decoded UTF-8. Keep these fields compatible so a
+        // downgrade cannot roll back a committed byte-preserving truncation.
         finalArchiveHash:
-          finalArchiveContents === null ? null : this.historyContentsHash(finalArchiveContents),
+          finalArchiveContents === null
+            ? null
+            : this.historyContentsHash(finalArchiveContents.toString("utf8")),
         finalChatHash:
-          finalChatContents === null ? null : this.historyContentsHash(finalChatContents),
+          finalChatContents === null
+            ? null
+            : this.historyContentsHash(finalChatContents.toString("utf8")),
+        rawHashes: {
+          version: 1,
+          finalArchiveHash:
+            finalArchiveContents === null ? null : this.historyContentsHash(finalArchiveContents),
+          finalChatHash:
+            finalChatContents === null ? null : this.historyContentsHash(finalChatContents),
+        },
       })
     );
     try {
@@ -2394,7 +2455,7 @@ export class HistoryService {
     const rows = splitHistoryLines(raw).map((line) => ({
       raw: line,
       message: this.parseMessages(line.toString("utf8"), filePath, (value) =>
-        normalizeLegacyMuxMetadata(value as MuxMessage)
+        isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
       )[0],
     }));
     return { rows, messages: rows.flatMap((row) => (row.message ? [row.message] : [])) };
@@ -2428,9 +2489,11 @@ export class HistoryService {
       }
       return [Buffer.from(serialized)];
     });
+    // Future appends must start a new row even when a preserved corrupt tail
+    // lacked its final newline. Add only a delimiter; retain every original byte.
+    const last = contents.at(-1);
+    if (last && last.at(-1) !== 10) contents.push(Buffer.from("\n"));
     if (appended.length > 0) {
-      const last = contents.at(-1);
-      if (last && last.at(-1) !== 10) contents.push(Buffer.from("\n"));
       contents.push(Buffer.from(this.serializeHistoryEntries(appended, workspaceId)));
     }
     return Buffer.concat(contents);

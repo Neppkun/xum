@@ -276,6 +276,71 @@ describe("session_history real disk recovery", () => {
     );
   });
 
+  test("percentage truncation keeps invalid parsed rows raw without admitting them to typed history", async () => {
+    const invalid = Buffer.from('{"id":"bad","role":"user"}\n');
+    await fs.writeFile(chatPath, Buffer.concat([invalid, await fs.readFile(chatPath)]));
+    await append("last", "retained facts");
+    const result = await fixture.historyService.truncateHistory(workspaceId, 0.2);
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error(result.error);
+    expect(result.data.length).toBeGreaterThan(0);
+    expect((await fs.readFile(chatPath)).includes(invalid)).toBe(true);
+    expect(
+      (await pages({ action: "search", query: "retained facts" })).flatMap(
+        (page) => page.items ?? []
+      ).length
+    ).toBe(1);
+  });
+
+  test.each(["active", "archive"])(
+    "partial truncation delimits an unterminated %s floor before future appends",
+    async (artifact) => {
+      const reset = Buffer.from('{"metadata":{"contextBoundaryKind":"reset"},torn');
+      if (artifact === "active") {
+        const target = await append("cut-target", "discarded");
+        await fs.appendFile(chatPath, reset);
+        expect(
+          (await fixture.historyService.truncateAfterMessage(workspaceId, target.id)).success
+        ).toBe(true);
+      } else {
+        await fs.writeFile(archivePath, Buffer.concat([await fs.readFile(chatPath), reset]));
+        const rows = [
+          createMuxMessage("large-first", "user", "public context ".repeat(2000)),
+          createMuxMessage("large-last", "user", "public context ".repeat(2000)),
+        ];
+        await fs.writeFile(chatPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+        expect((await fixture.historyService.truncateHistory(workspaceId, 0.5)).success).toBe(true);
+      }
+      const rewritten = await fs.readFile(artifact === "active" ? chatPath : archivePath);
+      expect(rewritten.includes(reset)).toBe(true);
+      const accepted = createMuxMessage("accepted-after-rewrite", "user", "accepted facts");
+      expect((await fixture.historyService.appendToHistory(workspaceId, accepted)).success).toBe(
+        true
+      );
+      if (artifact === "archive") {
+        await append("next-boundary", "new summary", {
+          compacted: true,
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        });
+        const archived = await fs.readFile(archivePath, "utf8");
+        expect(archived.split("\n").some((line) => line.startsWith('{"id":"large-last"'))).toBe(
+          true
+        );
+      }
+      expect(
+        (await pages({ action: "search", query: "accepted facts" })).flatMap(
+          (page) => page.items ?? []
+        ).length
+      ).toBe(1);
+      expect(
+        (await pages({ action: "read_item", item_id: String(accepted.metadata!.historySequence) }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["accepted facts"]);
+    }
+  );
+
   test("partial percentage truncation keeps an archive containing only unreadable reset fragments", async () => {
     await append("manual-reset", "", { contextBoundaryKind: "reset" });
     const reset = Buffer.from(' {\n"contextBoundaryKind"\n:\n"reset"\n}\n');
@@ -314,8 +379,13 @@ describe("session_history real disk recovery", () => {
     await fs.writeFile(
       `${archivePath}.truncate.json`,
       JSON.stringify({
-        finalArchiveHash: createHash("sha256").update(reset).digest("hex"),
-        finalChatHash: createHash("sha256").update(active).digest("hex"),
+        finalArchiveHash: createHash("sha256").update(reset.toString("utf8")).digest("hex"),
+        finalChatHash: createHash("sha256").update(active.toString("utf8")).digest("hex"),
+        rawHashes: {
+          version: 1,
+          finalArchiveHash: createHash("sha256").update(reset).digest("hex"),
+          finalChatHash: createHash("sha256").update(active).digest("hex"),
+        },
       })
     );
     expect((await fixture.historyService.getLastMessages(workspaceId, 1)).success).toBe(true);
