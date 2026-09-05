@@ -5,6 +5,7 @@ import {
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "@/node/services/workspaceRemoval";
 import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
+import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -149,6 +150,212 @@ describe("session_history real disk recovery", () => {
       "stale_cursor"
     );
   });
+
+  for (const targetArtifact of ["active", "archive"] as const) {
+    for (const resetPosition of ["before", "after"] as const) {
+      test.each([false, true])(
+        `${targetArtifact} edit/fork (keep target: %s) preserves a fragmented reset ${resetPosition} the cut`,
+        async (keepTargetMessage) => {
+          const privateBoundary = await append("private-summary", "private summary", {
+            compacted: true,
+            compactionBoundary: true,
+            compactionEpoch: 1,
+          });
+          await append("manual-reset", "", { contextBoundaryKind: "reset" });
+          const target = await append("cut-target", "target facts");
+          const tail = await append("cut-tail", "tail facts");
+          // Standalone JSON strings parse, but are still unreadable reset fragments.
+          const reset = Buffer.concat([
+            Buffer.from(' {\n"contextBoundaryKind"\n:\n"reset"\n'),
+            Buffer.from([0xff]),
+            Buffer.from("\r\n}\n"),
+          ]);
+          const targetLine = Buffer.from(JSON.stringify(target) + "\n");
+          const tailLine = Buffer.from(JSON.stringify(tail) + "\n");
+          await fs.writeFile(
+            chatPath,
+            Buffer.concat(
+              resetPosition === "before"
+                ? [reset, targetLine, tailLine]
+                : [targetLine, reset, tailLine]
+            )
+          );
+          if (targetArtifact === "archive") {
+            await append("later-boundary", "public summary", {
+              compacted: true,
+              compactionBoundary: true,
+              compactionEpoch: 2,
+            });
+          }
+          const result = await fixture.historyService.truncateAfterMessage(workspaceId, target.id, {
+            keepTargetMessage,
+          });
+          expect(result.success).toBe(true);
+          if (!result.success) throw new Error(result.error);
+          expect(result.data.removedMessages.some((row) => row.id === target.id)).toBe(
+            !keepTargetMessage
+          );
+          expect(result.data.removedMessages.some((row) => row.id === tail.id)).toBe(true);
+          const retained = Buffer.concat([
+            targetArtifact === "archive" ? Buffer.alloc(0) : await fs.readFile(archivePath),
+            await fs.readFile(chatPath),
+          ]);
+          expect(retained.includes(reset)).toBe(true);
+          expect(retained.includes(Buffer.from("opening facts"))).toBe(true);
+          expect(
+            (await pages({ action: "search", query: "opening facts" })).flatMap(
+              (page) => page.items ?? []
+            )
+          ).toEqual([]);
+          expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+            "item_not_found"
+          );
+          expect(
+            (await pages({ action: "list_windows" }))
+              .flatMap((page) => page.windows ?? [])
+              .some(
+                (window) =>
+                  window.windowId === `w:${String(privateBoundary.metadata!.historySequence)}`
+              )
+          ).toBe(false);
+        }
+      );
+    }
+  }
+
+  test.each([false, true])(
+    "archived edit/fork (keep target: %s) retains an unreadable floor from the discarded active epoch",
+    async (keepTargetMessage) => {
+      const target = await append("archived-cut", "target facts");
+      await append("later-boundary", "public summary", {
+        compacted: true,
+        compactionBoundary: true,
+        compactionEpoch: 1,
+      });
+      const reset = Buffer.from('{"metadata":{"contextBoundaryKind":"reset"},broken\n');
+      await fs.writeFile(chatPath, reset);
+      await append("discarded-active", "public facts");
+      const result = await fixture.historyService.truncateAfterMessage(workspaceId, target.id, {
+        keepTargetMessage,
+      });
+      expect(result.success).toBe(true);
+      const retained = await fs.readFile(chatPath);
+      expect(retained.includes(reset)).toBe(true);
+      expect(retained.includes(Buffer.from("opening facts"))).toBe(true);
+      expect(retained.includes(Buffer.from("discarded-active"))).toBe(false);
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+    }
+  );
+
+  test("partial percentage truncation keeps an archive containing only unreadable reset fragments", async () => {
+    await append("manual-reset", "", { contextBoundaryKind: "reset" });
+    const reset = Buffer.from(' {\n"contextBoundaryKind"\n:\n"reset"\n}\n');
+    await fs.writeFile(chatPath, reset);
+    await append("later-boundary", "public summary", {
+      compacted: true,
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    await append("large-first", "public context ".repeat(2000));
+    await append("large-last", "public context ".repeat(2000));
+    const result = await fixture.historyService.truncateHistory(workspaceId, 0.5);
+    expect(result.success).toBe(true);
+    expect(await fs.readFile(archivePath)).toEqual(reset);
+    expect(
+      (await pages({ action: "search", query: "public" })).flatMap((page) => page.items ?? [])
+        .length
+    ).toBeGreaterThan(0);
+  });
+
+  test("truncation recovery hashes preserved invalid UTF-8 as bytes before retiring its tombstone", async () => {
+    const reset = Buffer.concat([
+      Buffer.from('{"metadata":{"contextBoundaryKind":"reset"},'),
+      Buffer.from([0xff]),
+      Buffer.from("\n"),
+    ]);
+    const active = Buffer.from(
+      JSON.stringify(createMuxMessage("public", "assistant", "public facts")) + "\n"
+    );
+    await fs.writeFile(archivePath, reset);
+    await fs.writeFile(chatPath, active);
+    await fs.writeFile(
+      `${archivePath}.truncate`,
+      JSON.stringify(createMuxMessage("private", "assistant", "private facts")) + "\n"
+    );
+    await fs.writeFile(
+      `${archivePath}.truncate.json`,
+      JSON.stringify({
+        finalArchiveHash: createHash("sha256").update(reset).digest("hex"),
+        finalChatHash: createHash("sha256").update(active).digest("hex"),
+      })
+    );
+    expect((await fixture.historyService.getLastMessages(workspaceId, 1)).success).toBe(true);
+    expect(await fs.readFile(archivePath)).toEqual(reset);
+    expect(
+      (await pages({ action: "search", query: "private facts" })).flatMap(
+        (page) => page.items ?? []
+      )
+    ).toEqual([]);
+    expect(
+      await fs.stat(`${archivePath}.truncate`).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  test.each(["active", "archive"])(
+    "partial percentage truncation preserves malformed reset bytes in %s history",
+    async (resetArtifact) => {
+      for (let index = 0; index < 12; index++)
+        await append(`private-${index}`, "old context ".repeat(40));
+      const secret = await append("private-secret", "private facts");
+      await append("manual-reset", "", { contextBoundaryKind: "reset" });
+      const reset = Buffer.concat([
+        Buffer.from(' {"metadata":{"contextBoundaryKind"\n:\n"reset"},'),
+        Buffer.from([0xff]),
+        Buffer.from("\r\n"),
+      ]);
+      await fs.writeFile(chatPath, reset);
+      for (let index = 0; index < 8; index++)
+        await append(`public-${index}`, "public facts ".repeat(40));
+      if (resetArtifact === "archive") {
+        await append("later-boundary", "public summary", {
+          compacted: true,
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        });
+      }
+      const result = await fixture.historyService.truncateHistory(workspaceId, 0.05);
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error(result.error);
+      expect(result.data.length).toBeGreaterThan(0);
+      const retained = Buffer.concat([await fs.readFile(archivePath), await fs.readFile(chatPath)]);
+      expect(retained.includes(reset)).toBe(true);
+      expect(retained.includes(Buffer.from("private facts"))).toBe(true);
+      expect(
+        (await pages({ action: "search", query: "private facts" })).flatMap(
+          (page) => page.items ?? []
+        )
+      ).toEqual([]);
+      expect(
+        (
+          await pages({ action: "read_item", item_id: String(secret.metadata!.historySequence) })
+        ).at(-1)?.error
+      ).toBe("item_not_found");
+      expect(
+        (await pages({ action: "search", query: "public facts" })).flatMap(
+          (page) => page.items ?? []
+        ).length
+      ).toBeGreaterThan(0);
+      expect((await fixture.historyService.clearHistory(workspaceId)).success).toBe(true);
+      expect(
+        (await pages({ action: "search", query: "facts" })).flatMap((page) => page.items ?? [])
+      ).toEqual([]);
+    }
+  );
 
   test.each([
     "stream update",
