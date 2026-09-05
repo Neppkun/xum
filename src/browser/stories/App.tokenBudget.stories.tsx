@@ -174,6 +174,58 @@ export const Phone375: AppStory = {
   },
 };
 
+export const RejectedTail: AppStory = {
+  ...Rollover,
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-token-budget-rejected",
+          messages: [
+            {
+              ...createMuxMessage("completed-request", "user", "Run the regression tests.", {
+                historySequence: 1,
+                timestamp: STABLE_TIMESTAMP - 20_000,
+              }),
+              type: "message",
+            },
+            createAssistantMessage("completed-response", "The regression tests passed.", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 10_000,
+              model: MODEL,
+            }),
+            {
+              ...createMuxMessage("rejected-tail", "user", "An oversized request was rejected.", {
+                historySequence: 3,
+                timestamp: STABLE_TIMESTAMP,
+                contextBudgetRejected: true,
+              }),
+              type: "message",
+            },
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await waitFor(async () => {
+      await expect(canvas.getByText("An oversized request was rejected.")).toBeVisible();
+      await expect(canvas.getByText("The regression tests passed.")).toBeVisible();
+    });
+    await expect(canvas.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+    await expect(canvas.getByRole("textbox")).toBeEnabled();
+    await waitForScrollStabilization(canvasElement);
+  },
+};
+
+export const RejectedTailPhone375: AppStory = {
+  ...Phone375,
+  render: RejectedTail.render,
+  play: RejectedTail.play,
+};
+
 export const ContextSettings: AppStory = {
   ...Rollover,
   play: async ({ canvasElement }) => {
