@@ -3,17 +3,21 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 import { Bot, Check, ChevronRight, ClipboardList, Code2 } from "lucide-react-native";
 import type { LucideIcon } from "lucide-react-native";
 import type { FrontendWorkspaceMetadata } from "../../../../src/common/types/workspace";
-import { formatModelDisplayName } from "../../../../src/common/utils/ai/modelDisplay";
 import { Field, Sheet } from "../components/Controls";
-import { modelChoices, resolveSettings, thinkingLevels } from "../settings";
+import {
+  modelChoices,
+  modelName,
+  modelMatchesSearch,
+  resolveSettings,
+  thinkingLevels,
+} from "../settings";
 import type { ChatSettings, SettingsData } from "../settings";
 import type { ThinkingLevel } from "../../../../src/common/types/thinking";
 import { colors, layout, radii, spacing, typography } from "../theme";
 
-type Page = "model" | "catalog" | "effort" | "agent" | "custom";
+type Page = "model" | "effort" | "agent" | "custom";
 const titles: Record<Page, string> = {
   model: "Select model",
-  catalog: "More models",
   effort: "Effort",
   agent: "Select mode",
   custom: "Custom model",
@@ -27,15 +31,6 @@ const effortLabels: Record<ThinkingLevel, string> = {
   max: "Maximum",
 };
 
-export function modelName(id: string) {
-  return formatModelDisplayName(
-    id
-      .slice(id.indexOf(":") + 1)
-      .split("/")
-      .at(-1) ?? id
-  );
-}
-
 export function ModelSettings(props: {
   initialPage: "model" | "agent";
   value: ChatSettings;
@@ -48,14 +43,9 @@ export function ModelSettings(props: {
   const [query, setQuery] = useState("");
   const [customModel, setCustomModel] = useState(props.value.model);
   const models = modelChoices(props.data, props.value.model);
-  const currentProvider = props.value.model.split(":")[0];
-  // Start with the current choice and its provider, not invented recommendations or capability claims.
-  const featured = [
-    ...models.filter((model) => model.split(":")[0] === currentProvider),
-    ...models.filter((model) => model.split(":")[0] !== currentProvider),
-  ].slice(0, 4);
+  // Search the entire Settings-visible catalog in the main sheet, not a provider shortlist.
   const filtered = models.filter((model) =>
-    `${model} ${modelName(model)}`.toLowerCase().includes(query.trim().toLowerCase())
+    modelMatchesSearch(model, query, providerName(model.split(":")[0]))
   );
   const groups = new Map<string, string[]>();
   for (const model of filtered) {
@@ -88,13 +78,7 @@ export function ModelSettings(props: {
       variant="picker"
       title={titles[page]}
       onClose={props.onClose}
-      onBack={
-        page === "catalog" || page === "effort"
-          ? () => setPage("model")
-          : page === "custom"
-            ? () => setPage("catalog")
-            : undefined
-      }
+      onBack={page === "effort" || page === "custom" ? () => setPage("model") : undefined}
       action={
         page === "custom" && (
           <Pressable
@@ -116,7 +100,14 @@ export function ModelSettings(props: {
     >
       {page === "model" && (
         <>
-          <View style={styles.group}>{featured.map(modelRow)}</View>
+          <Field
+            label="Search models"
+            placeholder="Model or provider"
+            value={query}
+            onChangeText={setQuery}
+            returnKeyType="search"
+            clearButtonMode="while-editing"
+          />
           <View style={styles.group}>
             <PickerRow
               label="Effort"
@@ -127,21 +118,6 @@ export function ModelSettings(props: {
               disclosure
             />
           </View>
-          <View style={styles.group}>
-            <PickerRow label="More models" onPress={() => setPage("catalog")} disclosure />
-          </View>
-        </>
-      )}
-      {page === "catalog" && (
-        <>
-          <Field
-            label="Search models"
-            placeholder="Model or provider"
-            value={query}
-            onChangeText={setQuery}
-            returnKeyType="search"
-            clearButtonMode="while-editing"
-          />
           {[...groups].map(([provider, choices]) => (
             <View key={provider} style={styles.section}>
               <Text style={styles.sectionLabel}>{providerName(provider)}</Text>

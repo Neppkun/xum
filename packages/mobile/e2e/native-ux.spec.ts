@@ -52,11 +52,13 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
 
     const chooseModel = page.getByRole("button", { name: "Choose model", exact: true });
     await chooseModel.click();
-    const more = page.getByRole("button", { name: "More models", exact: true });
-    await withinViewport(page, more);
-    await more.click();
-    await page.getByRole("textbox", { name: "Search models" }).fill("no-match-model-query");
-    await page.getByRole("button", { name: "Back", exact: true }).click();
+    const search = page.getByRole("textbox", { name: "Search models" });
+    await withinViewport(page, search);
+    await expect(page.getByRole("radio").first()).toBeVisible();
+    await search.fill("no-match-model-query");
+    await expect(page.getByRole("radio")).toHaveCount(0);
+    await search.fill("");
+    await expect(page.getByRole("radio").first()).toBeVisible();
     await page.getByRole("button", { name: /^Effort/ }).click();
     await page.getByRole("radio", { name: "High", exact: true }).click();
     await expect(page.getByRole("button", { name: /^Effort/ })).toContainText("High");

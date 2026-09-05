@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { KNOWN_MODELS } from "../../../src/common/constants/knownModels";
-import { modelChoices, resolveSettings, type SettingsData } from "./settings";
+import { modelChoices, modelMatchesSearch, resolveSettings, type SettingsData } from "./settings";
 
 function data(): SettingsData {
   return {
@@ -30,6 +30,74 @@ describe("mobile model settings", () => {
     expect(options).toContain(hidden);
     expect(options.filter((id) => id === hidden)).toHaveLength(1);
     expect(options).toContain("anthropic:custom-model");
+  });
+  test("shows configured providers and gateway-only models without exposing disabled providers", () => {
+    const config = data();
+    config.providers.openai.isEnabled = true;
+    config.providers.google.isConfigured = true;
+    expect(modelChoices(config, "")).toContain(KNOWN_MODELS.GPT.id);
+    expect(modelChoices(config, "")).toContain(KNOWN_MODELS.GEMINI_FLASH.id);
+    config.providers.openai.isEnabled = false;
+    config.providers.google.isConfigured = false;
+    config.providers.coder = {
+      isEnabled: true,
+      isConfigured: true,
+      apiKeySet: false,
+      models: ["openai/gpt-5.6-sol"],
+      discoveredModels: ["openai/gpt-5.6-sol"],
+    };
+    config.config = { ...config.config, routePriority: ["coder", "direct"] };
+    expect(modelChoices(config, "")).toContain("openai:gpt-5.6-sol");
+    expect(modelChoices(config, "")).not.toContain(KNOWN_MODELS.GEMINI_FLASH.id);
+  });
+  test("does not resurrect removed discovery entries and honors hidden gateway models", () => {
+    const config = data();
+    config.providers.coder = {
+      isEnabled: true,
+      isConfigured: true,
+      apiKeySet: false,
+      models: ["openai/gpt-5.6-sol"],
+      discoveredModels: ["openai/gpt-5.6-sol", "vendor/removed"],
+      removedModels: ["vendor/removed"],
+    };
+    config.config = {
+      ...config.config,
+      routePriority: ["coder"],
+      hiddenModels: ["openai:gpt-5.6-sol"],
+    };
+    const choices = modelChoices(config, "");
+    expect(choices).toContain("coder:openai/gpt-5.6-sol");
+    expect(choices).not.toContain("coder:vendor/removed");
+    expect(choices).not.toContain("openai:gpt-5.6-sol");
+  });
+  test("uses the OpenAI authentication gates from the web picker", () => {
+    const config = data();
+    config.providers.openai = {
+      isEnabled: true,
+      isConfigured: true,
+      apiKeySet: false,
+      codexOauthSet: true,
+      models: ["gpt-5.6-sol", "gpt-4o", "gpt-5.3-codex-spark"],
+    };
+    expect(modelChoices(config, "")).toContain("openai:gpt-5.6-sol");
+    expect(modelChoices(config, "")).not.toContain("openai:gpt-4o");
+    config.providers.openai.apiKeySet = true;
+    config.providers.openai.codexOauthSet = false;
+    expect(modelChoices(config, "")).toContain("openai:gpt-4o");
+    expect(modelChoices(config, "")).not.toContain("openai:gpt-5.3-codex-spark");
+  });
+  test("search matches friendly names, provider names, and canonical aliases across routes", () => {
+    expect(modelMatchesSearch("anthropic:claude-sonnet-5", "Sonnet 5", "Anthropic")).toBe(true);
+    expect(modelMatchesSearch("custom:opaque-id", " TEAM ", "Team models")).toBe(true);
+    expect(modelMatchesSearch(KNOWN_MODELS.GEMINI_FLASH.id, "gemini-flash", "Google")).toBe(true);
+    expect(
+      modelMatchesSearch(
+        `mux-gateway:${KNOWN_MODELS.GEMINI_FLASH.id.replace(":", "/")}`,
+        "gemini-flash",
+        "Mux Gateway"
+      )
+    ).toBe(true);
+    expect(modelMatchesSearch("anthropic:claude-sonnet-5", "not-a-model", "Anthropic")).toBe(false);
   });
   test("resolves agent-scoped workspace settings ahead of global preferences", () => {
     const config = data();

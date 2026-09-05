@@ -148,13 +148,20 @@ test("workspace creation cannot be dismissed or submitted twice while the server
 
 const pickerValue: ChatSettings = { agentId: "exec", model: "local:one", thinkingLevel: "high" };
 const pickerData: SettingsData = {
-  config: { agentAiDefaults: {}, defaultModel: "local:one" },
+  config: { agentAiDefaults: {}, defaultModel: "local:one", hiddenModels: ["other:hidden"] },
   providers: {
     local: {
       isConfigured: true,
       isEnabled: true,
       apiKeySet: true,
       models: ["one", "two", "three", "four", "five"],
+    },
+    other: {
+      isConfigured: true,
+      isEnabled: true,
+      apiKeySet: true,
+      displayName: "Team models",
+      models: ["visible", "hidden"],
     },
   },
   agents: [
@@ -203,7 +210,9 @@ test("model picks apply directly while keeping mode and effort", () => {
     />
   );
   expect(view.getByRole("radio", { name: "local:one" }).getAttribute("aria-checked")).toBe("true");
-  expect(view.queryByRole("radio", { name: "local:five" })).toBeNull();
+  expect(view.getByRole("radio", { name: "local:five" })).toBeDefined();
+  expect(view.getByRole("radio", { name: "other:visible" })).toBeDefined();
+  expect(view.queryByRole("radio", { name: "other:hidden" })).toBeNull();
   fireEvent.click(view.getByRole("radio", { name: "local:two" }));
   expect(changes).toEqual([{ ...pickerValue, model: "local:two" }]);
   expect(closed).toBe(1);
@@ -246,18 +255,20 @@ test("mode selection preserves an explicit model and effort rather than resettin
   expect(closed).toBe(1);
 });
 
-test("closing catalog search does not change the selection and all models remain searchable", () => {
+test("searching the main picker spans providers without changing selection", () => {
   const changes: ChatSettings[] = [];
   const view = render(
     <PickerHarness onChange={(value) => changes.push(value)} onClose={() => {}} />
   );
-  fireEvent.click(view.getByRole("button", { name: "More models" }));
   fireEvent.change(view.getByLabelText("Search models"), { target: { value: "FIVE" } });
   expect(view.getByRole("radio", { name: "local:five" })).toBeDefined();
   expect(view.queryByRole("radio", { name: "local:one" })).toBeNull();
-  fireEvent.click(view.getByRole("button", { name: "Back" }));
+  fireEvent.change(view.getByLabelText("Search models"), { target: { value: "TEAM" } });
+  expect(view.getByRole("radio", { name: "other:visible" })).toBeDefined();
+  expect(view.queryByRole("radio", { name: "other:hidden" })).toBeNull();
   expect(changes).toHaveLength(0);
-  expect(view.getByRole("radio", { name: "local:one" }).getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(view.getByRole("radio", { name: "other:visible" }));
+  expect(changes).toEqual([{ ...pickerValue, model: "other:visible" }]);
 });
 
 test("custom model drafts require valid input and explicit confirmation", () => {
@@ -271,7 +282,6 @@ test("custom model drafts require valid input and explicit confirmation", () => 
       }}
     />
   );
-  fireEvent.click(view.getByRole("button", { name: "More models" }));
   fireEvent.click(view.getByRole("button", { name: "Custom model" }));
   fireEvent.change(view.getByLabelText("Model ID"), { target: { value: "missing-provider" } });
   fireEvent.click(view.getByRole("button", { name: "Use custom model" }));

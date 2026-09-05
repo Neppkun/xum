@@ -25,9 +25,9 @@ import { Button, IconButton, Loading, Notice } from "../components/Controls";
 import { Message } from "../components/Message";
 import { useConversation } from "../useConversation";
 import { linkedAbortController } from "../useConnection";
-import { resolveSettings } from "../settings";
+import { modelName, resolveSettings } from "../settings";
 import type { ChatSettings } from "../settings";
-import { ModelSettings, modelName } from "./ModelSettings";
+import { ModelSettings } from "./ModelSettings";
 import { colors, fontFamily, layout, radii, spacing, typography } from "../theme";
 import { DEFAULT_THINKING_LEVEL } from "../../../../src/common/types/thinking";
 
