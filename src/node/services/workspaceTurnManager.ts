@@ -26,6 +26,10 @@ import {
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
+import {
+  AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
+  agentReportProgressDedupePrefix,
+} from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
 import {
   readAgentDefinition,
@@ -2391,6 +2395,26 @@ export class WorkspaceTurnManager {
         ) {
           this.activeWorkspaceTurnHandleByWorkspaceId.delete(params.record.workspaceId);
         }
+        // Incremental agent_report updates from this execution were queued behind the owner's
+        // busy turn (reportAgentProgress routes them to the continuation owner). This terminal
+        // outcome supersedes them; left queued, each would later dispatch as a stale "in
+        // progress" turn. Drop them before waiters resolve so an owner whose task_await just
+        // returned cannot be cut at its next step boundary by an update it already outran.
+        // skipCancelCallbacks: when the owner itself runs as a delegated turn, each queued report
+        // carries continuation callbacks that would settle that live turn as interrupted.
+        const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+          params.record.ownerWorkspaceId,
+          agentReportProgressDedupePrefix(params.record.workspaceId, params.record.handleId),
+          { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
+        );
+        if (!queuedProgressRemoval.success) {
+          log.warn("Failed to remove queued incremental sub-agent reports at settlement", {
+            ownerWorkspaceId: params.record.ownerWorkspaceId,
+            childWorkspaceId: params.record.workspaceId,
+            handleId: params.record.handleId,
+            error: queuedProgressRemoval.error,
+          });
+        }
         const foregroundWaiterWorkspaceIds = this.settleWorkspaceTurnWaiters(
           params.record.handleId,
           params.waiterSettlement
@@ -4501,9 +4525,6 @@ export class WorkspaceTurnManager {
     ) {
       return true;
     }
-    if (this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)) {
-      return true;
-    }
     const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
     if (activeStream == null || activeStream.messageId === event.messageId) {
       return false;
@@ -4659,16 +4680,17 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    // A queued continuation can stop the in-flight stream at a tool boundary with
-    // finishReason "tool-calls" and continue the same delegated turn. Report
-    // wake-ups carry the exact correlation explicitly; bash-monitor wakes inherit
-    // it from history. Defer settlement until the continuation's terminal
-    // stream-end instead of reporting a false completion failure to the owner.
-    // Any other queued input (manual message, /compact) supersedes the turn and
-    // must settle the old outcome here.
+    // Parent guidance and report wake-ups continue the exact delegated turn. This includes
+    // turn-end guidance: don't publish an early report before the queued guidance runs.
+    // Uncorrelated bash-monitor wakes inherit only an open tool-boundary continuation;
+    // manual messages and /compact still supersede the old outcome.
     if (
-      event.metadata.finishReason === "tool-calls" &&
-      this.hasSameTurnContinuation(event, metadata)
+      (event.metadata.finishReason === "tool-calls" ||
+        event.metadata.finishReason === "stop" ||
+        event.metadata.finishReason == null) &&
+      (this.hasSameTurnContinuation(event, metadata) ||
+        (event.metadata.finishReason === "tool-calls" &&
+          this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)))
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;
