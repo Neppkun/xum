@@ -151,8 +151,8 @@ describe("Codex OAuth account routing", () => {
     const config = {
       codexOauth: auth,
       codexOauthAccounts: {
-        work: { label: "Work", auth },
-        invalid: { label: "Invalid", auth: { ...auth, refresh: "" } },
+        work: { label: "Work", credentials: auth },
+        invalid: { label: "Invalid", credentials: { ...auth, refresh: "" } },
       },
       codexOauthDefaultAccountId: "work",
     };

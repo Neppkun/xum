@@ -334,8 +334,8 @@ describe("ProviderService.getConfig", () => {
           codexOauth: auth,
           codexOauthLabel: "Personal",
           codexOauthAccounts: {
-            work: { label: "Work", auth },
-            broken: { label: "Broken", auth: {} },
+            work: { label: "Work", credentials: auth },
+            broken: { label: "Broken", credentials: {} },
           },
           codexOauthDefaultAccountId: "work",
         },
@@ -380,7 +380,7 @@ describe("ProviderService.getConfig", () => {
           const accountConfig =
             accountId === "default"
               ? { codexOauth: auth }
-              : { codexOauthAccounts: { work: { label: "Work", auth } } };
+              : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } };
           store.saveProvidersConfig({
             openai: { ...accountConfig, codexOauthDefaultAccountId: accountId },
           });
@@ -430,7 +430,7 @@ describe("ProviderService.getConfig", () => {
         new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
           openai: {
             codexOauth: { ...auth, invalidReason: "invalid_grant" },
-            codexOauthAccounts: { work: { label: "Work", auth } },
+            codexOauthAccounts: { work: { label: "Work", credentials: auth } },
           },
         });
         const view = service.getConfig();
@@ -453,7 +453,7 @@ describe("ProviderService.getConfig", () => {
           codexOauthAccounts: {
             work: {
               label: "Work",
-              auth: { type: "oauth", access: "access", refresh: "refresh", expires: 12345 },
+              credentials: { type: "oauth", access: "access", refresh: "refresh", expires: 12345 },
             },
           },
           codexOauthDefaultAccountId: "work",

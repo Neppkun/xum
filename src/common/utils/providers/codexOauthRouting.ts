@@ -80,7 +80,7 @@ export function hasCodexOauthTokens(config: unknown, accountId?: string): boolea
     return false;
   }
   const oauth = asRecord(
-    selectedId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID ? record.codexOauth : selectedAccount?.auth
+    selectedId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID ? record.codexOauth : selectedAccount?.credentials
   );
   return (
     oauth?.type === "oauth" &&
@@ -144,7 +144,7 @@ export function resolveCodexOauthRouting(
   const hasInvalidStoredAccount =
     asRecord(record?.codexOauth)?.invalidReason === "invalid_grant" ||
     Object.values(asRecord(accounts) ?? {}).some(
-      (account) => asRecord(asRecord(account)?.auth)?.invalidReason === "invalid_grant"
+      (account) => asRecord(asRecord(account)?.credentials)?.invalidReason === "invalid_grant"
     );
   const hasAccountSlots = Array.isArray(accounts)
     ? accounts.length > 0

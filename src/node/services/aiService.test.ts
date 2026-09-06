@@ -1160,8 +1160,8 @@ describe("AIService.captureModelRoutingSnapshot", () => {
       openai: {
         apiKey: "stored-api-key",
         codexOauthAccounts: {
-          work: { label: "Work", auth: auth.work },
-          personal: { label: "Personal", auth: auth.personal },
+          work: { label: "Work", credentials: auth.work },
+          personal: { label: "Personal", credentials: auth.personal },
         },
         fetch,
       },
@@ -1254,7 +1254,7 @@ describe("AIService.captureModelRoutingSnapshot", () => {
     });
     providersConfigStore.saveProvidersConfig({
       openai: {
-        codexOauthAccounts: { work: { label: "Work", auth: TEST_CODEX_OAUTH } },
+        codexOauthAccounts: { work: { label: "Work", credentials: TEST_CODEX_OAUTH } },
       },
     });
     const requests: RecordedFetchRequest[] = [];
@@ -1313,7 +1313,7 @@ describe("AIService.createModelWithPinnedMetadata", () => {
         codexOauthAccounts: {
           work: {
             label: "Work",
-            auth: {
+            credentials: {
               type: "oauth",
               access: "access",
               refresh: "refresh",
@@ -1497,7 +1497,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         codexOauthAccounts: {
           work: {
             label: "Work",
-            auth: {
+            credentials: {
               type: "oauth",
               access: "access",
               refresh: "refresh",
@@ -3145,8 +3145,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           apiKey: "openai-key",
           codexOauthDefaultAccountId: "work",
           codexOauthAccounts: {
-            work: { label: "Work", auth: auth.work },
-            personal: { label: "Personal", auth: auth.personal },
+            work: { label: "Work", credentials: auth.work },
+            personal: { label: "Personal", credentials: auth.personal },
           },
           fetch: createRecordingOpenAIFetch(requests, "gpt-5.5"),
         },
@@ -3426,8 +3426,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           wireFormat: "responses" as const,
           codexOauthDefaultAccountId: "work",
           codexOauthAccounts: {
-            work: { label: "Work", auth: auth.work },
-            personal: { label: "Personal", auth: auth.personal },
+            work: { label: "Work", credentials: auth.work },
+            personal: { label: "Personal", credentials: auth.personal },
           },
           fetch: createRecordingOpenAIFetch(requests, "gpt-5.5"),
         },

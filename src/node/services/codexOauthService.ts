@@ -148,6 +148,12 @@ export class CodexOauthError extends Schema.TaggedError<CodexOauthError>()("Code
   reason: Schema.String,
 }) {}
 
+function createNamedAccount(accountId: string, label: unknown, credentials: CodexOauthAuth) {
+  const trimmedLabel = typeof label === "string" ? label.trim() : "";
+  // Write only known fields. Disk entries can contain unsafe token copies outside credentials.
+  return { label: trimmedLabel || accountId, credentials };
+}
+
 function isValidLabel(label: string): boolean {
   return label.trim().length > 0 && label.trim().length <= CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH;
 }
@@ -239,11 +245,12 @@ export class CodexOauthService {
           this.readStoredAuth(accountId) ? { value: label.trim() } : null
         );
       }
-      return this.updateConfigValueEffect(this.accountPath(accountId), (current) =>
-        isPlainObject(current) && parseCodexOauthAuth(current.auth)
-          ? { value: { ...current, label: label.trim() } }
-          : null
-      );
+      return this.updateConfigValueEffect(this.accountPath(accountId), (current) => {
+        const credentials = isPlainObject(current)
+          ? parseCodexOauthAuth(current.credentials)
+          : null;
+        return credentials ? { value: createNamedAccount(accountId, label, credentials) } : null;
+      });
     });
   }
 
@@ -873,7 +880,11 @@ export class CodexOauthService {
           const entry = accounts[accountId];
           next.codexOauthAccounts = {
             ...accounts,
-            [accountId]: { ...(isPlainObject(entry) ? entry : {}), auth: selected },
+            [accountId]: createNamedAccount(
+              accountId,
+              isPlainObject(entry) ? entry.label : undefined,
+              selected
+            ),
           };
         }
         return { value: next };
@@ -938,7 +949,7 @@ export class CodexOauthService {
       this.updateConfigValueEffect(this.accountPath(selection.accountId), (current) => {
         const legacy = selection.accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
         const stored = parseCodexOauthAuth(
-          legacy ? current : isPlainObject(current) ? current.auth : undefined
+          legacy ? current : isPlainObject(current) ? current.credentials : undefined
         );
         // Compare under the file lock. Old refreshes must not restore deleted or reconnected slots.
         if (
@@ -947,7 +958,13 @@ export class CodexOauthService {
         )
           return null;
         if (legacy) return { value: auth };
-        return { value: { ...(isPlainObject(current) ? current : {}), auth } };
+        return {
+          value: createNamedAccount(
+            selection.accountId,
+            isPlainObject(current) ? current.label : undefined,
+            auth
+          ),
+        };
       })
     );
   }
@@ -978,7 +995,7 @@ export class CodexOauthService {
               : {};
             const entry = accounts[selection.accountId];
             const stored = parseCodexOauthAuth(
-              legacy ? current.codexOauth : isPlainObject(entry) ? entry.auth : undefined
+              legacy ? current.codexOauth : isPlainObject(entry) ? entry.credentials : undefined
             );
             // Token rotation preserves the login ID. Deletion, replacement, or an older writer cannot match it.
             if (
@@ -996,11 +1013,12 @@ export class CodexOauthService {
               // Named login preserves existing legacy credentials until explicit disconnect.
               next.codexOauthAccounts = {
                 ...accounts,
-                [selection.accountId]: {
-                  ...(isPlainObject(entry) ? entry : {}),
-                  label: isPlainObject(entry) ? entry.label : selection.label,
-                  auth: nextAuth,
-                },
+                // Legacy config readers redact credentials, including nested account identity fields.
+                [selection.accountId]: createNamedAccount(
+                  selection.accountId,
+                  isPlainObject(entry) ? entry.label : selection.label,
+                  nextAuth
+                ),
               };
               // Commit the first slot and its selection together. A failed write must leave neither field.
               if (

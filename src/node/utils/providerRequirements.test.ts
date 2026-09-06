@@ -84,7 +84,7 @@ describe("hasAnyConfiguredProvider", () => {
           codexOauthAccounts: {
             work: {
               label: "Work",
-              auth: {
+              credentials: {
                 type: "oauth",
                 access: "access",
                 refresh: "refresh",
@@ -127,7 +127,7 @@ describe("hasAnyConfiguredProvider", () => {
       const openai =
         accountId === "default"
           ? { codexOauth: auth }
-          : { codexOauthAccounts: { work: { label: "Work", auth } } };
+          : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } };
       expect(hasAnyConfiguredProvider({ openai })).toBe(false);
       expect(hasAnyConfiguredProvider({ openai, openrouter: { apiKey: "or-test" } })).toBe(true);
     } finally {
@@ -148,7 +148,7 @@ describe("hasAnyConfiguredProvider", () => {
         enabled: false,
         ...(accountId === "default"
           ? { codexOauth: auth }
-          : { codexOauthAccounts: { work: { label: "Work", auth } } }),
+          : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } }),
       };
       expect(hasAnyConfiguredProvider({ openai })).toBe(false);
       expect(hasAnyConfiguredProvider({ openai, openrouter: { apiKey: "or-test" } })).toBe(true);

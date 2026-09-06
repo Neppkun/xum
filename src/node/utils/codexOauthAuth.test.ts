@@ -60,7 +60,9 @@ describe("parseCodexOauthAuth", () => {
       const stored = { ...auth, credentialId: invalid };
       expect(parseCodexOauthAuth(stored)).toEqual(auth);
       expect(
-        getCodexOauthAccounts({ codexOauthAccounts: { work: { label: "Work", auth: stored } } })
+        getCodexOauthAccounts({
+          codexOauthAccounts: { work: { label: "Work", credentials: stored } },
+        })
       ).toHaveLength(1);
       expect(stored.credentialId).toBe(invalid);
     }
@@ -281,7 +283,7 @@ describe("Codex OAuth account slots", () => {
     const config = {
       codexOauth: legacy,
       codexOauthLabel: "Personal",
-      codexOauthAccounts: { work: { label: "Work", auth: work } },
+      codexOauthAccounts: { work: { label: "Work", credentials: work } },
     };
     expect(getCodexOauthAccounts(config).map(({ id, label }) => ({ id, label }))).toEqual([
       { id: "default", label: "Personal" },
@@ -295,7 +297,7 @@ describe("Codex OAuth account slots", () => {
   it("uses explicit selection before the global default and never substitutes missing slots", () => {
     const config = {
       codexOauth: legacy,
-      codexOauthAccounts: { work: { label: "Work", auth: work } },
+      codexOauthAccounts: { work: { label: "Work", credentials: work } },
       codexOauthDefaultAccountId: "work",
     };
     expect(getCodexOauthAuth(config)?.access).toBe("work");
@@ -321,8 +323,8 @@ describe("Codex OAuth account slots", () => {
       codexOauth: legacy,
       codexOauthDefaultAccountId: "damaged",
       codexOauthAccounts: {
-        damaged: { label, auth },
-        work: { label: " Work ", auth: work },
+        damaged: { label, credentials: auth },
+        work: { label: " Work ", credentials: work },
       },
     };
     expect(getCodexOauthAccounts(config).map(({ id, label }) => ({ id, label }))).toEqual([
@@ -338,11 +340,11 @@ describe("Codex OAuth account slots", () => {
     const config = {
       codexOauthAccounts: {
         missingAuth: {},
-        invalidType: { label: "Valid label", auth: { ...work, type: "apiKey" } },
-        invalidAccess: { label: 42, auth: { ...work, access: null } },
-        invalidRefresh: { auth: { ...work, refresh: "" } },
-        invalidExpiry: { label: " ", auth: { ...work, expires: Infinity } },
-        work: { label: "Work", auth: work },
+        invalidType: { label: "Valid label", credentials: { ...work, type: "apiKey" } },
+        invalidAccess: { label: 42, credentials: { ...work, access: null } },
+        invalidRefresh: { credentials: { ...work, refresh: "" } },
+        invalidExpiry: { label: " ", credentials: { ...work, expires: Infinity } },
+        work: { label: "Work", credentials: work },
       },
     };
     expect(getCodexOauthAccounts(config).map(({ id }) => id)).toEqual(["work"]);
@@ -354,9 +356,11 @@ describe("Codex OAuth account slots", () => {
   it("excludes stored IDs that cannot pass account mutation validation", () => {
     const invalidIds = ["", "__proto__", "constructor", "prototype", "../bad", "x".repeat(201)];
     const accounts = Object.fromEntries(
-      invalidIds.map((id) => [id, { label: "Invalid", auth: work }])
+      invalidIds.map((id) => [id, { label: "Invalid", credentials: work }])
     );
-    const config = { codexOauthAccounts: { ...accounts, work: { label: "Work", auth: work } } };
+    const config = {
+      codexOauthAccounts: { ...accounts, work: { label: "Work", credentials: work } },
+    };
     expect(getCodexOauthAccounts(config).map((account) => account.id)).toEqual(["work"]);
     for (const id of invalidIds) expect(getCodexOauthAuth(config, id)).toBeNull();
     expect(getCodexOauthAuth({ ...config, codexOauthDefaultAccountId: "../bad" })).toBeNull();
@@ -366,10 +370,10 @@ describe("Codex OAuth account slots", () => {
     const config = {
       codexOauth: legacy,
       codexOauthAccounts: {
-        default: { label: "Duplicate", auth: work },
-        broken: { label: "Broken", auth: {} },
-        blank: { label: " ", auth: null },
-        work: { label: "Work", auth: work },
+        default: { label: "Duplicate", credentials: work },
+        broken: { label: "Broken", credentials: {} },
+        blank: { label: " ", credentials: null },
+        work: { label: "Work", credentials: work },
       },
     };
     expect(getCodexOauthAccounts(config).map((account) => account.id)).toEqual(["default", "work"]);

@@ -1074,7 +1074,10 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         };
         const requests: Array<{ url: string; authorization: string | null }> = [];
         const providersConfig = {
-          openai: { apiKey: "test-api-key", codexOauthAccounts: { work: { label: "Work", auth } } },
+          openai: {
+            apiKey: "test-api-key",
+            codexOauthAccounts: { work: { label: "Work", credentials: auth } },
+          },
         };
         const fetchStub = Object.assign(
           (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1186,7 +1189,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         openai: {
           apiKey: "api-key-must-not-win",
           codexOauth: personal,
-          codexOauthAccounts: { work: { label: "Work", auth: work } },
+          codexOauthAccounts: { work: { label: "Work", credentials: work } },
         },
       });
       await config.editConfig((current) => {
@@ -1299,7 +1302,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
           openai: {
             codexOauth: personal,
             codexOauthDefaultAccountId: "work",
-            codexOauthAccounts: { work: { label: "Work", auth: updatedWork } },
+            codexOauthAccounts: { work: { label: "Work", credentials: updatedWork } },
           },
         });
         await config.editConfig((current) => {
@@ -2433,7 +2436,7 @@ describe("ProviderModelFactory routing", () => {
                     codexOauthAccounts: {
                       [accountId]: {
                         label: "Work",
-                        auth: {
+                        credentials: {
                           type: "oauth" as const,
                           access: "access",
                           refresh: "refresh",
@@ -2485,7 +2488,7 @@ describe("ProviderModelFactory routing", () => {
             openai: {
               ...(accountId === "default"
                 ? { codexOauth: auth }
-                : { codexOauthAccounts: { work: { label: "Work", auth } } }),
+                : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } }),
               codexOauthDefaultAccountId: accountId,
             },
             openrouter: { apiKey: "or-test" },
@@ -2522,7 +2525,7 @@ describe("ProviderModelFactory routing", () => {
           const openai = {
             ...(accountId === "default"
               ? { codexOauth: auth }
-              : { codexOauthAccounts: { work: { label: "Work", auth } } }),
+              : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } }),
             codexOauthDefaultAccountId: accountId,
           };
           const store = new ProvidersConfigStore(config.rootDir);

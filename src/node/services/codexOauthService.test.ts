@@ -346,7 +346,7 @@ describe("CodexOauthService", () => {
         deps.providersConfig = {
           openai: {
             codexOauth: legacy,
-            codexOauthAccounts: { work: { label: "Work", auth } },
+            codexOauthAccounts: { work: { label: "Work", credentials: auth } },
             codexOauthDefaultAccountId: "work",
           },
         };
@@ -535,7 +535,7 @@ describe("CodexOauthService", () => {
       deps.providersConfig = {
         openai: {
           codexOauth: legacy,
-          codexOauthAccounts: { work: { label: "Work", auth: work } },
+          codexOauthAccounts: { work: { label: "Work", credentials: work } },
           codexOauthDefaultAccountId: "work",
         },
       };
@@ -551,7 +551,10 @@ describe("CodexOauthService", () => {
       const legacy = validAuth();
       const work = validAuth({ refresh: "work" });
       deps.providersConfig = {
-        openai: { codexOauth: legacy, codexOauthAccounts: { work: { label: "Work", auth: work } } },
+        openai: {
+          codexOauth: legacy,
+          codexOauthAccounts: { work: { label: "Work", credentials: work } },
+        },
       };
       expect(await Effect.runPromise(service.renameAccountEffect("default", " Personal "))).toEqual(
         Ok(undefined)
@@ -714,7 +717,9 @@ describe("CodexOauthService", () => {
       const store = new ProvidersConfigStore(deps.rootDir);
       store.saveProvidersConfig({
         openai: {
-          codexOauthAccounts: { work: { label: "Work", auth: expiredAuth({ refresh: "old" }) } },
+          codexOauthAccounts: {
+            work: { label: "Work", credentials: expiredAuth({ refresh: "old" }) },
+          },
         },
       });
       const secondAttempt = createDeferred<void>();
@@ -777,7 +782,9 @@ describe("CodexOauthService", () => {
       deps.providersConfig = {
         openai: {
           codexOauth: expiredAuth({ refresh: "legacy" }),
-          codexOauthAccounts: { work: { label: "Work", auth: expiredAuth({ refresh: "work" }) } },
+          codexOauthAccounts: {
+            work: { label: "Work", credentials: expiredAuth({ refresh: "work" }) },
+          },
         },
       };
       const bothStarted = createDeferred<void>();
@@ -803,7 +810,9 @@ describe("CodexOauthService", () => {
       deps.providersConfig = {
         openai: {
           codexOauth: expiredAuth({ accountId: "chatgpt-original" }),
-          codexOauthAccounts: { work: { label: "Work", auth: validAuth({ access: "work" }) } },
+          codexOauthAccounts: {
+            work: { label: "Work", credentials: validAuth({ access: "work" }) },
+          },
         },
       };
       const started = createDeferred<void>();
@@ -859,7 +868,7 @@ describe("CodexOauthService", () => {
       "serializes disconnect and refresh when %s persists first",
       async (first) => {
         deps.providersConfig = {
-          openai: { codexOauthAccounts: { work: { label: "Work", auth: expiredAuth() } } },
+          openai: { codexOauthAccounts: { work: { label: "Work", credentials: expiredAuth() } } },
         };
         const provider = createMockProviderService(deps);
         service = createService(deps, provider);
@@ -911,7 +920,10 @@ describe("CodexOauthService", () => {
       const work = expiredAuth();
       const legacy = validAuth({ access: "legacy" });
       deps.providersConfig = {
-        openai: { codexOauth: legacy, codexOauthAccounts: { work: { label: "Work", auth: work } } },
+        openai: {
+          codexOauth: legacy,
+          codexOauthAccounts: { work: { label: "Work", credentials: work } },
+        },
       };
       const started = createDeferred<void>();
       const response = createDeferred<Response>();
@@ -930,7 +942,7 @@ describe("CodexOauthService", () => {
 
     it("keeps a concurrent rename when refreshed credentials persist", async () => {
       deps.providersConfig = {
-        openai: { codexOauthAccounts: { work: { label: "Work", auth: expiredAuth() } } },
+        openai: { codexOauthAccounts: { work: { label: "Work", credentials: expiredAuth() } } },
       };
       const started = createDeferred<void>();
       const response = createDeferred<Response>();
@@ -1033,7 +1045,7 @@ describe("CodexOauthService", () => {
 
       it("keeps the newer selection when a superseded " + kind + " flow terminates", async () => {
         deps.providersConfig = {
-          openai: { codexOauthAccounts: { work: { label: "Work", auth: validAuth() } } },
+          openai: { codexOauthAccounts: { work: { label: "Work", credentials: validAuth() } } },
         };
         deviceFetch();
         const first =
@@ -1065,6 +1077,65 @@ describe("CodexOauthService", () => {
       expect(deps.setConfigValueCalls).toHaveLength(0);
     });
 
+    for (const action of ["rename", "refresh", "stamp", "reconnect"] as const) {
+      it.each([undefined, 42, " ", " Work "])(
+        "drops unsafe disk fields during " + action + " with label %s",
+        async (label) => {
+          const credentials = validAuth({
+            credentialId: action === "stamp" ? undefined : validAuth().credentialId,
+            expires: action === "refresh" ? 0 : Date.now() + 3_600_000,
+          });
+          const store = new ProvidersConfigStore(deps.rootDir);
+          const document = {
+            openai: {
+              codexOauthAccounts: {
+                work: { label, credentials, auth: { access: "unsafe-copy" } },
+              },
+            },
+          };
+          // Manual disk damage bypasses write validation. Loading must still permit account recovery.
+          await fs.promises.writeFile(store.providersFile, JSON.stringify(document));
+          service = new CodexOauthService(store, new ProviderService(new Config(deps.rootDir)));
+          const expectedLabel = typeof label === "string" && label.trim() ? label.trim() : "work";
+          expect(getCodexOauthAccounts(store.loadProvidersConfig()?.openai)).toEqual([
+            { id: "work", label: expectedLabel, auth: credentials },
+          ]);
+          deviceFetch(() =>
+            Promise.resolve(
+              mockRefreshResponse({
+                access_token: "updated",
+                refresh_token: "updated-refresh",
+                expires_in: 3600,
+              })
+            )
+          );
+          if (action === "rename") {
+            expect(await service.renameAccount("work", "Renamed")).toEqual(Ok(undefined));
+          } else if (action === "refresh") {
+            expect(await service.getValidAuth("work")).toMatchObject({
+              success: true,
+              data: { access: "updated" },
+            });
+          } else {
+            const flow = await service.startDeviceFlow({ accountId: "work" });
+            if (!flow.success) throw new Error(flow.error);
+            if (action === "stamp") await service.cancelDeviceFlow(flow.data.flowId);
+            else expect(await service.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+          }
+          const saved = store.loadProvidersConfig()?.openai;
+          expect(saved?.codexOauthAccounts).toEqual({
+            work: {
+              label: action === "rename" ? "Renamed" : expectedLabel,
+              credentials: getCodexOauthAuth(saved, "work"),
+            },
+          });
+          expect(await fs.promises.readFile(store.providersFile, "utf8")).not.toContain(
+            "unsafe-copy"
+          );
+        }
+      );
+    }
+
     it("creates a named slot and selects the first account globally", async () => {
       deviceFetch();
       const flow = await service.startDeviceFlow({ label: " Personal " });
@@ -1074,6 +1145,10 @@ describe("CodexOauthService", () => {
       expect(accounts).toHaveLength(1);
       expect(accounts[0].id).not.toBe("default");
       expect(accounts[0].label).toBe("Personal");
+      // Persist one protected credential object, without a second token copy under auth.
+      expect(deps.providersConfig.openai?.codexOauthAccounts).toEqual({
+        [accounts[0].id]: { label: "Personal", credentials: accounts[0].auth },
+      });
       expect(await service.getValidAuth()).toEqual(Ok(accounts[0].auth));
       expect(deps.providersConfig.openai?.codexOauth).toBeUndefined();
     });
@@ -1147,7 +1222,7 @@ describe("CodexOauthService", () => {
       const work = validAuth({ access: "work" });
       deps.providersConfig = {
         openai: {
-          codexOauthAccounts: { work: { label: "Work", auth: work } },
+          codexOauthAccounts: { work: { label: "Work", credentials: work } },
           codexOauthDefaultAccountId: "work",
         },
       };
@@ -1166,7 +1241,7 @@ describe("CodexOauthService", () => {
       async (failure) => {
         const initial = expiredAuth();
         deps.providersConfig = {
-          openai: { codexOauthAccounts: { work: { label: "Work", auth: initial } } },
+          openai: { codexOauthAccounts: { work: { label: "Work", credentials: initial } } },
         };
         const provider = createMockProviderService(deps);
         service = createService(deps, provider);
@@ -1223,7 +1298,7 @@ describe("CodexOauthService", () => {
 
     it.each(["disconnect", "cancel"])("does not persist an exchange after %s", async (action) => {
       deps.providersConfig = {
-        openai: { codexOauthAccounts: { work: { label: "Work", auth: validAuth() } } },
+        openai: { codexOauthAccounts: { work: { label: "Work", credentials: validAuth() } } },
       };
       const started = createDeferred<void>();
       const response = createDeferred<Response>();
@@ -1253,7 +1328,9 @@ describe("CodexOauthService", () => {
     it("keeps refreshed credentials when a concurrent reconnect is cancelled", async () => {
       deps.providersConfig = {
         openai: {
-          codexOauthAccounts: { work: { label: "Work", auth: expiredAuth({ refresh: "old" }) } },
+          codexOauthAccounts: {
+            work: { label: "Work", credentials: expiredAuth({ refresh: "old" }) },
+          },
         },
       };
       const refreshStarted = createDeferred<void>();
@@ -1319,7 +1396,7 @@ describe("CodexOauthService", () => {
       const provider = new ProviderService(new Config(deps.rootDir));
       const store = provider.providersConfigStore;
       store.saveProvidersConfig({
-        openai: { codexOauthAccounts: { work: { label: "Work", auth } } },
+        openai: { codexOauthAccounts: { work: { label: "Work", credentials: auth } } },
       });
       return {
         provider,
@@ -1340,7 +1417,7 @@ describe("CodexOauthService", () => {
           openai:
             accountId === "default"
               ? { codexOauth: auth }
-              : { codexOauthAccounts: { work: { label: "Work", auth } } },
+              : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } },
         };
         deviceFetch();
         const flow = await service.startDeviceFlow({ accountId });
@@ -1514,7 +1591,7 @@ describe("CodexOauthService", () => {
           if (change !== "removed") {
             await provider.setConfigValue("openai", ["codexOauthAccounts", "work"], {
               label: "Work",
-              auth: {
+              credentials: {
                 ...initial,
                 credentialId:
                   change === "recreated" ? "50e00a32-b964-4ce2-b131-6b53356ce2db" : undefined,
@@ -1622,7 +1699,7 @@ describe("CodexOauthService", () => {
       const write = spyOn(provider, "updateProviderSection").mockImplementationOnce(
         (name, transform, options) => {
           store.saveProvidersConfig({
-            openai: { codexOauthAccounts: { work: { label: "Work", auth: replacement } } },
+            openai: { codexOauthAccounts: { work: { label: "Work", credentials: replacement } } },
           });
           return update(name, transform, options);
         }
@@ -1662,7 +1739,7 @@ describe("CodexOauthService", () => {
           codexOauth: validAuth(),
           codexOauthDefaultAccountId: "default",
           codexOauthAccounts: {
-            work: { label: "Work", auth: validAuth({ invalidReason: "invalid_grant" }) },
+            work: { label: "Work", credentials: validAuth({ invalidReason: "invalid_grant" }) },
           },
         },
       };
@@ -1678,7 +1755,7 @@ describe("CodexOauthService", () => {
           openai:
             accountId === "default"
               ? { codexOauth: auth }
-              : { codexOauthAccounts: { work: { label: "Work", auth } } },
+              : { codexOauthAccounts: { work: { label: "Work", credentials: auth } } },
         };
         deviceFetch();
         const fetch = globalThis.fetch;
@@ -1743,7 +1820,9 @@ describe("CodexOauthService", () => {
     it("completes a reconnect after a concurrent refresh persists first", async () => {
       deps.providersConfig = {
         openai: {
-          codexOauthAccounts: { work: { label: "Work", auth: expiredAuth({ refresh: "old" }) } },
+          codexOauthAccounts: {
+            work: { label: "Work", credentials: expiredAuth({ refresh: "old" }) },
+          },
         },
       };
       const refreshStarted = createDeferred<void>();
@@ -1839,7 +1918,9 @@ describe("CodexOauthService", () => {
     it("keeps a successful reconnect when an older refresh completes", async () => {
       deps.providersConfig = {
         openai: {
-          codexOauthAccounts: { work: { label: "Work", auth: expiredAuth({ refresh: "old" }) } },
+          codexOauthAccounts: {
+            work: { label: "Work", credentials: expiredAuth({ refresh: "old" }) },
+          },
         },
       };
       const refreshStarted = createDeferred<void>();
@@ -1873,7 +1954,7 @@ describe("CodexOauthService", () => {
       deps.providersConfig = {
         openai: {
           codexOauth: legacy,
-          codexOauthAccounts: { work: { label: "Work", auth: validAuth() } },
+          codexOauthAccounts: { work: { label: "Work", credentials: validAuth() } },
         },
       };
       deviceFetch();

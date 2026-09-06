@@ -113,7 +113,7 @@ export function getCodexOauthAccounts(config: unknown): Array<{
         !isPlainObject(entry)
       )
         continue;
-      const auth = parseCodexOauthAuth(entry.auth);
+      const auth = parseCodexOauthAuth(entry.credentials);
       if (!auth) continue;
       // Damaged display labels must not hide credentials from reconnect, rename, or disconnect.
       const label = typeof entry.label === "string" ? entry.label.trim() : "";

@@ -1180,7 +1180,7 @@ describe("AgentSession continuous compaction wiring", () => {
           codexOauthAccounts: {
             work: {
               label: "Work",
-              auth: {
+              credentials: {
                 type: "oauth" as const,
                 access: "work-access",
                 refresh: "work-refresh",
@@ -1189,7 +1189,7 @@ describe("AgentSession continuous compaction wiring", () => {
             },
             personal: {
               label: "Personal",
-              auth: {
+              credentials: {
                 type: "oauth" as const,
                 access: "personal-access",
                 refresh: "personal-refresh",
