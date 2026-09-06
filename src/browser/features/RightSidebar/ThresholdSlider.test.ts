@@ -70,6 +70,9 @@ describe("automatic context threshold labels", () => {
     expect(
       getAutoCompactionLabel({ threshold: 100, rolloverEnabled, setThreshold: () => undefined })
     ).not.toMatch(/\d+%/);
-    expect(evaluateAt(1_000_000, 100).decision).toBe("continue");
+    // Off disables automatic rollover, not the token-budget hard ceiling.
+    const hardCeiling = getContextBudgetHardCeiling(1_000_000);
+    expect(evaluateAt(hardCeiling - 1, 100).decision).toBe("continue");
+    expect(evaluateAt(hardCeiling, 100).decision).toBe("block");
   });
 });
