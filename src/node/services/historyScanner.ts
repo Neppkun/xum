@@ -333,7 +333,7 @@ export async function readProviderHistoryFromLatestBoundary(
 
 export interface BoundedHistoryRow {
   message: MuxMessage;
-  /** Exact physical row, stable under prefix-preserving appends, not rewrites/rotation. */
+  /** Exact row, stable across certified EOF appends with an unchanged prefix, not rewrites/rotation. */
   itemId: string;
   windowId: string;
   startsWindow: boolean;
@@ -699,7 +699,7 @@ export async function scanHistoryFilesBounded(
             windowId !== null &&
             !options.visit({
               message,
-              itemId: `r:${artifact}:${start}:${createHash("sha256").update(raw).digest("hex")}`,
+              itemId: `r:${state.provenanceEpoch}:${artifact}:${start}:${createHash("sha256").update(raw).digest("hex")}`,
               windowId,
               startsWindow: state.windowPending || isDurableContextBoundaryMarker(message),
             })

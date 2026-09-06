@@ -1307,6 +1307,73 @@ describe("session_history real disk recovery", () => {
     );
   });
 
+  test("identical physical copies have distinct references that expire after a rewrite", async () => {
+    const row =
+      JSON.stringify(
+        createMuxMessage("identical", "assistant", "needle identical payload", {
+          historySequence: 9,
+        })
+      ) + "\n";
+    await fs.writeFile(chatPath, row + row);
+    const found = (await pages({ action: "search", query: "needle", limit: 1 })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(found).toHaveLength(2);
+    expect(found[0].itemId).not.toBe(found[1].itemId);
+    for (const item of found) {
+      expect((await call({ action: "read_item", item_id: item.itemId })).items?.[0]?.text).toBe(
+        "needle identical payload"
+      );
+    }
+    // Removing the first physical copy moves identical bytes onto its old offset.
+    await fs.writeFile(chatPath, row);
+    for (const item of found) {
+      expect((await pages({ action: "read_item", item_id: item.itemId })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+    }
+    const current = (await pages({ action: "search", query: "needle" })).flatMap(
+      (page) => page.items ?? []
+    )[0];
+    expect((await call({ action: "read_item", item_id: current.itemId })).items?.[0]?.text).toBe(
+      "needle identical payload"
+    );
+  });
+
+  test("rotation expires exact references without hiding the relocated row from a new search", async () => {
+    await append("relocated", "needle archived payload");
+    const previous = (await pages({ action: "search", query: "needle" })).flatMap(
+      (page) => page.items ?? []
+    )[0];
+    await append("rotate", "summary", {
+      compacted: true,
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    expect((await pages({ action: "read_item", item_id: previous.itemId })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+    const current = (await pages({ action: "search", query: "needle" })).flatMap(
+      (page) => page.items ?? []
+    )[0];
+    expect((await call({ action: "read_item", item_id: current.itemId })).items?.[0]?.text).toBe(
+      "needle archived payload"
+    );
+  });
+
+  test("empty queries are rejected and zero-width regexp syntax remains literal", async () => {
+    expect((await call({ action: "search", query: "" })).error).toBe("query_required");
+    await append("literal-zero-width", "literal ^ $ (?=x) \\b markers");
+    await append("zero-width-decoy", "x ordinary text");
+    for (const query of ["^", "$", "(?=x)", "\\b"]) {
+      expect(
+        (await pages({ action: "search", query }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["literal ^ $ (?=x) \\b markers"]);
+    }
+  });
+
   test("literal case-insensitive snippets use original offsets after expanding Unicode lowercases", async () => {
     const query = "[NeEdLe].*\\(x)?";
     const text = "İ".repeat(300) + query + " trailing context";
