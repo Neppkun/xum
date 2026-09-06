@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CHAT_FILE_NAME } from "@/common/constants/paths";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
@@ -269,7 +269,7 @@ describe("WorkspaceTurnManager settlement authorization", () => {
     const h = await startTurn();
     const { causes } = observeCauseInsideLock(h.manager);
     await h.appendWake(false);
-    const reads = spyOn(h.historyService, "getHistoryFromLatestBoundary");
+    const reads = spyOn(h.historyService, "getControlEvidenceFromLatestBoundary");
     expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
     expect(causes).toHaveBeenCalledWith({ kind: "manual-supersession", messageId: "wake-input" });
     expect(reads).toHaveBeenCalledTimes(1);
@@ -300,7 +300,7 @@ describe("WorkspaceTurnManager settlement authorization", () => {
         })
       );
       const { causes } = observeCauseInsideLock(h.manager);
-      const reads = spyOn(h.historyService, "getHistoryFromLatestBoundary");
+      const reads = spyOn(h.historyService, "getControlEvidenceFromLatestBoundary");
       expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
       expect(causes).toHaveBeenCalledWith({
         kind: "uncorrelated-conservative-fallback",
@@ -313,6 +313,159 @@ describe("WorkspaceTurnManager settlement authorization", () => {
     }
   );
 
+  test("malformed message parts still provide ordered manual intervention evidence", async () => {
+    const h = await startTurn();
+    const messageId = " manual-with-damaged-parts ";
+    await appendFile(
+      join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+      JSON.stringify({ id: messageId, role: "user", parts: [null] }) + "\n"
+    );
+    await h.append(createMuxMessage(h.uncorrelatedEnd.messageId, "assistant", "Manual response"));
+    const { causes } = observeCauseInsideLock(h.manager);
+    expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+    expect(causes).toHaveBeenCalledWith({ kind: "manual-supersession", messageId });
+    expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
+  });
+
+  test.each(["before", "after"])(
+    "control evidence never crosses an unreadable floor %s the turn anchor",
+    async (position) => {
+      const h = await startTurn();
+      const reset = '{"metadata":{"contextBoundaryKind" : "reset"},broken\n';
+      const anchor = createMuxMessage("turn-anchor", "user", "delegated", {
+        muxMetadata: workspaceTurnMuxMetadata(h.parentId),
+      });
+      const invalidManual = JSON.stringify({ id: 42, role: "user", parts: [] }) + "\n";
+      await writeFile(
+        join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+        position === "before"
+          ? invalidManual + reset + JSON.stringify(anchor) + "\n"
+          : JSON.stringify(anchor) + "\n" + invalidManual + reset
+      );
+      await h.appendWake(true);
+      const { causes } = observeCauseInsideLock(h.manager);
+      expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+      if (position === "before") {
+        expect(causes).not.toHaveBeenCalled();
+        expect(await h.readRecord()).toMatchObject({ status: "running" });
+        expect(h.waiterSettled()).toBe(false);
+      } else {
+        expect(causes).toHaveBeenCalledWith({
+          kind: "uncorrelated-conservative-fallback",
+          reason: "missing-turn-anchor",
+        });
+        expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
+      }
+    }
+  );
+
+  test("manual evidence after a stale stream end is not applied out of order", async () => {
+    const h = await startTurn();
+    await writeFile(
+      join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+      [
+        createMuxMessage(h.uncorrelatedEnd.messageId, "assistant", "earlier end"),
+        createMuxMessage("turn-anchor", "user", "delegated", {
+          muxMetadata: workspaceTurnMuxMetadata(h.parentId),
+        }),
+        { id: 42, role: "user" },
+      ]
+        .map((row) => JSON.stringify(row))
+        .join("\n") + "\n"
+    );
+    const { causes } = observeCauseInsideLock(h.manager);
+    expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+    expect(causes).not.toHaveBeenCalled();
+    expect(await h.readRecord()).toMatchObject({ status: "running" });
+  });
+
+  test.each(
+    [
+      undefined,
+      null,
+      [],
+      { type: "normal" },
+      {
+        type: "compaction-request",
+        source: "auto-compaction",
+        parsed: { followUpContent: { dispatchOptions: { source: "internal-resume" } } },
+      },
+      {
+        type: "compaction-request",
+        source: "auto-compaction",
+        parsed: { continueMessage: { dispatchOptions: { source: "internal-resume" } } },
+      },
+    ].map((metadata) => [metadata] as const)
+  )("synthetic control evidence does not become manual input: %j", async (muxMetadata) => {
+    const h = await startTurn();
+    await appendFile(
+      join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+      JSON.stringify({ id: 42, role: "user", metadata: { synthetic: true, muxMetadata } }) + "\n"
+    );
+    await h.appendWake(true);
+    const { causes } = observeCauseInsideLock(h.manager);
+    expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+    expect(causes).not.toHaveBeenCalled();
+    expect(await h.readRecord()).toMatchObject({ status: "running" });
+  });
+
+  test("compaction-summary control anchors retain manual ordering after the original anchor is archived", async () => {
+    const h = await startTurn();
+    await h.append(
+      createMuxMessage("summary-anchor", "assistant", "summary", {
+        compacted: true,
+        compactionBoundary: true,
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue",
+            model: "anthropic:claude-opus-4-6",
+            agentId: "exec",
+            workspaceTurnMetadata: workspaceTurnMuxMetadata(h.parentId),
+          },
+        },
+      })
+    );
+    await appendFile(
+      join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+      JSON.stringify({ id: "after-summary", role: "user" }) + "\n"
+    );
+    await h.append(createMuxMessage(h.uncorrelatedEnd.messageId, "assistant", "Manual response"));
+    const { causes } = observeCauseInsideLock(h.manager);
+    expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+    expect(causes).toHaveBeenCalledWith({
+      kind: "manual-supersession",
+      messageId: "after-summary",
+    });
+  });
+
+  test.each(
+    [null, [], { followUpContent: 42 }, { followUpContent: { dispatchOptions: null } }].map(
+      (parsed) => [parsed] as const
+    )
+  )("damaged auto-compaction follow-up metadata conservatively interrupts: %j", async (parsed) => {
+    const h = await startTurn();
+    await appendFile(
+      join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+      JSON.stringify({
+        id: 42,
+        role: "user",
+        metadata: {
+          synthetic: true,
+          muxMetadata: { type: "compaction-request", source: "auto-compaction", parsed },
+        },
+      }) + "\n"
+    );
+    await h.appendWake(true);
+    const { causes } = observeCauseInsideLock(h.manager);
+    expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+    expect(causes).toHaveBeenCalledWith({
+      kind: "uncorrelated-conservative-fallback",
+      reason: "invalid-manual-input-id",
+    });
+  });
+
   test.each(["history-read-failed", "missing-stream-end", "missing-turn-anchor"] as const)(
     "conservative %s fallback interrupts with one history read and its exact internal reason",
     async (reason) => {
@@ -324,7 +477,7 @@ describe("WorkspaceTurnManager settlement authorization", () => {
         expect((await h.historyService.deleteMessage(h.workspaceId, messageId)).success).toBe(true);
       }
       const { causes } = observeCauseInsideLock(h.manager);
-      const reads = spyOn(h.historyService, "getHistoryFromLatestBoundary");
+      const reads = spyOn(h.historyService, "getControlEvidenceFromLatestBoundary");
       if (reason === "history-read-failed") reads.mockResolvedValueOnce(Err("unreadable history"));
       expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
       expect(causes).toHaveBeenCalledWith({ kind: "uncorrelated-conservative-fallback", reason });

@@ -1,6 +1,7 @@
 import { createScanner, SyntaxKind } from "jsonc-parser";
 import * as fs from "node:fs/promises";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import { isPlainObject } from "@/common/utils/isPlainObject";
 import { createHash } from "node:crypto";
 import assert from "node:assert";
 import {
@@ -255,10 +256,11 @@ async function findProviderHistoryStart(
 }
 
 /** Keep raw location and provider tail reads on one verified snapshot, without write-lock re-entry. */
-export async function readProviderHistoryFromLatestBoundary(
+async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
-  skip: number
-): Promise<MuxMessage[]> {
+  skip: number,
+  project: (value: unknown) => Row | null
+): Promise<Row[]> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
   const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
   try {
@@ -284,27 +286,27 @@ export async function readProviderHistoryFromLatestBoundary(
         ? findProviderHistoryStart(file.handle, file.size, skipCount)
         : Promise.resolve({ kind: "exhausted", oldestBoundary: null, boundaryCount: 0 });
     };
-    const readTail = async (artifact: HistoryArtifact, offset: number): Promise<MuxMessage[]> => {
+    const readTail = async (artifact: HistoryArtifact, offset: number): Promise<Row[]> => {
       const file = files.get(artifact);
       if (!file) return [];
       assert(offset >= 0 && offset <= file.size, "provider start must be within its snapshot");
       const buffer = Buffer.alloc(file.size - offset);
       const read = await file.handle.read(buffer, 0, buffer.length, offset);
       if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
-      const messages: MuxMessage[] = [];
+      const messages: Row[] = [];
       for (const line of buffer.toString("utf8").split("\n")) {
         if (!line.trim()) continue;
         try {
-          const value: unknown = JSON.parse(line);
-          if (isReadableHistoryMessage(value)) messages.push(normalizeLegacyMuxMetadata(value));
+          const row = project(JSON.parse(line) as unknown);
+          if (row !== null) messages.push(row);
         } catch {
-          // Provider-only self-healing; full/UI history keeps its existing reader.
+          // Project only usable rows; full/UI history keeps its existing reader.
         }
       }
       return messages;
     };
     const chat = await locate("chat", skip);
-    let messages: MuxMessage[];
+    let messages: Row[];
     if (chat.kind === "start") messages = await readTail("chat", chat.offset);
     else {
       const archive = await locate("archive", skip - chat.boundaryCount);
@@ -335,6 +337,39 @@ export async function readProviderHistoryFromLatestBoundary(
   } finally {
     await Promise.all([...files.values()].map((file) => file.handle.close()));
   }
+}
+
+export function readProviderHistoryFromLatestBoundary(
+  paths: Record<HistoryArtifact, string>,
+  skip: number
+): Promise<MuxMessage[]> {
+  return readHistoryProjectionFromLatestBoundary(paths, skip, (value) =>
+    isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
+  );
+}
+
+/** Ordered lifecycle evidence, not a provider message or a source of repaired IDs. */
+export interface HistoryControlRow {
+  id?: unknown;
+  role: "user" | "assistant" | "system";
+  metadata?: Record<string, unknown>;
+}
+
+export function readHistoryControlEvidenceFromLatestBoundary(
+  paths: Record<HistoryArtifact, string>,
+  skip: number
+): Promise<HistoryControlRow[]> {
+  return readHistoryProjectionFromLatestBoundary(paths, skip, (value) => {
+    const row = isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : value;
+    if (!isPlainObject(row)) return null;
+    if (row.role !== "user" && row.role !== "assistant" && row.role !== "system") return null;
+    if (row.metadata !== undefined && !isPlainObject(row.metadata)) return null;
+    return {
+      ...("id" in row ? { id: row.id } : {}),
+      role: row.role,
+      ...(row.metadata === undefined ? {} : { metadata: row.metadata }),
+    };
+  });
 }
 
 export interface BoundedHistoryRow {

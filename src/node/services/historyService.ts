@@ -10,6 +10,8 @@ import {
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   readProviderHistoryFromLatestBoundary,
+  readHistoryControlEvidenceFromLatestBoundary,
+  type HistoryControlRow,
   type BoundedHistoryScanOptions,
 } from "./historyScanner";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
@@ -1823,6 +1825,28 @@ export class HistoryService {
       const message = getErrorMessage(error);
       return Err(`Failed to read history from boundary: ${message}`);
     }
+  }
+
+  /** Lifecycle decisions retain malformed IDs/parts without bypassing the raw privacy floor. */
+  async getControlEvidenceFromLatestBoundary(
+    workspaceId: string
+  ): Promise<Result<HistoryControlRow[]>> {
+    return this.withRecoveredHistoryResultLock(
+      workspaceId,
+      "Failed to read history control evidence",
+      async () => {
+        await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
+        return Ok(
+          await readHistoryControlEvidenceFromLatestBoundary(
+            {
+              chat: this.getChatHistoryPath(workspaceId),
+              archive: this.getChatArchivePath(workspaceId),
+            },
+            0
+          )
+        );
+      }
+    );
   }
 
   private async getHistoryFromLatestBoundaryUnlocked(

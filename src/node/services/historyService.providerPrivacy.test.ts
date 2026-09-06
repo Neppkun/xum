@@ -109,6 +109,12 @@ describe("HistoryService provider-only raw privacy floors", () => {
             ).providerRequestMessages.map((message) => message.id)
           ).toEqual(expected);
         }
+        const control = await h.historyService.getControlEvidenceFromLatestBoundary(workspaceId);
+        expect(control.success).toBe(true);
+        if (!control.success) throw new Error(control.error);
+        expect(control.data.map((row) => row.id)).toEqual(
+          artifact === "chat" ? [publicChat.id] : [publicArchive.id, publicChat.id]
+        );
         const full: MuxMessage[] = [];
         expect(
           (
@@ -127,6 +133,46 @@ describe("HistoryService provider-only raw privacy floors", () => {
       }
     );
   }
+
+  test("control evidence preserves malformed IDs and parts in order without widening provider reads", async () => {
+    const correlation = {
+      type: "workspace-turn-task",
+      taskHandleId: "handle",
+      ownerWorkspaceId: "owner",
+      turnId: "turn",
+    };
+    const rows = [
+      old,
+      { role: "user" },
+      { id: null, role: "user", parts: null },
+      { id: 42, role: "user", parts: [] },
+      { id: "bad-parts", role: "user", parts: [null], metadata: { synthetic: true } },
+      {
+        ...createMuxMessage("legacy", "user", "valid legacy input"),
+        metadata: { cmuxMetadata: correlation },
+      },
+      { id: "wrong-role", role: "other", parts: [] },
+      { id: "wrong-metadata", role: "user", metadata: [] },
+      null,
+    ];
+    await fs.writeFile(chatPath, rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    const evidence = await h.historyService.getControlEvidenceFromLatestBoundary(workspaceId);
+    expect(evidence.success).toBe(true);
+    if (!evidence.success) throw new Error(evidence.error);
+    expect(evidence.data.map((row) => row.id)).toEqual([
+      old.id,
+      undefined,
+      null,
+      42,
+      "bad-parts",
+      "legacy",
+    ]);
+    expect(evidence.data[1]).not.toHaveProperty("id");
+    expect(evidence.data.every((row) => !("parts" in row))).toBe(true);
+    expect(evidence.data.at(-1)?.metadata?.muxMetadata).toEqual(correlation);
+    expect(evidence.data.at(-1)?.metadata).not.toHaveProperty("cmuxMetadata");
+    expect(await providerIds()).toEqual([old.id, "legacy"]);
+  });
 
   test("skip falls back within the newest malformed floor instead of an older archive boundary", async () => {
     await fs.writeFile(archivePath, line(boundary) + line(old));
