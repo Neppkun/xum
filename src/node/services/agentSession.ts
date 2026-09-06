@@ -5046,19 +5046,13 @@ export class AgentSession {
       const access = await this.checkContextBudgetHistoryAccess(options);
       if (!access.success) return access;
     }
-    const firstAssistant = history.data.find(
-      (row) => row.role === "assistant" && row.metadata?.contextUsage
-    );
-    // Only a single-step first response gives a known first-request input floor.
-    const systemFloorTokens =
-      firstAssistant && (firstAssistant.metadata?.stepStartPartIndices?.length ?? 1) <= 1
-        ? tokenCount(firstAssistant.metadata?.contextUsage?.inputTokens)
-        : undefined;
+    // Historical input usage includes user/history content, especially for compaction.
+    // Without measured system+schema overhead, use the model-scaled fallback; the
+    // assembled-request preflight remains authoritative for the actual prompt.
     const freshEstimate = estimateFreshRequestTokens({
       userText,
       attachments,
       leadIn: rollover ? buildLeadInText(rollover) : undefined,
-      systemFloorTokens,
       modelContextLimit: maxTokens,
     });
     if (freshEstimate >= getContextBudgetHardCeiling(maxTokens)) {

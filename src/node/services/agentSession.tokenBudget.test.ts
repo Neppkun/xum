@@ -211,6 +211,79 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   }
 
+  test.each([undefined, null, {}, "invalid", 42])(
+    "a persisted assistant with unreadable parts=%j cannot brick the next send",
+    async (parts) => {
+      const h = await setup();
+      await seedHistory(h, 20_000);
+      const damaged = {
+        id: "damaged-parts",
+        role: "assistant",
+        parts,
+        metadata: {
+          model,
+          historySequence: 3,
+          contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
+        },
+      };
+      const historyPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+      const raw = JSON.stringify(damaged) + "\n";
+      await fs.appendFile(historyPath, raw);
+      expect((await h.session.sendMessage("Continue past the damaged row", options)).success).toBe(
+        true
+      );
+      expect(h.requests).toHaveLength(1);
+      expect(h.requests[0].messages.some((row) => row.id === damaged.id)).toBe(false);
+      expect(h.requests[0].messages.some((row) => row.id === "old-answer")).toBe(true);
+      expect(await fs.readFile(historyPath, "utf8")).toContain(raw);
+    }
+  );
+
+  test.each(["large-first-prompt", "compaction-summary"] as const)(
+    "historical input usage is not a system floor for the next request (%s)",
+    async (kind) => {
+      const h = await setup();
+      h.session.setAutoCompactionThreshold(1);
+      const previous = createMuxMessage("high-input-answer", "assistant", "Small useful response", {
+        model,
+        contextUsage: { inputTokens: 125_000, outputTokens: 20, totalTokens: 125_020 },
+        stepStartPartIndices: [0],
+        ...(kind === "compaction-summary"
+          ? {
+              compacted: "user" as const,
+              compactionEpoch: 1,
+              muxMetadata: { type: "compaction-summary" as const },
+            }
+          : {}),
+      });
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            createMuxMessage("old-user", "user", "Prior request"),
+            previous,
+          ])
+        ).success
+      ).toBe(true);
+      expect((await h.session.sendMessage("Small fitting follow-up", options)).success).toBe(true);
+      expect(h.requests).toHaveLength(1);
+      expect(h.requests[0].messages.some((row) => row.id === previous.id)).toBe(true);
+      h.aiEmitter.emit("stream-end", {
+        type: "stream-end",
+        workspaceId,
+        messageId: "assistant-1",
+        metadata: { model, agentId: "exec", finishReason: "stop" },
+        parts: [],
+      });
+      h.completions[0].settle({ status: "completed" });
+      await h.session.waitForIdle();
+      expect(await h.session.sendMessage("oversized ".repeat(60_000), options)).toMatchObject({
+        success: false,
+        error: { type: "context_budget_blocked" },
+      });
+      expect(h.requests).toHaveLength(1);
+    }
+  );
+
   test.each([false, true])(
     "a rejected tail never retries the older completed turn after restart (legacy=%s)",
     async (legacy) => {
