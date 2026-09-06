@@ -67,6 +67,10 @@ describe("HistoryService provider-only raw privacy floors", () => {
     ["fragmented", ' {\n"contextBoundaryKind"\n:\n"reset"\n}\n'],
     ["control separators", '{"metadata":{"contextBoundaryKind"\u0000:\u0001"reset"},broken\n'],
     [
+      "array-shaped metadata",
+      '{"id":"damaged","role":"assistant","parts":[],"metadata":[{"contextBoundaryKind":"reset"}]}\n',
+    ],
+    [
       "duplicate rollover metadata",
       `{"id":"ambiguous","role":"assistant","parts":[],"metadata":{"contextBoundaryKind":"reset"},"metadata":${JSON.stringify(rollover)}}\n`,
     ],
@@ -169,6 +173,69 @@ describe("HistoryService provider-only raw privacy floors", () => {
     expect(Buffer.byteLength(contents)).toBeGreaterThan(SESSION_HISTORY_MAX_SCAN_BYTES);
     await fs.writeFile(chatPath, contents);
     expect(await providerIds()).toEqual([boundary.id, ...rows.map((message) => message.id)]);
+  });
+
+  test.each(["text", "tool"])(
+    "readable nested %s reset data is not a provider privacy floor",
+    async (kind) => {
+      const data = { contextBoundaryKind: "reset", value: "ordinary data" };
+      const message =
+        kind === "text"
+          ? createMuxMessage("marker-data", "assistant", JSON.stringify(data))
+          : createMuxMessage("marker-data", "assistant", "", undefined, [
+              {
+                type: "dynamic-tool",
+                toolCallId: "payload",
+                toolName: "bash",
+                state: "output-available",
+                input: {},
+                output: data,
+              },
+            ]);
+      await fs.writeFile(archivePath, line(old));
+      await fs.writeFile(chatPath, line(message) + line(publicChat));
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.map((row) => row.id)).toEqual([old.id, message.id, publicChat.id]);
+      expect(await providerIds()).toEqual([old.id, message.id, publicChat.id]);
+    }
+  );
+
+  test("ordinary reset-like payloads remain rewritable but cannot replace a manual boundary", async () => {
+    const parts: MuxMessage["parts"] = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "payload",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { contextBoundaryKind: "reset" },
+      },
+    ];
+    const ordinary = createMuxMessage("ordinary", "assistant", "", undefined, parts);
+    expect((await h.historyService.appendToHistory(workspaceId, ordinary)).success).toBe(true);
+    expect(
+      (
+        await h.historyService.updateHistory(workspaceId, {
+          ...ordinary,
+          parts: [{ type: "text", text: "updated data" }],
+        })
+      ).success
+    ).toBe(true);
+    expect(await providerIds()).toEqual([old.id, ordinary.id]);
+    const reset = createMuxMessage("manual", "assistant", "", { contextBoundaryKind: "reset" });
+    expect((await h.historyService.appendToHistory(workspaceId, reset)).success).toBe(true);
+    expect(
+      (
+        await h.historyService.updateHistory(workspaceId, {
+          ...reset,
+          metadata: { historySequence: reset.metadata!.historySequence },
+          parts,
+        })
+      ).success
+    ).toBe(false);
+    expect(await providerIds()).toEqual([]);
   });
 
   test("valid rollover boundaries stay readable while malformed trailing rows are filtered", async () => {

@@ -1952,8 +1952,17 @@ export class HistoryService {
     if (linesToArchive.length > 0) {
       // Append + fsync BEFORE rewriting chat.jsonl: a crash must never lose
       // sealed rows, only (at worst) duplicate them, which the dedupe above heals.
-      const fh = await fs.open(archivePath, "a");
+      const fh = await fs.open(archivePath, "a+");
       try {
+        // A failed archive write can leave a torn tail while chat still contains
+        // the complete rows. Delimit that evidence before replaying those rows.
+        const { size } = await fh.stat();
+        if (size > 0) {
+          const tail = Buffer.alloc(1);
+          const read = await fh.read(tail, 0, 1, size - 1);
+          assert(read.bytesRead === 1, "archive tail must remain readable under the history lock");
+          if (tail[0] !== 10) await fh.writeFile("\n");
+        }
         await fh.writeFile(Buffer.concat(linesToArchive));
         await fh.sync();
       } finally {
@@ -2466,8 +2475,13 @@ export class HistoryService {
         return [];
       }
       const serialized = this.serializeHistoryEntries([updated], workspaceId);
-      if (hasRawResetMarker(row.raw.toString("utf8")) && !hasRawResetMarker(serialized)) {
-        throw new Error("History update would erase unreadable reset evidence");
+      // Unreadable/ambiguous rows stay raw above. For readable rows, payload
+      // data cannot establish or stand in for a real top-level reset boundary.
+      if (
+        row.message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET &&
+        updated.metadata?.contextBoundaryKind !== CONTEXT_BOUNDARY_KINDS.RESET
+      ) {
+        throw new Error("History update would erase reset evidence");
       }
       return [Buffer.from(serialized)];
     });

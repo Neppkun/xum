@@ -50,6 +50,11 @@ export function isReadableHistoryMessage(value: unknown): value is MuxMessage {
     typeof value.id === "string" &&
     "role" in value &&
     ["user", "assistant", "system"].includes(String(value.role)) &&
+    (!("metadata" in value) ||
+      value.metadata === undefined ||
+      (value.metadata !== null &&
+        typeof value.metadata === "object" &&
+        !Array.isArray(value.metadata))) &&
     "parts" in value &&
     MuxMessageSchema.shape.parts.safeParse(value.parts).success
   );
@@ -160,8 +165,9 @@ function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMess
     }
     if (rowReset && hasAmbiguousResetKeys(text)) return null;
     if (!isReadableHistoryMessage(raw)) return null;
-    // A valid row breaks any chain of older/newer malformed fragments.
-    probe.possibleReset = rowReset;
+    // Readable payloads may discuss resets; only their top-level metadata can
+    // mark one. Raw evidence is reserved for unreadable/ambiguous rows above.
+    probe.possibleReset = false;
     return normalizeLegacyMuxMetadata(raw);
   } catch {
     return null;

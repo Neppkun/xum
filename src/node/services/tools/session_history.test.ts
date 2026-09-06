@@ -8,7 +8,7 @@ import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
 import { hasRawResetMarker } from "@/node/services/historyScanner";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
@@ -2338,6 +2338,104 @@ describe("session_history real disk recovery", () => {
           .map((item) => item.text)
       ).toEqual([expected]);
     }
+  });
+
+  test.each([false, true])(
+    "rotation retries preserve a torn archive tail and every complete row (reset evidence: %s)",
+    async (resetEvidence) => {
+      await append("sealed", "sealed facts");
+      if (resetEvidence) {
+        await fs.writeFile(
+          archivePath,
+          Buffer.concat([
+            Buffer.from(
+              JSON.stringify(
+                createMuxMessage("older-private", "assistant", "private archived facts")
+              ) + "\n"
+            ),
+            Buffer.from(' {"metadata":{"contextBoundaryKind" : "reset"},'),
+            Buffer.from([0xff]),
+          ])
+        );
+      }
+      const originalOpen = fs.open;
+      let crashed = false;
+      const writes: Array<{ mockRestore(): void }> = [];
+      const opened = spyOn(fs, "open").mockImplementation(async (...args) => {
+        const handle = await originalOpen(...args);
+        if (args[0] === archivePath && (args[1] === "a" || args[1] === "a+")) {
+          const originalWrite = handle.writeFile.bind(handle);
+          writes.push(
+            spyOn(handle, "writeFile").mockImplementation(async (data, options) => {
+              if (!crashed && Buffer.isBuffer(data)) {
+                crashed = true;
+                await originalWrite(data.subarray(0, data.indexOf(10) - 1), options);
+                throw new Error("simulated partial archive publication");
+              }
+              return originalWrite(data, options);
+            })
+          );
+        }
+        return handle;
+      });
+      try {
+        await append("first-boundary", "summary", {
+          compacted: true,
+          compactionBoundary: true,
+          compactionEpoch: 1,
+        });
+      } finally {
+        for (const write of writes) write.mockRestore();
+        opened.mockRestore();
+      }
+      expect(crashed).toBe(true);
+      expect((await fs.readFile(chatPath, "utf8")).includes('"id":"first"')).toBe(true);
+      const tornArchive = await fs.readFile(archivePath);
+      expect(tornArchive.at(-1)).not.toBe(10);
+      await append("retry-boundary", "latest summary", {
+        compacted: true,
+        compactionBoundary: true,
+        compactionEpoch: 2,
+      });
+      const archived = await fs.readFile(archivePath);
+      expect(archived.subarray(0, tornArchive.length)).toEqual(tornArchive);
+      expect((await fs.readFile(chatPath, "utf8")).includes('"id":"first"')).toBe(false);
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["opening facts", "sealed facts"]);
+      const full: MuxMessage[] = [];
+      expect(
+        (
+          await fixture.historyService.iterateFullHistory(workspaceId, "forward", (rows) => {
+            full.push(...rows);
+          })
+        ).success
+      ).toBe(true);
+      for (const id of ["first", "sealed", "first-boundary", "retry-boundary"])
+        expect(full.some((row) => row.id === id)).toBe(true);
+    }
+  );
+
+  test("a readable structured tool result containing reset data does not hide earlier recovery rows", async () => {
+    await append("tool-data", "", undefined, [
+      {
+        type: "dynamic-tool",
+        toolCallId: "data",
+        toolName: "bash",
+        state: "output-available",
+        input: {},
+        output: { contextBoundaryKind: "reset", value: "tool facts" },
+      },
+    ]);
+    await append("after-tool", "later facts");
+    const found = (await pages({ action: "search", query: "facts" })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(found.map((item) => item.text)).toContain("opening facts");
+    expect(found.some((item) => item.text.includes("tool facts"))).toBe(true);
+    expect(found.map((item) => item.text)).toContain("later facts");
   });
 
   test("potential crash replays remain visible without exact duplicate proof", async () => {
