@@ -1,3 +1,4 @@
+import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
@@ -280,6 +281,7 @@ interface AutoRetryResumeRequest {
   // ACP correlation/delegation lives in transient send options that are
   // intentionally omitted from durable startup-recovery snapshots.
   options: SendMessageOptions;
+  requestAssemblySnapshot?: RequestAssemblySnapshot;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
@@ -624,6 +626,9 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   ): Promise<MemorySessionContext | null>;
   isClaudeSkillsCompatEnabled?(): boolean;
   isAgentPluginsEnabled?(): boolean;
+  captureRequestAssemblySnapshot?(
+    workspaceId: string
+  ): Promise<Result<RequestAssemblySnapshot, SendMessageError>>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -924,6 +929,7 @@ export class AgentSession {
   private activeStreamContext?: {
     modelString: string;
     contextBudgetRetried?: boolean;
+    requestAssemblySnapshot?: RequestAssemblySnapshot;
     options?: SendMessageOptions;
     agentInitiated?: boolean;
     openaiTruncationModeOverride?: "auto" | "disabled";
@@ -1426,7 +1432,8 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
-    goalId?: string
+    goalId?: string,
+    requestAssemblySnapshot?: RequestAssemblySnapshot
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1435,6 +1442,7 @@ export class AgentSession {
 
     this.lastAutoRetryResumeRequest = {
       options,
+      ...(requestAssemblySnapshot ? { requestAssemblySnapshot } : {}),
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
@@ -1472,6 +1480,7 @@ export class AgentSession {
         agentInitiated: request.agentInitiated === true ? true : undefined,
         goalKind: request.goalKind,
         goalId: request.goalId,
+        requestAssemblySnapshot: request.requestAssemblySnapshot,
       });
       if (result.success) {
         if (!result.data.started) {
@@ -3817,6 +3826,7 @@ export class AgentSession {
     let autoCompactionMessage: MuxMessage | null = null;
     const tokenBudgetActive = this.isTokenBudgetActive(optionsForStream);
     let contextBudgetPrefix: MuxMessage[] = [];
+    let requestAssemblySnapshot: RequestAssemblySnapshot | undefined;
     if (tokenBudgetActive && !editMessageId) {
       // A stopped turn's partial belongs to the old window, never after its reset.
       const committed = await this.historyService.commitPartial(this.workspaceId);
@@ -3835,7 +3845,8 @@ export class AgentSession {
           this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(prepared.error)));
         return prepared;
       }
-      contextBudgetPrefix = prepared.data;
+      contextBudgetPrefix = prepared.data.prefix;
+      requestAssemblySnapshot = prepared.data.requestAssemblySnapshot;
     }
     const contextRollover =
       contextBudgetPrefix[0]?.metadata?.muxMetadata?.type === "context-window-rollover";
@@ -4338,7 +4349,13 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
+    this.setAutoRetryResumeState(
+      optionsForStream,
+      agentInitiated,
+      goalKind,
+      internal?.goalId,
+      requestAssemblySnapshot
+    );
     try {
       await internal?.onAccepted?.();
     } catch (error) {
@@ -4423,7 +4440,8 @@ export class AgentSession {
           goalKind,
           internal?.goalId,
           turnThinkingOverride,
-          contextRollover
+          contextRollover,
+          requestAssemblySnapshot
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
           await notifyAcceptedPreStreamFailure(
@@ -4492,7 +4510,12 @@ export class AgentSession {
 
   async resumeStream(
     options: SendMessageOptions,
-    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
+    internal?: {
+      agentInitiated?: boolean;
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
+      requestAssemblySnapshot?: RequestAssemblySnapshot;
+    }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
 
@@ -4537,7 +4560,8 @@ export class AgentSession {
       optionsForStream,
       internal?.agentInitiated,
       internal?.goalKind,
-      internal?.goalId
+      internal?.goalId,
+      internal?.requestAssemblySnapshot
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
     this.setTurnPhase(TurnPhase.PREPARING);
@@ -4557,7 +4581,9 @@ export class AgentSession {
         undefined,
         internal?.goalKind,
         internal?.goalId,
-        turnThinkingOverride
+        turnThinkingOverride,
+        internal?.requestAssemblySnapshot != null,
+        internal?.requestAssemblySnapshot
       );
       if (!result.success) {
         return result;
@@ -4794,11 +4820,34 @@ export class AgentSession {
     return Ok(undefined);
   }
 
+  private async captureRolloverRequestAssembly(): Promise<
+    Result<RequestAssemblySnapshot, SendMessageError>
+  > {
+    if (!this.aiService.captureRequestAssemblySnapshot)
+      return Err({
+        type: "context_budget_blocked",
+        message: "Request assembly safety is unavailable; use /compact or retry after restarting.",
+      });
+    const captured = await this.aiService.captureRequestAssemblySnapshot(this.workspaceId);
+    if (!captured.success) return captured;
+    assert(
+      captured.data.workspaceId === this.workspaceId,
+      "Rollover snapshot must match its workspace"
+    );
+    if (!captured.data.preservesToolset)
+      return Err({
+        type: "context_budget_blocked",
+        message:
+          "Context rollover is unavailable with request middleware that can change tools. Use /compact or a context-only integration.",
+      });
+    return captured;
+  }
+
   /** Emergency retries reuse the accepted user row; never rerun a completed tool to recover context. */
   private async rolloverAfterBudgetFailure(
     model: string,
     estimate?: number
-  ): Promise<Result<boolean, SendMessageError>> {
+  ): Promise<Result<RequestAssemblySnapshot | undefined, SendMessageError>> {
     const context = this.activeStreamContext;
     const generation = this.contextBudgetGeneration;
     if (
@@ -4810,7 +4859,7 @@ export class AgentSession {
       this.disposed ||
       this.shuttingDown
     )
-      return Ok(false);
+      return Ok(undefined);
     try {
       // StreamManager's completion settles after teardown. Commit its error partial,
       // including any settled fallback tool outputs, before sealing the old window.
@@ -4819,20 +4868,22 @@ export class AgentSession {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) return Err(createUnknownSendMessageError(history.error));
       const user = history.data.findLast((row) => row.id === this.activeStreamUserMessageId);
-      if (!user) return Ok(false);
+      if (!user) return Ok(undefined);
       const priorRows = history.data.filter(
         (row) => row !== user && !isSyntheticSnapshotUserMessage(row)
       );
-      if (!hasRolloverEligibleMessages(priorRows)) return Ok(false);
+      if (!hasRolloverEligibleMessages(priorRows)) return Ok(undefined);
       const maxTokens = getEffectiveContextLimit(
         model,
         this.is1MContextEnabledForModel(model, context.options, context.providersConfig),
         context.providersConfig,
         { openaiWireFormat: context.options?.providerOptions?.openai?.wireFormat }
       );
-      if (maxTokens == null || maxTokens <= 0) return Ok(false);
+      if (maxTokens == null || maxTokens <= 0) return Ok(undefined);
       const access = await this.checkContextBudgetHistoryAccess(context.options);
       if (!access.success) return access;
+      const captured = await this.captureRolloverRequestAssembly();
+      if (!captured.success) return captured;
       const rollover: ContextWindowRollover = {
         type: "context-window-rollover",
         rolloverId: randomUUID(),
@@ -4907,7 +4958,7 @@ export class AgentSession {
         this.disposed ||
         this.shuttingDown
       )
-        return Ok(false);
+        return Ok(undefined);
       // Retry the accepted skill instructions, not their dynamic commands. They
       // may have been deduped against a snapshot elsewhere in the sealed window.
       const skillSnapshots = extractAgentSkillRefs(user.metadata?.muxMetadata).flatMap((ref) => {
@@ -4938,7 +4989,7 @@ export class AgentSession {
       this.onContextWindowRollover?.();
       await clearPendingBranchSummary(this.workspaceId);
       for (const row of rows) this.emitChatEvent({ ...row, type: "message" });
-      return Ok(true);
+      return Ok(captured.data);
     } catch (error) {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
@@ -4947,7 +4998,12 @@ export class AgentSession {
   private async prepareContextBudgetSend(
     userMessage: MuxMessage,
     options: SendMessageOptions
-  ): Promise<Result<MuxMessage[], SendMessageError>> {
+  ): Promise<
+    Result<
+      { prefix: MuxMessage[]; requestAssemblySnapshot?: RequestAssemblySnapshot },
+      SendMessageError
+    >
+  > {
     const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
     if (!history.success) return Err(createUnknownSendMessageError(history.error));
     // A filesystem error can be reported after an atomic replacement became visible.
@@ -4974,7 +5030,7 @@ export class AgentSession {
     );
     if (maxTokens == null || maxTokens <= 0) {
       log.warn("Token budget has no known model context limit", { model: options.model });
-      return Ok([]);
+      return Ok({ prefix: [] });
     }
     const lastAssistant = history.data.findLast(
       (row) => row.role === "assistant" && row.metadata?.contextUsage
@@ -5062,6 +5118,8 @@ export class AgentSession {
       });
     }
     if (rollover) {
+      const captured = await this.captureRolloverRequestAssembly();
+      if (!captured.success) return captured;
       this.pendingRollover = rollover;
       userMessage.metadata = {
         ...userMessage.metadata,
@@ -5075,7 +5133,7 @@ export class AgentSession {
         userMessage.parts = [{ type: "text", text: "Continue" }];
         userMessage.metadata.muxMetadata = undefined;
       }
-      return Ok(createRolloverPrefix(rollover));
+      return Ok({ prefix: createRolloverPrefix(rollover), requestAssemblySnapshot: captured.data });
     }
     if (shouldRollover) {
       log.warn("Context-budget window is already fresh; skipping duplicate reset", {
@@ -5085,7 +5143,7 @@ export class AgentSession {
     }
     if (userMessage.metadata?.muxMetadata?.type === "context-budget-warning") {
       this.pendingBudgetWarning = undefined;
-      return Ok([]);
+      return Ok({ prefix: [] });
     }
     if (
       !this.contextBudgetWarningClaimed &&
@@ -5093,16 +5151,18 @@ export class AgentSession {
       this.compactionMonitor.getThreshold() < 1 &&
       (this.pendingBudgetWarning != null || decision.decision === "warn")
     ) {
-      return Ok([
-        createContextBudgetWarning(
-          decision.projected,
-          maxTokens,
-          this.contextBudgetMemoryWritable,
-          this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy)
-        ),
-      ]);
+      return Ok({
+        prefix: [
+          createContextBudgetWarning(
+            decision.projected,
+            maxTokens,
+            this.contextBudgetMemoryWritable,
+            this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy)
+          ),
+        ],
+      });
     }
-    return Ok([]);
+    return Ok({ prefix: [] });
   }
 
   private async onContextBudgetStepSettled(
@@ -6104,7 +6164,8 @@ export class AgentSession {
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
     activeTurnThinkingOverride?: ActiveTurnThinkingOverride,
-    contextBudgetRetried = false
+    contextBudgetRetried = false,
+    requestAssemblySnapshot?: RequestAssemblySnapshot
   ): Promise<AgentSessionResult<void>> {
     // Re-read at every pre-stream checkpoint below: dispose or shutdown can land while a
     // recovery-initiated stream (which carries no abortSignal) awaits commitPartial, file-change
@@ -6114,6 +6175,17 @@ export class AgentSession {
 
     if (isStreamStartAborted()) {
       return Ok(undefined);
+    }
+
+    // Delayed retries belong to this admitted turn; do not lose its pinned chain on teardown.
+    if (requestAssemblySnapshot) {
+      this.setAutoRetryResumeState(
+        options,
+        agentInitiated,
+        goalKind,
+        goalId,
+        requestAssemblySnapshot
+      );
     }
 
     // Reset per-stream flags (used for retries / crash-safe bookkeeping).
@@ -6126,6 +6198,7 @@ export class AgentSession {
     this.activeStreamContext = {
       modelString,
       contextBudgetRetried,
+      requestAssemblySnapshot,
       options,
       agentInitiated,
       openaiTruncationModeOverride,
@@ -6355,6 +6428,7 @@ export class AgentSession {
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
       strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
+      requestAssemblySnapshot,
       onStepSettled: this.isTokenBudgetActive(options)
         ? (step) => this.onContextBudgetStepSettled(step)
         : undefined,
@@ -6386,7 +6460,8 @@ export class AgentSession {
             goalKind,
             goalId,
             activeTurnThinkingOverride,
-            true
+            true,
+            rolled.data
           );
         }
         // This row passed send-time admission but never fit the final request.
@@ -6765,7 +6840,10 @@ export class AgentSession {
         context.agentInitiated,
         undefined,
         context.goalKind,
-        context.goalId
+        context.goalId,
+        undefined,
+        context.contextBudgetRetried,
+        context.requestAssemblySnapshot
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -6932,7 +7010,8 @@ export class AgentSession {
           context.goalKind,
           context.goalId,
           undefined,
-          true
+          true,
+          rolled.data
         );
         this.resolveStreamErrorRecoveryDecision(
           data.messageId,

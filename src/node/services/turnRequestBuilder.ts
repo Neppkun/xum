@@ -46,7 +46,8 @@ import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
 import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
-import { agentPluginHookService } from "@/node/services/agentPlugins/hookService";
+import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
+import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import { isRlmModeEnabled } from "@/node/services/branchSummary";
@@ -286,6 +287,8 @@ export interface StreamMessageOptions {
   disableWorkspaceAgents?: boolean;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
   onStepSettled?: OnStepSettled;
+  /** Internal rollover admission contract; never serialized into send options/history. */
+  requestAssemblySnapshot?: RequestAssemblySnapshot;
   muxMetadata?: MuxMessageMetadata;
   openaiTruncationModeOverride?: "auto" | "disabled";
   /**
@@ -785,6 +788,7 @@ export class TurnRequestBuilder {
       disableWorkspaceAgents,
       hasQueuedMessages,
       onStepSettled,
+      requestAssemblySnapshot,
       openaiTruncationModeOverride,
       muxMetadata,
       minThinkingLevel: providedMinThinkingLevel,
@@ -1416,16 +1420,15 @@ export class TurnRequestBuilder {
     // hooks.js modules with the event spine BEFORE request assembly so both
     // request.assemble and tool.execute middleware are in place for this
     // turn. Failure posture: a broken plugin never blocks a send.
-    await agentPluginHookService.ensureWorkspaceHooksForRequest({
-      workspaceId,
-      sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
-      journal: this.dependencies.durableEventJournalFor(workspaceId),
-      enabled: this.dependencies.isAgentPluginsEnabled(),
-      xumHome: this.dependencies.config.rootDir,
-      // Project containers follow the same off-host gating as plugin MCP.
-      projectRoot: agentPluginsMcpContext?.projectRoot,
-      projectTrusted,
-    });
+    if (!requestAssemblySnapshot) {
+      await prepareWorkspaceRequestHooks({
+        config: this.dependencies.config,
+        metadata,
+        hostCheckoutRoot,
+        journal: this.dependencies.durableEventJournalFor(workspaceId),
+        enabled: this.dependencies.isAgentPluginsEnabled(),
+      });
+    }
 
     const listMcpServersStartedAt = Date.now();
     const mcpServers = this.dependencies.bindings.mcpServerManager
@@ -2410,14 +2413,16 @@ export class TurnRequestBuilder {
           attemptSystemTokens = await tokenizer.countTokens(attemptSystem);
         }
 
-        if (eventSpine.hasMiddleware("request.assemble")) {
+        if (requestAssemblySnapshot || eventSpine.hasMiddleware("request.assemble")) {
           const assembleCtx: RequestAssembleContext = {
             workspaceId,
             modelString: seed.rawModelString,
             systemMessage: attemptSystem,
             tools: attemptTools,
           };
-          await eventSpine.run("request.assemble", assembleCtx);
+          // An admitted rollover must never drift back to the live registry, including fallbacks.
+          if (requestAssemblySnapshot) await requestAssemblySnapshot.run(assembleCtx);
+          else await eventSpine.run("request.assemble", assembleCtx);
           attemptTools = assembleCtx.tools;
           if (toolSearchRuntime?.state) {
             attemptTools = rebuildToolSearchState(toolSearchRuntime.state, {

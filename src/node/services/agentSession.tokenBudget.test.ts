@@ -1,3 +1,4 @@
+import { eventSpine } from "./events/eventSpine";
 import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -377,6 +378,192 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(await allRows(h)).toEqual(before);
     expect(h.requests).toHaveLength(0);
   });
+
+  test.each(["global", "workspace", "benign"] as const)(
+    "uncertified %s middleware blocks rollover before cleanup or provider dispatch",
+    async (scope) => {
+      const h = await setup();
+      await seedHistory(h, 110_000);
+      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
+      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      const unregister = eventSpine.useBefore(
+        "request.assemble",
+        (ctx) => {
+          if (scope !== "benign") delete ctx.tools.session_history;
+        },
+        scope === "global" ? undefined : { workspaceId }
+      );
+      try {
+        expect(await h.session.sendMessage("Keep history reachable", options)).toMatchObject({
+          success: false,
+          error: { type: "context_budget_blocked" },
+        });
+        expect(cleanup).not.toHaveBeenCalled();
+        expect(rolloverRows(await allRows(h))).toHaveLength(0);
+        expect(h.requests).toHaveLength(0);
+      } finally {
+        unregister();
+      }
+    }
+  );
+
+  test.each(["empty", "internal-only"] as const)(
+    "uncertified middleware does not block an already fresh %s window",
+    async (contents) => {
+      const h = await setup();
+      await seedRolloverEligibilityState(h, contents);
+      const unregister = eventSpine.useBefore("request.assemble", () => undefined);
+      try {
+        expect((await h.session.sendMessage("x".repeat(350_000), options)).success).toBe(true);
+        expect(h.requests[0].requestAssemblySnapshot).toBeUndefined();
+      } finally {
+        unregister();
+      }
+    }
+  );
+
+  test("middleware explicitly scoped to another workspace does not block rollover", async () => {
+    const h = await setup();
+    await seedHistory(h, 110_000);
+    const unregister = eventSpine.useBefore(
+      "request.assemble",
+      (ctx) => {
+        delete ctx.tools.session_history;
+      },
+      { workspaceId: "other-workspace" }
+    );
+    try {
+      expect((await h.session.sendMessage("Continue safely", options)).success).toBe(true);
+      expect(h.requests[0].requestAssemblySnapshot?.preservesToolset).toBe(true);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    } finally {
+      unregister();
+    }
+  });
+
+  test.each(["cleanup", "append"] as const)(
+    "admitted request snapshot survives registry changes during %s",
+    async (phase) => {
+      const h = await setup();
+      await seedHistory(h, 110_000);
+      const unregisters: Array<() => void> = [];
+      const admitted = eventSpine.useRequestContext(
+        (ctx) => {
+          ctx.systemMessage += " admitted";
+        },
+        { workspaceId }
+      );
+      unregisters.push(admitted);
+      const replaceRegistration = () => {
+        admitted();
+        unregisters.push(
+          eventSpine.useBefore(
+            "request.assemble",
+            (ctx) => {
+              delete ctx.tools.session_history;
+            },
+            { workspaceId }
+          )
+        );
+      };
+      if (phase === "cleanup") {
+        const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
+        const cleanup = session.applyContextResetSideEffects.bind(session);
+        spyOn(session, "applyContextResetSideEffects").mockImplementationOnce(async () => {
+          replaceRegistration();
+          await cleanup();
+        });
+      } else {
+        const append = h.historyService.appendManyToHistory.bind(h.historyService);
+        spyOn(h.historyService, "appendManyToHistory").mockImplementationOnce(async (id, rows) => {
+          replaceRegistration();
+          return append(id, rows);
+        });
+      }
+      try {
+        expect((await h.session.sendMessage("Admitted turn", options)).success).toBe(true);
+        const snapshot = h.requests[0].requestAssemblySnapshot!;
+        const ctx = { workspaceId, modelString: model, systemMessage: "base", tools: {} };
+        await snapshot.run(ctx);
+        expect(ctx.systemMessage).toBe("base admitted");
+        h.session.dispose();
+        const next = await setup({ previous: h });
+        await seedHistory(next, 110_000);
+        expect(await next.session.sendMessage("Next admission", options)).toMatchObject({
+          success: false,
+          error: { type: "context_budget_blocked" },
+        });
+        expect(next.requests).toHaveLength(0);
+      } finally {
+        for (const unregister of unregisters) unregister();
+      }
+    }
+  );
+
+  test("delayed automatic retry retains the admitted snapshot instead of the live registry", async () => {
+    const h = await setup({
+      failure: (attempt) =>
+        attempt === 1 ? { type: "runtime_start_failed", message: "retry startup" } : undefined,
+    });
+    await seedHistory(h, 110_000);
+    const admitted = eventSpine.useRequestContext(
+      (ctx) => {
+        ctx.systemMessage += " admitted";
+      },
+      { workspaceId }
+    );
+    let removeLive: (() => void) | undefined;
+    const session = h.session as unknown as {
+      retryManager: { cancel(): void };
+      retryActiveStream(): Promise<void>;
+    };
+    try {
+      expect((await h.session.sendMessage("Retry this same turn", options)).success).toBe(false);
+      session.retryManager.cancel();
+      const captured = h.requests[0].requestAssemblySnapshot;
+      expect(captured).toBeDefined();
+      admitted();
+      removeLive = eventSpine.useBefore("request.assemble", () => undefined, { workspaceId });
+      await session.retryActiveStream();
+      expect(h.requests).toHaveLength(2);
+      expect(h.requests[1].requestAssemblySnapshot).toBe(captured);
+      expect(rolloverRows(await allRows(h))).toHaveLength(1);
+    } finally {
+      admitted();
+      removeLive?.();
+    }
+  });
+
+  test.each([false, true])(
+    "emergency rollover checks and pins the applicable chain (blocked=%s)",
+    async (blocked) => {
+      const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
+      await seedHistory(h, 20_000);
+      const session = h.session as unknown as { applyContextResetSideEffects(): Promise<void> };
+      const cleanup = spyOn(session, "applyContextResetSideEffects");
+      const unregister = blocked
+        ? eventSpine.useBefore("request.assemble", () => undefined, { workspaceId })
+        : eventSpine.useRequestContext(
+            (ctx) => {
+              ctx.systemMessage += " emergency";
+            },
+            { workspaceId }
+          );
+      try {
+        expect((await h.session.sendMessage("Retry if safe", options)).success).toBe(!blocked);
+        expect(cleanup).toHaveBeenCalledTimes(blocked ? 0 : 1);
+        expect(h.requests).toHaveLength(blocked ? 1 : 2);
+        expect(rolloverRows(await allRows(h))).toHaveLength(blocked ? 0 : 1);
+        if (!blocked) {
+          const ctx = { workspaceId, modelString: model, systemMessage: "base", tools: {} };
+          await h.requests[1].requestAssemblySnapshot!.run(ctx);
+          expect(ctx.systemMessage).toBe("base emergency");
+        }
+      } finally {
+        unregister();
+      }
+    }
+  );
 
   test("on-send rollover appends reset, hidden lead-in, skill snapshot and the original user together", async () => {
     const h = await setup();

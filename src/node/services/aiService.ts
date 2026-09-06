@@ -1,3 +1,5 @@
+import { eventSpine, type RequestAssemblySnapshot } from "./events/eventSpine";
+import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
 import * as fs from "fs/promises";
@@ -489,6 +491,24 @@ export class AIService extends EventEmitter {
    */
   private durableEventJournalFor(workspaceId: string): DurableEventJournal {
     return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
+  }
+
+  /** Reconcile lazy workspace hooks before pinning a rollover's request-assembly contract. */
+  async captureRequestAssemblySnapshot(
+    workspaceId: string
+  ): Promise<Result<RequestAssemblySnapshot, SendMessageError>> {
+    const metadata = await this.getWorkspaceMetadata(workspaceId);
+    if (!metadata.success) return Err({ type: "unknown", raw: metadata.error });
+    const runtimeContext = this.createWorkspaceRuntimeContext(workspaceId, metadata.data);
+    if (!runtimeContext.success) return runtimeContext;
+    await prepareWorkspaceRequestHooks({
+      config: this.config,
+      metadata: metadata.data,
+      hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
+      enabled: this.isAgentPluginsEnabled(),
+      journal: this.durableEventJournalFor(workspaceId),
+    });
+    return Ok(eventSpine.captureRequestAssembly(workspaceId));
   }
 
   isMockModeEnabled(): boolean {

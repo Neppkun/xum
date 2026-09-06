@@ -1,4 +1,4 @@
-import { eventSpine } from "./events/eventSpine";
+import { eventSpine, type RequestAssembleContext } from "./events/eventSpine";
 // Bun test file - doesn't support Jest mocking, so we skip this test for now
 // These tests would need to be rewritten to work with Bun's test runner
 // For now, the commandProcessor tests demonstrate our testing approach
@@ -1476,6 +1476,69 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     expect(harness.streamSystemContextHotMemoriesBlocks).toContain(
       `<hot_memories>${fallbackModel}</hot_memories>`
     );
+  });
+
+  it("uses the admitted snapshot for primary, fallback, and thinking rebuilds without restoring live-denied tools", async () => {
+    using xumHome = new DisposableTempDir("ai-pinned-request-assembly");
+    const sourceModel = KNOWN_MODELS.SONNET.id;
+    const fallbackModel = KNOWN_MODELS.GPT.id;
+    await writeMainConfig(xumHome.path, {
+      modelFallbacks: { [sourceModel]: { models: [fallbackModel] } },
+    });
+    const metadata = createLocalWorkspaceMetadata("pinned-request", xumHome.path);
+    const harness = createHarness(xumHome.path, metadata, {
+      allTools: { session_history: { inputSchema: jsonSchema({ type: "object" }) } },
+      useRequestedModelString: true,
+    });
+    const seenModels: string[] = [];
+    const unregister = eventSpine.useRequestContext(
+      (ctx) => {
+        seenModels.push(ctx.modelString);
+        ctx.systemMessage += "\npinned-context";
+      },
+      { workspaceId: metadata.id }
+    );
+    let removeLive: (() => void) | undefined;
+    try {
+      const captured = await harness.service.captureRequestAssemblySnapshot(metadata.id);
+      expect(captured.success).toBe(true);
+      if (!captured.success) throw new Error("Expected assembly snapshot");
+      expect(harness.getToolsForModelSpy).not.toHaveBeenCalled();
+      unregister();
+      const live = mock((ctx: RequestAssembleContext) => {
+        delete ctx.tools.session_history;
+      });
+      removeLive = eventSpine.useBefore("request.assemble", live, { workspaceId: metadata.id });
+      const request = {
+        messages: [createMuxMessage("user", "user", "continue")],
+        workspaceId: metadata.id,
+        modelString: sourceModel,
+        thinkingLevel: "off" as const,
+      };
+      expect(
+        (
+          await harness.service.streamMessage({
+            ...request,
+            requestAssemblySnapshot: captured.data,
+          })
+        ).success
+      ).toBe(true);
+      const primary = harness.startStreamCalls[0];
+      expect(primary.tools?.session_history).toBeDefined();
+      const rebuilt = await primary.rebuildFirstStepForThinkingLevel!("low", {});
+      expect(JSON.stringify(rebuilt)).toContain("pinned-context");
+      const fallback = await primary.modelFallback!.prepare(fallbackModel);
+      expect(fallback.success).toBe(true);
+      if (fallback.success) expect(fallback.data.tools?.session_history).toBeDefined();
+      expect(seenModels).toEqual([sourceModel, fallbackModel]);
+      expect(live).not.toHaveBeenCalled();
+      expect((await harness.service.streamMessage(request)).success).toBe(true);
+      expect(live).toHaveBeenCalledTimes(1);
+      expect(harness.startStreamCalls[1].tools?.session_history).toBeUndefined();
+    } finally {
+      unregister();
+      removeLive?.();
+    }
   });
 
   it("emits startup breadcrumbs as runtime-status events before stream start", async () => {

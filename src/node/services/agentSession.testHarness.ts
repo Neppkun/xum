@@ -1,3 +1,4 @@
+import { eventSpine } from "./events/eventSpine";
 import { mock } from "bun:test";
 import { EventEmitter } from "events";
 
@@ -87,6 +88,9 @@ function createMockAiService(args?: {
     ),
     getProvidersConfig: mock(() => null),
     isExperimentEnabled: mock((_experimentId) => false),
+    captureRequestAssemblySnapshot: mock((workspaceId: string) =>
+      Promise.resolve(Ok(eventSpine.captureRequestAssembly(workspaceId)))
+    ),
     ...createStreamLifecycleMocks(),
     streamMessage: mock(() =>
       Promise.resolve(Ok(createStartedTurnHandle("test-assistant-message")))

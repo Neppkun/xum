@@ -14,6 +14,8 @@ Use the existing context-usage slider to choose the per-model threshold. The **R
 - Setting the usage threshold to **100%** disables automatic rollover and its warning. Hard request-size checks still apply.
 - `session_history` must be allowed by the agent's inherited tool policy and any caller restrictions. Built-in Exec, Plan, and Explore already allow it. Narrow custom agents can add `session_history` or a matching wildcard to `tools.add`. If access is omitted or disabled, rollover pauses before sealing existing context instead of falling back to a lossy summary.
 
+Rollover also pauses when applicable request middleware can change the toolset, before clearing context state or saving a boundary. Context-only integrations, including sandboxed plugin context hooks, remain supported. Xum pins the workspace's applicable hook registrations when admitting a rollover and uses that snapshot throughout the turn and its fallback attempts; later registration changes apply to subsequent requests. Plugin revocation still takes effect. Hooks explicitly scoped to another workspace do not block rollover. Ordinary requests and manual `/compact` retain their existing middleware behavior.
+
 ## Keeping useful context
 
 Once per window, a machine-authored warning asks the agent to write important context to the conventional `workspace/context-notes.md` file, up to **8 KiB**, if the workspace is writable. This is an opportunity to preserve notes, not a guarantee that the agent writes them. The notes' reserved hot-set slot still requires both **Memory** and **Memory Hot Set**; this experiment does not enable either.
