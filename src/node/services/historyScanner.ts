@@ -34,7 +34,7 @@ const resetTokenPattern = new RegExp(
             .toString(16)
             .padStart(4, "0")
             .replace(/[a-f]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
-          return `(?:${character}|\\\\u${hex})`;
+          return `(?:${character}|\\\\(?:u${hex}|x${hex.slice(2)}))`;
         })
         .join("")
     )
@@ -55,17 +55,22 @@ export function isReadableHistoryMessage(value: unknown): value is MuxMessage {
   );
 }
 
+// Corrupted JSON can contain JS hex escapes; raw and incremental probes must
+// recognize the same reset tokens without making the row provider-readable.
+function decodeResetEscapes(text: string): string {
+  return text.replace(/\\(?:u[\da-fA-F]{4}|x[\da-fA-F]{2})/g, (escape) =>
+    String.fromCharCode(Number.parseInt(escape.slice(2), 16))
+  );
+}
+
 function compactResetProbe(text: string): string {
   // Corruption may insert raw or escaped control separators where JSON permits
   // whitespace. Remove them before retaining overlap, including long runs.
-  return text.replace(/[\s\p{Cc}]/gu, "").replace(/\\u00(?:[0189][\da-f]|20|7f)/gi, "");
+  return text.replace(/[\s\p{Cc}]/gu, "").replace(/\\(?:u00|x)(?:[0189][\da-f]|20|7f)/gi, "");
 }
 
 export function hasRawResetMarker(text: string): boolean {
-  const decoded = compactResetProbe(text).replace(
-    /\\u([\da-fA-F]{4})/g,
-    (_match: string, hex: string) => String.fromCharCode(Number.parseInt(hex, 16))
-  );
+  const decoded = decodeResetEscapes(compactResetProbe(text));
   return decoded.includes(SESSION_HISTORY_RESET_NEEDLE);
 }
 
@@ -377,9 +382,7 @@ export async function scanHistoryFilesBounded(
               reverse ? match.index >= raw.length : match.index + match[0].length <= previousLength
             )
               continue;
-            const token = match[0].replace(/\\u([\da-fA-F]{4})/g, (_match: string, hex: string) =>
-              String.fromCharCode(Number.parseInt(hex, 16))
-            );
+            const token = decodeResetEscapes(match[0]);
             if (token === (reverse ? resetValueToken : resetKeyToken)) {
               if (resetStage === 0) resetStage = 1;
             } else if (token === ":" && resetStage === 1) resetStage = 2;

@@ -5,6 +5,7 @@ import {
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "@/node/services/workspaceRemoval";
 import { createRolloverPrefix } from "@/node/services/contextWindowRollover";
+import { hasRawResetMarker } from "@/node/services/historyScanner";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -1535,6 +1536,64 @@ describe("session_history real disk recovery", () => {
     });
   }
 
+  for (const [name, marker] of [
+    ["value", '"contextBoundaryKind":"res\\x65t"'],
+    ["key", '"\\x63ontextBoundaryKind":"reset"'],
+    ["colon", '"contextBoundaryKind"\\x3a"reset"'],
+    ["quotes", "\\x22contextBoundaryKind\\x22:\\x22reset\\x22"],
+    ["mixed escapes", '\\x22context\\u0042oundaryKind\\x22\\x3A"res\\x65t"'],
+    ["whitespace", '"contextBoundaryKind"\\x20:\\x09"res\\x65t"'],
+  ]) {
+    test(`hex-escaped reset ${name} protects direct/resumed retrieval and raw rewrites`, async () => {
+      await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      expect(first.nextCursor).toBeString();
+      const raw = Buffer.from(
+        `{"id":"hex-reset","role":"assistant","parts":[],"metadata":{${marker}}}\n`
+      );
+      await appendTrackedHistory(chatPath, raw);
+      const current = await append("public", "public facts");
+      const cut = await append("cut", "discarded tail");
+      expect(
+        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
+      ).toBe("stale_cursor");
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+      expect(hasRawResetMarker(raw.toString("utf8"))).toBe(true);
+      expect((await fixture.historyService.updateHistory(workspaceId, current)).success).toBe(true);
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+      expect((await fixture.historyService.truncateAfterMessage(workspaceId, cut.id)).success).toBe(
+        true
+      );
+      expect((await fs.readFile(chatPath)).includes(raw)).toBe(true);
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["public facts"]);
+    });
+  }
+
+  test.each([
+    '"contextBoundaryKinds":"res\\x65t"',
+    '"contextBoundaryKind":"re\\x73ume"',
+    `"contextBoundaryKind":${JSON.stringify(String.raw`res\x65t`)}`,
+  ])("non-reset hex data remains traversable: %s", async (marker) => {
+    const row = `{"id":"not-reset","role":"assistant","parts":[],"metadata":{${marker}}}\n`;
+    await appendTrackedHistory(chatPath, row);
+    expect(hasRawResetMarker(row)).toBe(false);
+    expect(
+      (await pages({ action: "read_item", item_id: "0" }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.text)
+    ).toEqual(["opening facts"]);
+  });
+
   const fragmentedResetMarkers = [
     { name: "after the key", marker: '"contextBoundaryKind"\n:"reset"' },
     { name: "after the colon", marker: '"contextBoundaryKind":\n"reset"' },
@@ -1542,6 +1601,10 @@ describe("session_history real disk recovery", () => {
     {
       name: "with escaped tokens",
       marker: `"${unicodeEscapes("contextBoundaryKind")}"\n:\n"${unicodeEscapes("reset")}"`,
+    },
+    {
+      name: "with hex-escaped fragments",
+      marker: '"\\x63ontextBoundaryKind"\n\\x3A\n"res\\x65t"',
     },
     {
       name: "across a row-budget page",
@@ -1857,7 +1920,33 @@ describe("session_history real disk recovery", () => {
             escape: "\\u003A",
             suffix: '"reset"},"tail":"',
           },
-        ].map((token) => [token.name, token] as const)
+          {
+            name: "hex value",
+            prefix: '","metadata":{"contextBoundaryKind":"res',
+            escape: "\\x65",
+            suffix: 't"},"tail":"',
+          },
+          {
+            name: "hex key",
+            prefix: '","metadata":{"',
+            escape: "\\x63",
+            suffix: 'ontextBoundaryKind":"reset"},"tail":"',
+          },
+          {
+            name: "hex colon",
+            prefix: '","metadata":{"contextBoundaryKind"',
+            escape: "\\x3A",
+            suffix: '"reset"},"tail":"',
+          },
+          {
+            name: "hex quote",
+            prefix: '","metadata":{',
+            escape: "\\x22",
+            suffix: 'contextBoundaryKind":"reset"},"tail":"',
+          },
+        ]
+          .filter((token) => split < token.escape.length)
+          .map((token) => [token.name, token] as const)
       )(
         `escaped reset %s split after byte ${split} across a ${mode} boundary remains private`,
         async (_name, token) => {
@@ -1879,7 +1968,7 @@ describe("session_history real disk recovery", () => {
             "\n";
           const suffix = token.suffix;
           const end = '"}\n' + publicLine;
-          const padding = distance - (6 - split + suffix.length + end.length);
+          const padding = distance - (token.escape.length - split + suffix.length + end.length);
           const row =
             '{"id":"split-reset","role":"assistant","parts":[],"padding":"' +
             "x".repeat(2 * SESSION_HISTORY_MAX_LINE_BYTES) +
