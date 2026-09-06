@@ -295,6 +295,24 @@ export class HistoryAppendProvenance {
         await writeFileAtomic(this.chatPath, replacement);
         published = true;
       } else {
+        const size = Number(before.chat?.size ?? 0);
+        assert(Number.isSafeInteger(size), "chat tail offset must be representable");
+        if (size > 0) {
+          const tailHandle = await fs.open(this.chatPath, "r");
+          try {
+            const tail = Buffer.alloc(1);
+            const read = await tailHandle.read(tail, 0, 1, size - 1);
+            assert(read.bytesRead === 1, "chat tail must remain readable under the history lock");
+            // Failed ordinary appends can leave a partial row. Preserve its raw
+            // evidence, but do not certify a repair as uninterrupted append history.
+            if (tail[0] !== 10) {
+              transaction.certified = false;
+              bytes = Buffer.concat([Buffer.from("\n"), bytes]);
+            }
+          } finally {
+            await tailHandle.close();
+          }
+        }
         await fs.appendFile(this.chatPath, bytes);
         published = true;
         const handle = await fs.open(this.chatPath, "r");

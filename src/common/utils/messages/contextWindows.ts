@@ -28,6 +28,12 @@ const rolloverBoundarySchema = z.object({
   parts: z.tuple([]),
   metadata: z.object({
     contextBoundaryKind: z.literal("reset"),
+    // Rejected capsules, copied tails, and incomplete rows cannot authorize
+    // crossing a manual reset. Other writer-added envelope metadata is allowed.
+    contextBudgetRejected: z.literal(false).optional(),
+    contextBudgetRejectedMessage: z.never().optional(),
+    rlmPreservedTailCopy: z.literal(false).optional(),
+    partial: z.literal(false).optional(),
     muxMetadata: rolloverMetadataSchema,
   }),
 });

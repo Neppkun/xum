@@ -966,6 +966,17 @@ describe("session_history real disk recovery", () => {
       role: "assistant",
       metadata: { contextBoundaryKind: "reset", muxMetadata: { type: "context-window-rollover" } },
     },
+    ...[
+      { contextBudgetRejected: true },
+      { contextBudgetRejected: "damaged" },
+      { contextBudgetRejectedMessage: {} },
+      { rlmPreservedTailCopy: true },
+      { partial: true },
+    ].map((conflict) => ({
+      name: `rollover with conflicting ${Object.keys(conflict)[0]}`,
+      role: "assistant",
+      metadata: { contextBoundaryKind: "reset", muxMetadata: validRollover, ...conflict },
+    })),
     ...Object.keys(validRollover).map((field) => {
       const partial: Record<string, unknown> = { ...validRollover };
       delete partial[field];
@@ -1034,6 +1045,26 @@ describe("session_history real disk recovery", () => {
       ).toBe(false);
     });
   }
+
+  test("genuine persisted rollovers retain their exemption with writer-added envelope metadata", async () => {
+    await append("private-before-genuine", "earlier facts");
+    const [boundary, leadIn] = createRolloverPrefix(validRollover);
+    boundary.metadata = {
+      ...boundary.metadata,
+      model: "openai:gpt-4o",
+      partial: false,
+      rlmPreservedTailCopy: false,
+    };
+    expect(
+      (await fixture.historyService.appendManyToHistory(workspaceId, [boundary, leadIn])).success
+    ).toBe(true);
+    expect((await fs.readFile(chatPath, "utf8")).includes('"workspaceId":')).toBe(true);
+    expect(boundary.metadata?.historySequence).toBeNumber();
+    const found = (await pages({ action: "search", query: "facts" })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(found.map((item) => item.text)).toEqual(["opening facts", "earlier facts"]);
+  });
 
   test("deep parseable reset metadata cannot lose privacy during canonicalization", async () => {
     const resetLine =
@@ -2572,6 +2603,60 @@ describe("session_history real disk recovery", () => {
     expect(found.some((item) => item.text.includes("tool facts"))).toBe(true);
     expect(found.map((item) => item.text)).toContain("later facts");
   });
+
+  test.each([false, true])(
+    "ordinary append retry preserves accepted rows and raw reset privacy (reset: %s)",
+    async (reset) => {
+      await append("earlier", "earlier facts");
+      const originalAppend = fs.appendFile;
+      const torn = reset
+        ? Buffer.concat([
+            Buffer.from('{"metadata":{"contextBoundaryKind" : "reset"},'),
+            Buffer.from([0xff]),
+          ])
+        : Buffer.from('{"id":"failed","role":"user","parts":[');
+      const failed = spyOn(fs, "appendFile").mockImplementationOnce(async (target) => {
+        await originalAppend(target, torn);
+        throw new Error("simulated torn ordinary append");
+      });
+      try {
+        expect(
+          (
+            await fixture.historyService.appendToHistory(
+              workspaceId,
+              createMuxMessage("failed", "user", "failed input")
+            )
+          ).success
+        ).toBe(false);
+      } finally {
+        failed.mockRestore();
+      }
+      const before = await fs.readFile(chatPath);
+      const accepted = createMuxMessage("accepted", "user", "accepted facts");
+      expect((await fixture.historyService.appendToHistory(workspaceId, accepted)).success).toBe(
+        true
+      );
+      await append("accepted-result", "result facts");
+      expect((await fs.readFile(chatPath)).subarray(0, before.length)).toEqual(before);
+      const history = await fixture.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (!history.success) throw new Error(history.error);
+      expect(history.data.map((row) => row.id)).toEqual(
+        reset
+          ? ["accepted", "accepted-result"]
+          : ["first", "earlier", "accepted", "accepted-result"]
+      );
+      expect(
+        (await pages({ action: "search", query: "facts" }))
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(
+        reset
+          ? ["accepted facts", "result facts"]
+          : ["opening facts", "earlier facts", "accepted facts", "result facts"]
+      );
+    }
+  );
 
   test("potential crash replays remain visible without exact duplicate proof", async () => {
     await append("same-one", "identical content");

@@ -1,3 +1,4 @@
+import assert from "node:assert";
 import nodeFs from "node:fs";
 import { afterEach, beforeEach, describe, expect, test, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
@@ -280,6 +281,62 @@ if (!result.success) throw new Error(result.error);
       createMuxMessage("cooperative", "assistant", "later")
     );
     await assertStale(cursor);
+  });
+
+  test("ordinary append retries delimit partial writes and invalidate any torn-tail scan epoch", async () => {
+    const cursor = await startCursor();
+    const append = fs.appendFile;
+    const failure = spyOn(fs, "appendFile").mockImplementationOnce(
+      async (target, data, options) => {
+        expect(Buffer.isBuffer(data)).toBe(true);
+        assert(Buffer.isBuffer(data));
+        await append(target, data.subarray(0, data.length - 3), options);
+        throw new Error("partial append failure");
+      }
+    );
+    try {
+      const failed = await fixture.historyService.appendToHistory(
+        ws,
+        createMuxMessage("failed", "user", "failed input")
+      );
+      expect(failed.success).toBe(false);
+      if (!failed.success) expect(failed.error).toContain("partial append failure");
+      expect(failure).toHaveBeenCalledTimes(1);
+    } finally {
+      failure.mockRestore();
+    }
+    await assertStale(cursor);
+    const afterFailure = await startCursor();
+    const before = await fs.readFile(store.chatPath);
+    expect(before.at(-1)).not.toBe(10);
+    expect(
+      (
+        await fixture.historyService.appendToHistory(
+          ws,
+          createMuxMessage("accepted", "user", "accepted retry")
+        )
+      ).success
+    ).toBe(true);
+    expect(
+      (
+        await fixture.historyService.appendToHistory(
+          ws,
+          createMuxMessage("result", "assistant", "accepted result")
+        )
+      ).success
+    ).toBe(true);
+    expect((await fs.readFile(store.chatPath)).subarray(0, before.length)).toEqual(before);
+    await assertStale(afterFailure);
+    const rows = await fixture.historyService.getHistoryFromLatestBoundary(ws);
+    expect(rows.success).toBe(true);
+    if (!rows.success) throw new Error(rows.error);
+    expect(rows.data.map((row) => row.id)).toEqual([
+      "row-0",
+      "row-1",
+      "row-2",
+      "accepted",
+      "result",
+    ]);
   });
 
   test("atomic batches preserve corrupt UTF-8 bytes but invalidate torn-tail repair", async () => {
