@@ -7,6 +7,7 @@ import * as path from "path";
 import { Config } from "@/node/config";
 
 import type { ORPCContext } from "./context";
+import { inFlightProcedureCount } from "./inFlightProcedures";
 import { router } from "./router";
 
 describe("router agent skill routes", () => {
@@ -262,5 +263,33 @@ describe("router config transcript mutation", () => {
     }
     expect(error).toBeInstanceOf(ORPCError);
     expect((error as ORPCError<string, unknown>).code).toBe("SERVICE_UNAVAILABLE");
+  });
+
+  test("an aborted config mutation stays in flight until its write settles", async () => {
+    let started!: () => void;
+    const writeStarted = new Promise<void>((resolve) => (started = resolve));
+    let finish!: () => void;
+    const write = new Promise<void>((resolve) => (finish = resolve));
+    const context = {
+      config: {
+        markSplashScreenViewed: () => {
+          started();
+          return write;
+        },
+      },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+    const controller = new AbortController();
+    const call = client.splashScreens
+      .markSplashScreenViewed({ splashId: "late" }, { signal: controller.signal })
+      .catch((error: unknown) => error);
+    await writeStarted;
+    expect(inFlightProcedureCount()).toBe(1);
+    controller.abort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(inFlightProcedureCount()).toBe(1);
+    finish();
+    await call;
+    expect(inFlightProcedureCount()).toBe(0);
   });
 });

@@ -28,13 +28,18 @@ export async function trackInFlightProcedure<T>(
   }
 }
 
-// Optional because unit tests assemble partial contexts without a ServerService.
+// oRPC applies builder middlewares at both the router and the procedure level (1.14 dropped the
+// leading-middleware dedupe), so the first pass marks the context and the second pass is a no-op.
+const TRACKED = "inFlight/tracked";
+
+// serverService is optional because unit tests assemble partial contexts without one.
 export const inFlightProcedureMiddleware = os
-  .$context<{ serverService?: Pick<ServerService, "isShuttingDown"> }>()
+  .$context<{ serverService?: Pick<ServerService, "isShuttingDown">; [TRACKED]?: true }>()
   .middleware(async ({ context, path, next }) => {
+    if (context[TRACKED]) return await next();
     return await trackInFlightProcedure(
       path,
       () => !context.serverService?.isShuttingDown(),
-      async () => next()
+      async () => next({ context: { [TRACKED]: true } })
     );
   });

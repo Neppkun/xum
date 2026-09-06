@@ -327,6 +327,31 @@ describe("server updater", () => {
     await Promise.all([updater.installUpdate(), updater.installUpdate()]);
     expect(events).toEqual(["refresh", "snapshot", "activate", "restart"]);
   });
+  test("a shutdown that begins while blockers refresh never activates the update", async () => {
+    const { layout } = await fixture();
+    const events: string[] = [];
+    let releaseRefresh!: () => void;
+    const updater = new ServerUpdater({ supported: true, layout }, undefined, {
+      refreshBlockers: () => new Promise<void>((resolve) => (releaseRefresh = resolve)),
+      collectBlockers: () => [],
+      restart: () => {
+        events.push("restart");
+        return Promise.resolve();
+      },
+      fetchDistTags: () => Promise.resolve({ next: "2.0.0" }),
+      runInstall: () => Promise.resolve("/staged"),
+      activate: () => {
+        events.push("activate");
+      },
+    });
+    await updater.checkForUpdates();
+    await updater.downloadUpdate();
+    const install = updater.installUpdate();
+    await updater.beginShutdown();
+    releaseRefresh();
+    await install;
+    expect(events).toEqual([]);
+  });
   test("shutdown aborts a pending stage and waits for it to settle", async () => {
     const { layout } = await fixture();
     let observed: AbortSignal | undefined;

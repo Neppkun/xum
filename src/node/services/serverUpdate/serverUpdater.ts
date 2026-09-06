@@ -164,6 +164,12 @@ export class ServerUpdater {
     this.installing = true;
     try {
       await this.deps.refreshBlockers?.();
+      // An unrelated teardown (SIGTERM) may have begun during the refresh; it must not inherit
+      // the launcher swap.
+      if (this.shuttingDown) {
+        this.installing = false;
+        return;
+      }
       const blockers = this.deps.collectBlockers();
       if (blockers.length) {
         this.installing = false;
