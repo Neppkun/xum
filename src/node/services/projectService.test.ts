@@ -2309,6 +2309,28 @@ exit 1
       expect(afterClear.projects.get(secondPath)?.codexOauthAccountId).toBe("work");
     });
 
+    it.each(["work", null])(
+      "rejects an unpersisted Codex account selection: %s",
+      async (accountId) => {
+        const projectPath = path.join(tempDir, "write-failure");
+        await config.editConfig((current) => {
+          current.projects.set(projectPath, { workspaces: [], codexOauthAccountId: "personal" });
+          return current;
+        });
+        // Config can complete the transform without persisting its result.
+        spyOn(config, "editConfig").mockImplementationOnce((transform) => {
+          transform(config.loadConfigOrDefault());
+          return Promise.resolve();
+        });
+
+        const result = await service.setCodexOauthAccount(projectPath, accountId);
+        expect(result.success).toBe(false);
+        expect(config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId).toBe(
+          "personal"
+        );
+      }
+    );
+
     it("rejects a Codex account override for an unknown project", async () => {
       const missing = path.join(tempDir, "missing");
       const result = await service.setCodexOauthAccount(missing, "work");

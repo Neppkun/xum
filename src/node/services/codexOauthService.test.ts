@@ -1332,6 +1332,31 @@ describe("CodexOauthService", () => {
       };
     }
 
+    it.each(["default", "work"])(
+      "reconnects a %s credential with a malformed durable ID",
+      async (accountId) => {
+        const auth = expiredAuth({ credentialId: "damaged-id" });
+        deps.providersConfig = {
+          openai:
+            accountId === "default"
+              ? { codexOauth: auth }
+              : { codexOauthAccounts: { work: { label: "Work", auth } } },
+        };
+        deviceFetch();
+        const flow = await service.startDeviceFlow({ accountId });
+        if (!flow.success) throw new Error(flow.error);
+        const stamped = getCodexOauthAuth(deps.providersConfig.openai, accountId);
+        expect(stamped?.credentialId).toBeDefined();
+        expect(stamped?.credentialId).not.toBe(auth.credentialId);
+        expect(await service.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+        const reconnected = await service.getValidAuth(accountId);
+        expect(reconnected.success).toBe(true);
+        if (reconnected.success) {
+          expect(reconnected.data.credentialId).not.toBe(stamped?.credentialId);
+        }
+      }
+    );
+
     it("reconnects a marked legacy credential that has no durable ID", async () => {
       deps.providersConfig = {
         openai: {

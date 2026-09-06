@@ -51,13 +51,18 @@ describe("parseCodexOauthAuth", () => {
     expect(result).toEqual(input);
   });
 
-  it("accepts missing login IDs but rejects malformed IDs", () => {
-    const auth = { type: "oauth", access: "access", refresh: "refresh", expires: 1000 };
+  it("preserves credentials with missing or malformed login IDs", () => {
+    const auth = { type: "oauth" as const, access: "access", refresh: "refresh", expires: 1000 };
     expect(parseCodexOauthAuth(auth)).not.toBeNull();
     const credentialId = "1c9c50b0-d777-4dd2-998c-09c156ba9754";
     expect(parseCodexOauthAuth({ ...auth, credentialId })?.credentialId).toBe(credentialId);
     for (const invalid of [null, "", "not-a-uuid", 42]) {
-      expect(parseCodexOauthAuth({ ...auth, credentialId: invalid })).toBeNull();
+      const stored = { ...auth, credentialId: invalid };
+      expect(parseCodexOauthAuth(stored)).toEqual(auth);
+      expect(
+        getCodexOauthAccounts({ codexOauthAccounts: { work: { label: "Work", auth: stored } } })
+      ).toHaveLength(1);
+      expect(stored.credentialId).toBe(invalid);
     }
   });
 

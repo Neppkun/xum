@@ -62,7 +62,6 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
     if (typeof accountId !== "string" || !accountId) return null;
   }
 
-  if (!credentialId.success) return null;
   if (invalidReason !== undefined && invalidReason !== "invalid_grant") return null;
 
   return {
@@ -71,7 +70,8 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
     refresh,
     expires,
     accountId,
-    credentialId: credentialId.data,
+    // Treat a damaged optional ID as legacy state so reconnect can assign a valid ID.
+    credentialId: credentialId.success ? credentialId.data : undefined,
     invalidReason,
   };
 }

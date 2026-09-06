@@ -1999,21 +1999,23 @@ export class ProjectService {
   async setCodexOauthAccount(projectPath: string, accountId: string | null): Promise<Result<void>> {
     const normalizedPath = stripTrailingSlashes(projectPath);
     try {
-      let result: Result<void> = Err(`Project not found: ${normalizedPath}`);
       // Edit fresh state so concurrent project settings remain intact.
       await this.config.editConfig((config) => {
         const project = config.projects.get(normalizedPath);
-        if (project) {
-          if (accountId === null) {
-            delete project.codexOauthAccountId;
-          } else {
-            project.codexOauthAccountId = accountId;
-          }
-          result = Ok(undefined);
+        if (!project) throw new Error(`Project not found: ${normalizedPath}`);
+        if (accountId === null) {
+          delete project.codexOauthAccountId;
+        } else {
+          project.codexOauthAccountId = accountId;
         }
         return config;
       });
-      return result;
+      // Config swallows write failures. Verify the billing selection before reporting success.
+      const persisted = this.config.loadConfigOrDefault().projects.get(normalizedPath);
+      if (!persisted || persisted.codexOauthAccountId !== (accountId ?? undefined)) {
+        return Err(`Failed to persist Codex account selection for ${normalizedPath}`);
+      }
+      return Ok(undefined);
     } catch (error) {
       return Err(`Failed to set Codex account for ${normalizedPath}: ${getErrorMessage(error)}`);
     }
