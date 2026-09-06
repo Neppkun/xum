@@ -165,7 +165,10 @@ import type {
 import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
-import { hasCodexOauthTokens } from "@/common/utils/providers/codexOauthRouting";
+import {
+  getCodexOauthProjectPath,
+  hasCodexOauthTokens,
+} from "@/common/utils/providers/codexOauthRouting";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -492,7 +495,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   );
 
   const { open } = useSettings();
-  const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
+  const { selectedWorkspace, workspaceMetadata, beginWorkspaceCreation } = useWorkspaceContext();
   const { agentId, currentAgent, agents } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
@@ -601,8 +604,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const usage = useWorkspaceUsage(workspaceIdForUsage);
   const { has1MContext } = useProviderOptions();
   const { config: providersConfig } = useProvidersConfig();
-  const accountProjectPath =
-    variant === "creation" ? creationParentProjectPath : selectedWorkspace?.projectPath;
+  const accountProjectPath = getCodexOauthProjectPath(
+    variant === "creation"
+      ? { projectPath: creationParentProjectPath, subProjectPath: creationSubProjectPath }
+      : (workspaceMetadata.get(props.workspaceId) ??
+          (selectedWorkspace?.workspaceId === props.workspaceId ? selectedWorkspace : undefined))
+  );
   const codexOauthAccountId = accountProjectPath
     ? getProjectConfig(accountProjectPath)?.codexOauthAccountId
     : undefined;

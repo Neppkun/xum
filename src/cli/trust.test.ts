@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
 import {
@@ -152,6 +152,41 @@ describe("xum trust CLI", () => {
       target.loadConfigOrDefault().projects.get(cliProject)?.codexOauthAccountId
     ).toBeUndefined();
   });
+
+  test.each(["work", undefined])(
+    "rejects a lost account selection write: %s",
+    async (accountId) => {
+      using tmp = new DisposableTempDir("codex-account-write-failure");
+      const real = new Config(path.join(tmp.path, "real"));
+      const target = new Config(path.join(tmp.path, "target"));
+      const projectPath = path.join(tmp.path, "project");
+      await real.editConfig((config) => {
+        config.projects.set(projectPath, { workspaces: [], codexOauthAccountId: accountId });
+        return config;
+      });
+      await target.editConfig((config) => {
+        config.projects.set(projectPath, { workspaces: [], codexOauthAccountId: "personal" });
+        return config;
+      });
+      // Simulate a config edit that reports success without writing the selection.
+      const edit = spyOn(target, "editConfig").mockResolvedValue(undefined);
+      try {
+        let error: unknown;
+        try {
+          await materializeCodexOauthAccount(real, target, projectPath, projectPath);
+        } catch (caught) {
+          error = caught;
+        }
+        expect(error).toBeInstanceOf(Error);
+        expect(String(error)).toContain("Failed to persist Codex OAuth account");
+        expect(target.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId).toBe(
+          "personal"
+        );
+      } finally {
+        edit.mockRestore();
+      }
+    }
+  );
 
   test("replaceRunTrustProjects rebuilds config without foreign settings", async () => {
     using tmp = new DisposableTempDir("trust-replace-run");

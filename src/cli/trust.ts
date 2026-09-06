@@ -221,6 +221,11 @@ export async function materializeCodexOauthAccount(
     config.projects.set(targetProjectPath, project);
     return config;
   });
+  // Config.saveConfig swallows write errors. Never send with an unintended account.
+  const persistedProject = targetConfig.loadConfigOrDefault().projects.get(targetProjectPath);
+  if (!persistedProject || persistedProject.codexOauthAccountId !== accountId) {
+    throw new Error(`Failed to persist Codex OAuth account for ${targetProjectPath}`);
+  }
 }
 
 /**

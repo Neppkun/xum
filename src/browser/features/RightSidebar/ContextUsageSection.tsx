@@ -1,4 +1,5 @@
 import React from "react";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
@@ -37,7 +38,7 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
   const { config: providersConfig } = useProvidersConfig();
   const { getProjectConfig } = useProjectContext();
   const { workspaceMetadata } = useWorkspaceContext();
-  const projectPath = workspaceMetadata.get(workspaceId)?.projectPath;
+  const projectPath = getCodexOauthProjectPath(workspaceMetadata.get(workspaceId));
   const codexOauthAccountId = projectPath
     ? getProjectConfig(projectPath)?.codexOauthAccountId
     : undefined;

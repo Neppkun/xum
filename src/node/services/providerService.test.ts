@@ -2146,6 +2146,59 @@ describe("ProviderService.updateConfigValue", () => {
   });
 });
 
+describe("ProviderService.updateProviderSection policy", () => {
+  it("denies user section writes but preserves internal mutation behavior", async () => {
+    await withTempPolicyProviderService(
+      { policy_format_version: "0.1", provider_access: [{ id: "anthropic" }] },
+      async (config, service) => {
+        const denied = await service.updateProviderSection(
+          "openai",
+          () => ({ value: { codexOauthDefaultAccountId: "work" } }),
+          { enforcePolicy: true }
+        );
+        expect(denied.success).toBe(false);
+        expect(
+          new ProvidersConfigStore(config.rootDir).loadProvidersConfig()?.openai
+        ).toBeUndefined();
+        const internal = await service.updateProviderSection("openai", () => ({
+          value: { codexOauthDefaultAccountId: "work" },
+        }));
+        expect(internal).toEqual({ success: true, data: { applied: true } });
+      }
+    );
+  });
+
+  it("allows unchanged locked URLs but rejects section writes that change them", async () => {
+    await withTempPolicyProviderService(
+      {
+        policy_format_version: "0.1",
+        provider_access: [{ id: "openai", base_url: "https://locked.example.com" }],
+      },
+      async (config, service) => {
+        const store = new ProvidersConfigStore(config.rootDir);
+        store.saveProvidersConfig({
+          openai: { baseUrl: "https://old.example.com", apiKey: "keep-key" },
+        });
+        expect(
+          await service.updateProviderSection(
+            "openai",
+            (section) => ({ value: { ...section, codexOauthDefaultAccountId: "work" } }),
+            { enforcePolicy: true }
+          )
+        ).toEqual({ success: true, data: { applied: true } });
+        const before = store.loadProvidersConfig()?.openai;
+        const denied = await service.updateProviderSection(
+          "openai",
+          (section) => ({ value: { ...section, baseUrl: "https://new.example.com" } }),
+          { enforcePolicy: true }
+        );
+        expect(denied.success).toBe(false);
+        expect(store.loadProvidersConfig()?.openai).toEqual(before);
+      }
+    );
+  });
+});
+
 describe("ProviderService gateway lifecycle", () => {
   it("auto-inserts gateway into routePriority when configured", async () => {
     await withTempConfigAsync(async (config, service) => {

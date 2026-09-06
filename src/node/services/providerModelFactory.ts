@@ -29,6 +29,7 @@ import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
   customProviderWireOrigin,
@@ -1210,13 +1211,7 @@ export class ProviderModelFactory {
       return opts.codexOauthSelection;
     }
     const workspace = opts?.workspaceId ? this.config.findWorkspace(opts.workspaceId) : null;
-    // Multi-project attribution wins. Single-project workspaces use their registered subproject.
-    const projectPath =
-      workspace?.projects?.[0]?.projectPath ??
-      workspace?.subProjectPath ??
-      workspace?.attributionProjectPath ??
-      workspace?.projectPath ??
-      opts?.projectPath;
+    const projectPath = getCodexOauthProjectPath(workspace) ?? opts?.projectPath;
     const projectAccountId = projectPath
       ? this.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
       : undefined;

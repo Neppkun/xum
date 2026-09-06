@@ -281,6 +281,17 @@ describe("Codex OAuth account slots", () => {
     expect(getCodexOauthAccountId(config, "missing")).toBe("missing");
   });
 
+  it("excludes stored IDs that cannot pass account mutation validation", () => {
+    const invalidIds = ["", "__proto__", "constructor", "prototype", "../bad", "x".repeat(201)];
+    const accounts = Object.fromEntries(
+      invalidIds.map((id) => [id, { label: "Invalid", auth: work }])
+    );
+    const config = { codexOauthAccounts: { ...accounts, work: { label: "Work", auth: work } } };
+    expect(getCodexOauthAccounts(config).map((account) => account.id)).toEqual(["work"]);
+    for (const id of invalidIds) expect(getCodexOauthAuth(config, id)).toBeNull();
+    expect(getCodexOauthAuth({ ...config, codexOauthDefaultAccountId: "../bad" })).toBeNull();
+  });
+
   it("filters malformed slots without accepting a duplicate legacy slot", () => {
     const config = {
       codexOauth: legacy,

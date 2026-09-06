@@ -2,11 +2,15 @@ import { Config, FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 
 import { Err, Ok } from "@/common/types/result";
 import { Effect } from "effect";
-import { getCodexOauthAccounts, getCodexOauthAuth } from "@/node/utils/codexOauthAuth";
+import {
+  getCodexOauthAccounts,
+  getCodexOauthAccountId,
+  getCodexOauthAuth,
+} from "@/node/utils/codexOauthAuth";
 import { createDeferred } from "@/node/utils/oauthUtils";
 import {
   CODEX_OAUTH_TOKEN_URL,
@@ -87,7 +91,7 @@ function createMockProvidersConfigStore(
 
 function createMockProviderService(
   deps: MockDeps
-): Pick<ProviderService, "setConfigValue" | "updateConfigValue"> {
+): Pick<ProviderService, "setConfigValue" | "updateConfigValue" | "updateProviderSection"> {
   const setConfigValue: ProviderService["setConfigValue"] = (provider, keyPath, value) => {
     deps.setConfigValueCalls.push({ provider, keyPath, value });
     deps.providersConfig[provider] ??= {};
@@ -103,6 +107,16 @@ function createMockProviderService(
   };
   return {
     setConfigValue,
+    updateProviderSection: (provider, update, options) => {
+      if (options?.enforcePolicy && deps.policyDenied)
+        return Promise.resolve(Err("Provider edits are disabled"));
+      const next = update(deps.providersConfig[provider]);
+      deps.onUpdate?.();
+      if (!next) return Promise.resolve(Ok({ applied: false }));
+      deps.providersConfig[provider] = next.value;
+      deps.setConfigValueCalls.push({ provider, keyPath: [], value: next.value });
+      return Promise.resolve(Ok({ applied: true }));
+    },
     updateConfigValue: async (provider, keyPath, update, options) => {
       if (options?.enforcePolicy && deps.policyDenied) return Err("Provider edits are disabled");
       let current: unknown = deps.providersConfig[provider];
@@ -986,6 +1000,102 @@ describe("CodexOauthService", () => {
       expect((await service.waitForDeviceFlow(first.data.flowId)).success).toBe(false);
       expect(await service.waitForDeviceFlow(second.data.flowId)).toEqual(Ok(undefined));
       expect(getCodexOauthAuth(deps.providersConfig.openai)?.access).toBe("access-device-2");
+    });
+
+    it("completes a reconnect after a concurrent refresh persists first", async () => {
+      deps.providersConfig = {
+        openai: {
+          codexOauthAccounts: { work: { label: "Work", auth: expiredAuth({ refresh: "old" }) } },
+        },
+      };
+      const refreshStarted = createDeferred<void>();
+      const refreshResponse = createDeferred<Response>();
+      const exchangeStarted = createDeferred<void>();
+      const exchangeResponse = createDeferred<Response>();
+      deviceFetch((init) => {
+        if (new URLSearchParams(requestBody(init)).get("grant_type") === "refresh_token") {
+          refreshStarted.resolve(undefined);
+          return refreshResponse.promise;
+        }
+        exchangeStarted.resolve(undefined);
+        return exchangeResponse.promise;
+      });
+      const refresh = service.getValidAuth("work");
+      await refreshStarted.promise;
+      const flow = await service.startDeviceFlow({ accountId: "work" });
+      if (!flow.success) throw new Error(flow.error);
+      const reconnect = service.waitForDeviceFlow(flow.data.flowId);
+      await exchangeStarted.promise;
+      refreshResponse.resolve(
+        mockRefreshResponse({
+          access_token: "refreshed",
+          refresh_token: "rotated",
+          expires_in: 3600,
+        })
+      );
+      expect((await refresh).success).toBe(true);
+      exchangeResponse.resolve(
+        mockRefreshResponse({
+          access_token: "reconnected",
+          refresh_token: "new-login",
+          expires_in: 3600,
+        })
+      );
+      expect(await reconnect).toEqual(Ok(undefined));
+      expect(getCodexOauthAuth(deps.providersConfig.openai, "work")?.refresh).toBe("new-login");
+    });
+
+    it.each([{ accounts: [] }, { accounts: null }, { accounts: 42 }])(
+      "repairs a malformed account map during named login: %j",
+      async ({ accounts }) => {
+        const provider = new ProviderService(new Config(deps.rootDir));
+        const store = provider.providersConfigStore;
+        store.saveProvidersConfig({ openai: { codexOauthAccounts: accounts, apiKey: "keep-key" } });
+        const realService = new CodexOauthService(store, provider);
+        deviceFetch();
+        try {
+          const flow = await realService.startDeviceFlow({ label: "Work" });
+          if (!flow.success) throw new Error(flow.error);
+          expect(await realService.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+          const openai = store.loadProvidersConfig()?.openai;
+          const connected = getCodexOauthAccounts(openai);
+          expect(connected).toHaveLength(1);
+          expect(getCodexOauthAccountId(openai)).toBe(connected[0].id);
+          expect(openai?.apiKey).toBe("keep-key");
+        } finally {
+          await realService.dispose();
+        }
+      }
+    );
+
+    it("does not leave a partial first login when saving the selected account fails", async () => {
+      const provider = new ProviderService(new Config(deps.rootDir));
+      const store = provider.providersConfigStore;
+      store.saveProvidersConfig({ openai: { apiKey: "keep-key" } });
+      const save = store.saveProvidersConfig.bind(store);
+      const saveSpy = spyOn(store, "saveProvidersConfig").mockImplementation((config) => {
+        // Fail the write that makes the new account the selected account.
+        const openai = config.openai;
+        if (
+          getCodexOauthAccounts(openai).some(
+            (account) => account.id === getCodexOauthAccountId(openai)
+          )
+        ) {
+          throw new Error("Disk unavailable");
+        }
+        save(config);
+      });
+      const realService = new CodexOauthService(store, provider);
+      deviceFetch();
+      try {
+        const flow = await realService.startDeviceFlow({ label: "Work" });
+        if (!flow.success) throw new Error(flow.error);
+        expect((await realService.waitForDeviceFlow(flow.data.flowId)).success).toBe(false);
+        expect(store.loadProvidersConfig()?.openai).toEqual({ apiKey: "keep-key" });
+      } finally {
+        saveSpy.mockRestore();
+        await realService.dispose();
+      }
     });
 
     it("keeps a successful reconnect when an older refresh completes", async () => {

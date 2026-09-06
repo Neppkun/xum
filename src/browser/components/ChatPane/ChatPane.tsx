@@ -8,6 +8,7 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
@@ -469,7 +470,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     activeBashMonitorCount,
   } = workspaceState;
   const { getProjectConfig } = useProjectContext();
-  const codexOauthAccountId = getProjectConfig(projectPath)?.codexOauthAccountId;
+  const accountProjectPath = getCodexOauthProjectPath(meta ?? { projectPath });
+  const codexOauthAccountId = accountProjectPath
+    ? getProjectConfig(accountProjectPath)?.codexOauthAccountId
+    : undefined;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
   const shouldRenderLoadOlderMessagesButton = hasOlderHistory && !isPixelSnapshotEnvironment();

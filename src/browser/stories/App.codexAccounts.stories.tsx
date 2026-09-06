@@ -1,11 +1,17 @@
 import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
-import { expandLeftSidebar, selectWorkspace } from "./helpers/uiState";
+import {
+  collapseLeftSidebar,
+  expandLeftSidebar,
+  expandProjects,
+  selectWorkspace,
+} from "./helpers/uiState";
 import { createMockORPCClient } from "./mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import type { APIClient } from "@/browser/contexts/API";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 
 export default { ...appMeta, title: "App/CodexAccounts" };
 
@@ -258,6 +264,100 @@ export const LoginFailureAndCancel: AppStory = {
     await expect(controls.queryByRole("alert")).toBeNull();
     await expect(controls.getAllByRole("listitem")).toHaveLength(2);
     section.scrollIntoView({ block: "start" });
+  },
+};
+
+function setupScopedAccount(kind: "subproject" | "multi" | "creation") {
+  const root = "/projects/account-root";
+  const subproject = root + "/sub";
+  const workspace = createWorkspace({
+    id: "scoped-account",
+    name: "main",
+    projectName: "account-root",
+    projectPath: root,
+  });
+  if (kind === "subproject") workspace.subProjectPath = subproject;
+  if (kind === "multi") {
+    workspace.projectPath = MULTI_PROJECT_CONFIG_KEY;
+    workspace.projects = [
+      { projectPath: subproject, projectName: "sub" },
+      { projectPath: root, projectName: "account-root" },
+    ];
+  }
+  selectWorkspace(workspace);
+  if (kind === "creation") {
+    expandLeftSidebar();
+    expandProjects([root, subproject]);
+  } else {
+    collapseLeftSidebar();
+  }
+  const projects = groupWorkspacesByProject([workspace]);
+  projects.set(root, {
+    ...projects.get(root),
+    codexOauthAccountId: "default",
+    workspaces: projects.get(root)?.workspaces ?? [],
+  });
+  projects.set(subproject, {
+    parentProjectPath: root,
+    codexOauthAccountId: "deleted",
+    workspaces: [],
+  });
+  return createMockORPCClient({
+    projects,
+    workspaces: [workspace],
+    agentAiDefaults: {
+      exec: { modelString: "openai:gpt-5.3-codex-spark" },
+      plan: { modelString: "openai:gpt-5.3-codex-spark" },
+    },
+    providersList: ["openai"],
+    providersConfig: {
+      openai: {
+        apiKeySet: true,
+        isConfigured: true,
+        isEnabled: true,
+        codexOauthSet: true,
+        codexOauthAccounts: [{ id: "default", label: "Personal" }],
+      },
+    },
+  });
+}
+
+async function checkScopedAccountWarning(canvasElement: HTMLElement) {
+  const warning = await within(canvasElement).findByTestId(
+    "codex-oauth-warning-banner",
+    {},
+    { timeout: 10000 }
+  );
+  await waitFor(() => expect(warning).toBeVisible());
+  if (window.innerWidth < 768) {
+    await expect(warning.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+  }
+}
+
+export const SubprojectRouting: AppStory = {
+  render: () => <AppWithMocks setup={() => setupScopedAccount("subproject")} />,
+  play: async ({ canvasElement }) => checkScopedAccountWarning(canvasElement),
+};
+
+export const MultiProjectRouting: AppStory = {
+  render: () => <AppWithMocks setup={() => setupScopedAccount("multi")} />,
+  play: SubprojectRouting.play,
+};
+
+export const SubprojectRoutingPhone: AppStory = {
+  ...SubprojectRouting,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark"], viewports: ["phone"] } } },
+};
+
+export const CreationSubprojectRouting: AppStory = {
+  render: () => <AppWithMocks setup={() => setupScopedAccount("creation")} />,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(
+      await canvas.findByRole("button", { name: "New chat in sub-project" }, { timeout: 10000 })
+    );
+    await checkScopedAccountWarning(canvasElement);
   },
 };
 

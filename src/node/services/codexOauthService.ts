@@ -27,10 +27,7 @@ import {
 } from "@/common/constants/codexOAuth";
 import {
   CODEX_OAUTH_DEFAULT_ACCOUNT_ID,
-  CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH,
   CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH,
-  CODEX_OAUTH_ACCOUNT_ID_PATTERN,
-  CODEX_OAUTH_RESERVED_ACCOUNT_IDS,
   CODEX_OAUTH_REFRESH_TIMEOUT_MS,
 } from "@/common/constants/codexOauthAccounts";
 import { FileLeaseManager, type ProvidersConfigStore } from "@/node/config";
@@ -45,6 +42,7 @@ import {
   getCodexOauthAccountId,
   getCodexOauthAuth,
   isCodexOauthAuthExpired,
+  isValidCodexOauthAccountId,
   parseCodexOauthAuth,
   type CodexOauthAuth,
 } from "@/node/utils/codexOauthAuth";
@@ -65,7 +63,6 @@ export interface CodexOauthLoginOptions {
 interface AccountSelection {
   accountId: string;
   revision: number;
-  loginAttempt?: number;
   auth: CodexOauthAuth | null;
   label?: string;
   selectAsDefault: boolean;
@@ -144,14 +141,6 @@ export class CodexOauthError extends Schema.TaggedError<CodexOauthError>()("Code
   reason: Schema.String,
 }) {}
 
-function isValidAccountId(accountId: string): boolean {
-  return (
-    accountId.length <= CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH &&
-    CODEX_OAUTH_ACCOUNT_ID_PATTERN.test(accountId) &&
-    !CODEX_OAUTH_RESERVED_ACCOUNT_IDS.has(accountId)
-  );
-}
-
 function isValidLabel(label: string): boolean {
   return label.trim().length > 0 && label.trim().length <= CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH;
 }
@@ -172,7 +161,8 @@ export class CodexOauthService {
 
   private readonly refreshMutexes = new Map<string, AsyncMutex>();
   private readonly accountRevisions = new Map<string, number>();
-  private readonly loginAttempts = new Map<string, number>();
+  private readonly loginSelections = new Map<string, AccountSelection>();
+  private readonly authMutationMutexes = new Map<string, AsyncMutex>();
 
   constructor(
     private readonly providersConfigStore: ProvidersConfigStore,
@@ -190,7 +180,7 @@ export class CodexOauthService {
     accountId = CODEX_OAUTH_DEFAULT_ACCOUNT_ID
   ): Effect.Effect<Result<void, string>> {
     return Effect.suspend(() => {
-      if (!isValidAccountId(accountId))
+      if (!isValidCodexOauthAccountId(accountId))
         return Effect.succeed(Err("Invalid Codex OAuth account ID"));
       // Invalidate pending refreshes and logins before clearing this slot.
       this.accountRevisions.set(accountId, this.getAccountRevision(accountId) + 1);
@@ -206,7 +196,7 @@ export class CodexOauthService {
 
   setDefaultAccountEffect(accountId: string): Effect.Effect<Result<void, string>> {
     return Effect.suspend(() => {
-      if (!isValidAccountId(accountId))
+      if (!isValidCodexOauthAccountId(accountId))
         return Effect.succeed(Err("Invalid Codex OAuth account ID"));
       return this.updateConfigValueEffect(["codexOauthDefaultAccountId"], () =>
         this.readStoredAuth(accountId) ? { value: accountId } : null
@@ -220,7 +210,7 @@ export class CodexOauthService {
 
   renameAccountEffect(accountId: string, label: string): Effect.Effect<Result<void, string>> {
     return Effect.suspend(() => {
-      if (!isValidAccountId(accountId))
+      if (!isValidCodexOauthAccountId(accountId))
         return Effect.succeed(Err("Invalid Codex OAuth account ID"));
       if (!isValidLabel(label)) return Effect.succeed(Err("Invalid Codex OAuth account label"));
       if (accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID) {
@@ -599,7 +589,7 @@ export class CodexOauthService {
     return Effect.gen(function* () {
       // Resolve once. A default change must not switch an active request to another account.
       const selectedId = getCodexOauthAccountId(self.readOpenaiConfig(), accountId);
-      if (!isValidAccountId(selectedId)) return Err("Invalid Codex OAuth account ID");
+      if (!isValidCodexOauthAccountId(selectedId)) return Err("Invalid Codex OAuth account ID");
       const revision = self.getAccountRevision(selectedId);
       const stored = self.readStoredAuth(selectedId);
       if (!stored) return Err(`Codex OAuth account "${selectedId}" is not configured`);
@@ -674,6 +664,8 @@ export class CodexOauthService {
   }
 
   private accountPath(accountId: string): string[] {
+    // Do not mirror named credentials into the legacy slot. Older versions refresh that slot independently.
+    // Keep existing legacy credentials until explicit disconnect; downgrade support does not include named accounts.
     return accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID
       ? ["codexOauth"]
       : ["codexOauthAccounts", accountId];
@@ -683,12 +675,17 @@ export class CodexOauthService {
     keyPath: string[],
     update: (current: unknown) => { value: unknown } | null
   ): Effect.Effect<Result<void, string>> {
+    return this.configMutationEffect(() =>
+      this.providerService.updateConfigValue("openai", keyPath, update, { enforcePolicy: true })
+    );
+  }
+
+  private configMutationEffect(
+    mutation: () => Promise<Result<{ applied: boolean }, string>>
+  ): Effect.Effect<Result<void, string>> {
     return Effect.uninterruptible(
       Effect.tryPromise({
-        try: () =>
-          this.providerService.updateConfigValue("openai", keyPath, update, {
-            enforcePolicy: true,
-          }),
+        try: mutation,
         catch: (error) => getErrorMessage(error),
       }).pipe(
         Effect.map((result): Result<void, string> => {
@@ -698,6 +695,26 @@ export class CodexOauthService {
             : Err("Codex OAuth account changed or is not configured");
         }),
         Effect.catch((error) => Effect.succeed(Err(error)))
+      )
+    );
+  }
+
+  private withAccountMutationEffect<T>(
+    accountId: string,
+    mutation: Effect.Effect<T>
+  ): Effect.Effect<T> {
+    let mutex = this.authMutationMutexes.get(accountId);
+    if (!mutex) {
+      mutex = new AsyncMutex();
+      this.authMutationMutexes.set(accountId, mutex);
+    }
+    const mutationMutex = mutex;
+    // Keep persistence and local snapshot updates together. Network requests stay outside this lock.
+    return Effect.uninterruptible(
+      Effect.acquireUseRelease(
+        Effect.promise(() => mutationMutex.acquire()),
+        () => mutation,
+        (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
       )
     );
   }
@@ -717,7 +734,7 @@ export class CodexOauthService {
       const accountId =
         options?.accountId ??
         (options?.label !== undefined ? crypto.randomUUID() : CODEX_OAUTH_DEFAULT_ACCOUNT_ID);
-      if (!isValidAccountId(accountId)) {
+      if (!isValidCodexOauthAccountId(accountId)) {
         return Effect.fail(new CodexOauthError({ reason: "Invalid Codex OAuth account ID" }));
       }
       const auth = this.readStoredAuth(accountId);
@@ -728,47 +745,55 @@ export class CodexOauthService {
       }
       // A failed or cancelled login must not discard a pending token rotation.
       const revision = this.getAccountRevision(accountId);
-      const loginAttempt = (this.loginAttempts.get(accountId) ?? 0) + 1;
-      this.loginAttempts.set(accountId, loginAttempt);
-      return Effect.succeed({
+      const selection: AccountSelection = {
         accountId,
         revision,
-        loginAttempt,
         auth,
         label: options?.label?.trim(),
         selectAsDefault:
           options?.label !== undefined &&
           getCodexOauthAccounts(this.readOpenaiConfig()).length === 0,
-      });
+      };
+      this.loginSelections.set(accountId, selection);
+      return Effect.succeed(selection);
     });
   }
 
   private persistAuth(
     selection: AccountSelection,
-    auth: CodexOauthAuth | undefined,
-    isActive: () => boolean = () => true
+    auth: CodexOauthAuth | undefined
   ): Effect.Effect<Result<void, string>> {
-    return this.updateConfigValueEffect(this.accountPath(selection.accountId), (current) => {
-      const legacy = selection.accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
-      const stored = parseCodexOauthAuth(
-        legacy ? current : isPlainObject(current) ? current.auth : undefined
-      );
-      // Compare under the file lock. Old refreshes must not restore deleted or reconnected slots.
-      if (
-        !isActive() ||
-        this.getAccountRevision(selection.accountId) !== selection.revision ||
-        !matchesAuth(stored, selection.auth)
+    return this.withAccountMutationEffect(
+      selection.accountId,
+      this.updateConfigValueEffect(this.accountPath(selection.accountId), (current) => {
+        const legacy = selection.accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
+        const stored = parseCodexOauthAuth(
+          legacy ? current : isPlainObject(current) ? current.auth : undefined
+        );
+        // Compare under the file lock. Old refreshes must not restore deleted or reconnected slots.
+        if (
+          this.getAccountRevision(selection.accountId) !== selection.revision ||
+          !matchesAuth(stored, selection.auth)
+        )
+          return null;
+        if (legacy || auth === undefined) return { value: auth };
+        return { value: { ...(isPlainObject(current) ? current : {}), auth } };
+      }).pipe(
+        Effect.map((result) => {
+          const login = this.loginSelections.get(selection.accountId);
+          // A local refresh changes tokens, not the identity of an in-progress interactive login.
+          if (
+            result.success &&
+            auth &&
+            login?.revision === selection.revision &&
+            matchesAuth(login.auth, selection.auth)
+          ) {
+            login.auth = auth;
+          }
+          return result;
+        })
       )
-        return null;
-      if (legacy || auth === undefined) return { value: auth };
-      return {
-        value: {
-          ...(isPlainObject(current) ? current : {}),
-          label: isPlainObject(current) ? current.label : selection.label,
-          auth,
-        },
-      };
-    });
+    );
   }
 
   private persistLoginAuth(
@@ -776,38 +801,71 @@ export class CodexOauthService {
     auth: CodexOauthAuth,
     isActive: () => boolean
   ): Effect.Effect<Result<void, string>> {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect generators do not inherit this.
-    const self = this;
-    return Effect.gen(function* () {
-      const result = yield* self.persistAuth(
-        selection,
-        auth,
-        () => isActive() && self.loginAttempts.get(selection.accountId) === selection.loginAttempt
-      );
-      if (!result.success) return result;
-      self.accountRevisions.set(
-        selection.accountId,
-        self.getAccountRevision(selection.accountId) + 1
-      );
-      if (!selection.selectAsDefault) return result;
-      // Concurrent first logins share this default write. The first successful write wins.
-      const selected = yield* Effect.promise(() =>
-        self.providerService.updateConfigValue(
+    return this.withAccountMutationEffect(
+      selection.accountId,
+      this.configMutationEffect(() =>
+        this.providerService.updateProviderSection(
           "openai",
-          ["codexOauthDefaultAccountId"],
-          (current) => {
-            const accounts = getCodexOauthAccounts(self.readOpenaiConfig());
-            return current === undefined &&
-              accounts.some((account) => account.id === selection.accountId) &&
-              !accounts.some((account) => account.id === CODEX_OAUTH_DEFAULT_ACCOUNT_ID)
-              ? { value: selection.accountId }
-              : null;
+          (section) => {
+            if (
+              !isActive() ||
+              this.loginSelections.get(selection.accountId) !== selection ||
+              this.getAccountRevision(selection.accountId) !== selection.revision
+            )
+              return null;
+            const current = isPlainObject(section) ? section : {};
+            const legacy = selection.accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
+            // Hand-edited arrays cannot retain named properties when JSON serializes the config.
+            const accounts = isPlainObject(current.codexOauthAccounts)
+              ? current.codexOauthAccounts
+              : {};
+            const entry = accounts[selection.accountId];
+            const stored = parseCodexOauthAuth(
+              legacy ? current.codexOauth : isPlainObject(entry) ? entry.auth : undefined
+            );
+            if (!matchesAuth(stored, selection.auth)) return null;
+            const next = { ...current };
+            if (legacy) {
+              next.codexOauth = auth;
+            } else {
+              // Do not mirror named credentials into the legacy slot.
+              // Older versions refresh that slot independently and cannot honor project selection.
+              // Named login preserves existing legacy credentials until explicit disconnect.
+              next.codexOauthAccounts = {
+                ...accounts,
+                [selection.accountId]: {
+                  ...(isPlainObject(entry) ? entry : {}),
+                  label: isPlainObject(entry) ? entry.label : selection.label,
+                  auth,
+                },
+              };
+              // Commit the first slot and its selection together. A failed write must leave neither field.
+              if (
+                selection.selectAsDefault &&
+                current.codexOauthDefaultAccountId === undefined &&
+                !parseCodexOauthAuth(current.codexOauth)
+              ) {
+                next.codexOauthDefaultAccountId = selection.accountId;
+              }
+            }
+            return { value: next };
           },
           { enforcePolicy: true }
         )
-      );
-      return selected.success ? Ok(undefined) : selected;
-    });
+      ).pipe(
+        Effect.map((result) => {
+          if (result.success) {
+            this.accountRevisions.set(
+              selection.accountId,
+              this.getAccountRevision(selection.accountId) + 1
+            );
+            if (this.loginSelections.get(selection.accountId) === selection)
+              this.loginSelections.delete(selection.accountId);
+          }
+          return result;
+        })
+      )
+    );
   }
 
   private handleDesktopCallbackAndExchange(input: {

@@ -5,7 +5,12 @@
  * extract non-sensitive claims (e.g. ChatGPT-Account-Id) from OAuth responses.
  */
 
-import { CODEX_OAUTH_DEFAULT_ACCOUNT_ID } from "@/common/constants/codexOauthAccounts";
+import {
+  CODEX_OAUTH_DEFAULT_ACCOUNT_ID,
+  CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH,
+  CODEX_OAUTH_ACCOUNT_ID_PATTERN,
+  CODEX_OAUTH_RESERVED_ACCOUNT_IDS,
+} from "@/common/constants/codexOauthAccounts";
 
 export interface CodexOauthAuth {
   type: "oauth";
@@ -50,6 +55,15 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
   return { type: "oauth", access, refresh, expires, accountId };
 }
 
+/** Validate local slot IDs at input and storage boundaries. */
+export function isValidCodexOauthAccountId(accountId: string): boolean {
+  return (
+    accountId.length <= CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH &&
+    CODEX_OAUTH_ACCOUNT_ID_PATTERN.test(accountId) &&
+    !CODEX_OAUTH_RESERVED_ACCOUNT_IDS.has(accountId)
+  );
+}
+
 /** Read connected slots from an OpenAI provider config. */
 export function getCodexOauthAccounts(config: unknown): Array<{
   id: string;
@@ -72,7 +86,12 @@ export function getCodexOauthAccounts(config: unknown): Array<{
   if (isPlainObject(config.codexOauthAccounts)) {
     for (const [id, entry] of Object.entries(config.codexOauthAccounts)) {
       // The legacy slot owns this ID, even if malformed disk data repeats it.
-      if (id === CODEX_OAUTH_DEFAULT_ACCOUNT_ID || !isPlainObject(entry)) continue;
+      if (
+        id === CODEX_OAUTH_DEFAULT_ACCOUNT_ID ||
+        !isValidCodexOauthAccountId(id) ||
+        !isPlainObject(entry)
+      )
+        continue;
       const auth = parseCodexOauthAuth(entry.auth);
       if (!auth || typeof entry.label !== "string" || !entry.label.trim()) continue;
       accounts.push({ id, label: entry.label.trim(), auth });

@@ -1577,34 +1577,47 @@ export class ProviderService {
    * that fetched it is still the stored credential, and disconnect clears
    * tokens + models in one write.
    *
-   * Internal credential-management primitive: skips policy gating like
-   * updateConfigValue.
+   * Internal callers can omit policy checks. User-driven mutations must set enforcePolicy.
    */
   public updateProviderSection(
     provider: string,
     update: (
       section: Record<string, unknown> | undefined
-    ) => { value: Record<string, unknown> } | null
+    ) => { value: Record<string, unknown> } | null,
+    options?: { enforcePolicy?: boolean }
   ): Promise<Result<{ applied: boolean }, string>> {
-    return Effect.runPromise(this.updateProviderSectionEffect(provider, update));
+    return Effect.runPromise(this.updateProviderSectionEffect(provider, update, options));
   }
 
   private updateProviderSectionEffect(
     provider: string,
     update: (
       section: Record<string, unknown> | undefined
-    ) => { value: Record<string, unknown> } | null
+    ) => { value: Record<string, unknown> } | null,
+    options?: { enforcePolicy?: boolean }
   ): Effect.Effect<Result<{ applied: boolean }, string>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
       const applied = yield* self.providersFileLockEffect(() => {
+        if (options?.enforcePolicy) {
+          const denial = self.validateProviderEditPolicy(provider, []);
+          if (denial != null) return denial;
+        }
         const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
         const section = providersConfig[provider] as Record<string, unknown> | undefined;
 
         const decision = update(section);
         if (!decision) {
           return false;
+        }
+
+        if (options?.enforcePolicy) {
+          for (const key of ["baseUrl", "baseURL"]) {
+            if (decision.value[key] === section?.[key]) continue;
+            const denial = self.validateProviderEditPolicy(provider, [key]);
+            if (denial != null) return denial;
+          }
         }
 
         const deniedKey = Object.keys(decision.value).find((key) =>
@@ -1619,6 +1632,7 @@ export class ProviderService {
         return true;
       });
 
+      if (typeof applied === "string") return { success: false as const, error: applied };
       // Best-effort: a landed write must not be reported as failed (see
       // afterAppliedMutationEffect).
       yield* self.afterAppliedMutationEffect(provider, applied);
