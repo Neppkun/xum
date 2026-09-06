@@ -445,18 +445,23 @@ describe("AgentSession token-budget lifecycle", () => {
     ).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
     expect(h.requests).toHaveLength(2);
     const rows = await allRows(h);
-    const snapshots = rows.filter(
+    const displayed = rows.map(restoreContextBudgetRejectedMessageForDisplay);
+    const snapshots = displayed.filter(
       (row) => row.metadata?.agentSkillSnapshot?.skillName === skillName
     );
     expect(snapshots).toHaveLength(2);
     expect(snapshots[1].metadata?.agentSkillSnapshot?.sha256).toBe(
       snapshots[0].metadata?.agentSkillSnapshot?.sha256
     );
-    const rejected = rows.findLast(
+    const rejected = displayed.findLast(
       (row) => row.metadata?.contextBudgetRejected && text(row) === "Use the unchanged skill again"
     )!;
     expect(rejected.metadata?.requestPreludeMessageIds).toContain(snapshots[1].id);
-    expect(snapshots[1].metadata?.contextBudgetRejected).toBe(true);
+    expect(rows.find((row) => row.id === snapshots[1].id)).toMatchObject({
+      role: "assistant",
+      parts: [],
+      metadata: { contextBudgetRejected: true },
+    });
     expect((await h.session.sendMessage("A new unrelated request", options)).success).toBe(true);
     const next = prepareProviderRequestMessages(
       h.requests[2].messages,

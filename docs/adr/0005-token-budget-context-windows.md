@@ -25,6 +25,12 @@ The reset, lead-in, and triggering message or continuation are committed as one 
 
 Only context-scoped cache, persisted carryover, and sandbox clearing runs before append. This ordering is deliberately fail-closed: a crash after publication must not reopen a fresh window with stale pre-reset carryover or kernel state. If cleanup succeeds but cancellation or append failure prevents publication, the old transcript remains with that disposable state cleared; it is not restored because a failed acknowledgment may still mean publication succeeded. Cancellation and admission are checked before cleanup and again before append. Branch-summary clearing and epoch notification run after append; cleanup failure must prevent a provider request. When rollover invalidates other sends, its own caller must adopt the updated epoch before continuing.
 
+### Rejected request retention across downgrades
+
+Rejected inputs and their owned snapshots are transcript-only. They are stored as empty, non-partial assistant records, retaining their identity and sequence; the original role, content, and display metadata live inside a new opaque metadata field. No original skill, file, command, or peer control metadata remains active on the outer record. Current display/export code can recover the original transcript projection without restoring it to provider history.
+
+The preceding request assembler already excludes empty assistant records, so downgrading cannot replay rejected payloads merely because it ignores the new rejection flag. Older builds may not display the quarantined original content, but preserve it for a subsequent upgrade. Partial-truncation transaction markers likewise retain legacy decoded-text digests in their existing fields and add separately versioned byte digests, allowing both versions to recognize an accepted rewrite containing invalid UTF-8.
+
 ### Append-stable retrieval cursors
 
 Head/tail hashes alone cannot distinguish an append from an interior rewrite followed by an append. Retrieval therefore uses a constant-size durable append receipt in addition to the bounded scan cursor. This receipt is cursor-safety metadata, not a rollover journal or a second copy of the transcript.
