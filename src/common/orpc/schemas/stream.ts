@@ -564,6 +564,9 @@ export const UsageDeltaEventSchema = z.object({
     .optional()
     .meta({ description: "True when this event is emitted during stream replay" }),
 
+  // Safe numeric limit from the accepted request. Never expose its routing snapshot.
+  effectiveContextLimit: z.number().positive().nullable().optional(),
+
   // Step-level: this step only (for context window display)
   usage: LanguageModelV2UsageSchema,
   providerMetadata: z.record(z.string(), z.unknown()).optional(),

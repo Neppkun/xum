@@ -71,6 +71,7 @@ const createApiCallError = (
 function createRoutingSnapshot(): ModelRoutingSnapshot {
   return {
     providersConfig: { openai: { apiKey: "test-key", codexOauthDefaultAuth: "oauth" } },
+    routeConfig: { routePriority: ["direct"], routeOverrides: {} },
     metadata: null,
     codexOauthSelection: { accountId: "work", explicit: true },
   };

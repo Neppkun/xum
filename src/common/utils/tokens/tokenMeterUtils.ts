@@ -62,12 +62,16 @@ export function calculateTokenMeterData(
   use1M: boolean,
   verticalProportions = false,
   providersConfig: ProvidersConfigMap | null = null,
-  routingOptions?: CodexOauthRoutingOptions
+  routingOptions?: CodexOauthRoutingOptions,
+  effectiveContextLimit?: number | null
 ): TokenMeterData {
   if (!usage) return { segments: [], totalTokens: 0, totalPercentage: 0 };
 
+  // Live usage keeps the accepted request limit. Idle callers omit the override.
   const maxTokens =
-    getEffectiveContextLimit(model, use1M, providersConfig, routingOptions) ?? undefined;
+    (effectiveContextLimit !== undefined
+      ? effectiveContextLimit
+      : getEffectiveContextLimit(model, use1M, providersConfig, routingOptions)) ?? undefined;
 
   // Total tokens used in the request.
   // For Anthropic prompt caching, cacheCreate tokens are reported separately but still

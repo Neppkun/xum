@@ -106,6 +106,7 @@ export function createModelRoutingSnapshotMock(
   return mock(
     (_workspaceId: string): ModelRoutingSnapshot => ({
       providersConfig: {},
+      routeConfig: { routePriority: ["direct"], routeOverrides: {} },
       metadata: structuredClone(getProvidersConfig()),
       codexOauthSelection: { accountId: "default", explicit: false },
     })

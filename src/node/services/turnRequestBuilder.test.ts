@@ -251,6 +251,73 @@ describe("TurnRequestBuilder tool scope", () => {
 });
 
 describe("TurnRequestBuilder model attempt preparation", () => {
+  it("computes limits from accepted auth settings instead of current provider settings", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      const accepted: ProvidersConfigMap = {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          codexOauthSet: true,
+          codexOauthDefaultAccountId: "work",
+          codexOauthAccounts: [{ id: "work", label: "Work" }],
+        },
+      };
+      harness.providersConfigStore.saveProvidersConfig({
+        openai: { codexOauthDefaultAuth: "apiKey" },
+      });
+      const model = "openai:gpt-5.5";
+      const options = preparationOptions(accepted, {
+        rawModelString: model,
+        canonicalModelString: model,
+        canonicalProviderName: "openai",
+        effectiveModelString: model,
+        optionsModelString: model,
+        wireProviderName: "openai",
+      });
+      const live = harness.builder.prepareModelAttempt(options);
+      const next = harness.builder.prepareModelAttempt({
+        ...options,
+        providersConfigSnapshot: {
+          openai: { ...accepted.openai, codexOauthDefaultAuth: "apiKey" },
+        },
+      });
+      const chatCompletions = harness.builder.prepareModelAttempt({
+        ...options,
+        muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
+      });
+      expect(live.effectiveContextLimit).toBe(272_000);
+      expect(next.effectiveContextLimit).toBeGreaterThan(272_000);
+      expect(chatCompletions.effectiveContextLimit).toBe(next.effectiveContextLimit);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("honors accepted custom limits and the request's 1M context option", async () => {
+    const harness = await createPreparationHarness();
+    try {
+      const options = preparationOptions({
+        anthropic: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "claude-sonnet-4-5", contextWindowTokens: 100_000 }],
+        },
+      });
+      expect(harness.builder.prepareModelAttempt(options).effectiveContextLimit).toBe(100_000);
+      expect(
+        harness.builder.prepareModelAttempt({
+          ...options,
+          muxProviderOptions: { anthropic: { use1MContextModels: [options.rawModelString] } },
+        }).effectiveContextLimit
+      ).toBe(1_000_000);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it("merges call settings and provider extras at the resolved namespace", async () => {
     const harness = await createPreparationHarness();
     try {

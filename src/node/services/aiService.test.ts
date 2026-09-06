@@ -1079,6 +1079,63 @@ describe("AIService.captureModelRoutingSnapshot", () => {
     expect(snapshot.codexOauthSelection).toEqual({ accountId: testCase.accountId, explicit: true });
   });
 
+  it.each(["defaults", "priority", "override"] as const)(
+    "copies captured route rules before later settings edits: %s",
+    async (change) => {
+      using xumHome = new DisposableTempDir("snapshot-route-config");
+      const { config, service, providersConfigStore } = createBasicAIService(xumHome.path);
+      providersConfigStore.saveProvidersConfig({
+        openai: { apiKey: "openai-key" },
+        openrouter: { apiKey: "openrouter-key" },
+      });
+      const appConfig = config.loadConfigOrDefault();
+      delete appConfig.routePriority;
+      delete appConfig.routeOverrides;
+      if (change !== "defaults") {
+        appConfig.routePriority = ["direct"];
+        appConfig.routeOverrides = { "openai:gpt-5.5": "direct" };
+      }
+      spyOn(config, "loadConfigOrDefault").mockReturnValue(appConfig);
+      const getProvidersConfig = service.getProvidersConfig.bind(service);
+      // Metadata projection must not expose shared mutable routing arrays or maps.
+      spyOn(service, "getProvidersConfig").mockImplementationOnce((raw) => {
+        if (change === "priority") appConfig.routePriority!.unshift("openrouter");
+        else if (change === "override") appConfig.routeOverrides!["openai:gpt-5.5"] = "openrouter";
+        else {
+          appConfig.routePriority = ["openrouter", "direct"];
+          appConfig.routeOverrides = { "openai:gpt-5.5": "openrouter" };
+        }
+        if (change === "priority") delete appConfig.routeOverrides!["openai:gpt-5.5"];
+        return getProvidersConfig(raw);
+      });
+      const snapshot = service.captureModelRoutingSnapshot();
+      for (const create of [
+        service.createModel.bind(service),
+        async (
+          model: string,
+          _options: undefined,
+          opts: Parameters<AIService["createModel"]>[2]
+        ) => {
+          const result = await service.createModelWithPinnedMetadata(model, opts);
+          return result.success ? Ok(result.data.model) : result;
+        },
+      ]) {
+        const captured = await create("openai:gpt-5.5", undefined, {
+          modelRoutingSnapshot: snapshot,
+        });
+        expect(captured.success).toBe(true);
+        if (captured.success && typeof captured.data !== "string")
+          expect(captured.data.modelId).toBe("gpt-5.5");
+        const current = await create("openai:gpt-5.5", undefined, {
+          modelRoutingSnapshot: service.captureModelRoutingSnapshot(),
+        });
+        expect(current.success).toBe(true);
+        if (current.success && typeof current.data !== "string")
+          expect(current.data.modelId).toBe("openai/gpt-5.5");
+      }
+    }
+  );
+
   it("createModel keeps captured config and selection ahead of live settings and raw overrides", async () => {
     using xumHome = new DisposableTempDir("snapshot-model-options");
     const { config, service, providersConfigStore } = createBasicAIService(xumHome.path);
@@ -3041,6 +3098,94 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
     expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
   });
+
+  it.each([
+    { toolName: "advisor", change: "priority" },
+    { toolName: "advisor", change: "override" },
+    { toolName: "intuition", change: "priority" },
+    { toolName: "intuition", change: "override" },
+  ] as const)(
+    "$toolName keeps captured route $change after settings change",
+    async ({ toolName, change }) => {
+      using xumHome = new DisposableTempDir("nested-tool-route-config");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "nested-route-config";
+      const store = new ProvidersConfigStore(xumHome.path);
+      store.saveProvidersConfig({
+        openai: { apiKey: "openai-key" },
+        openrouter: { apiKey: "openrouter-key" },
+      });
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      );
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        {
+          providersConfigStore: store,
+          experimentsService,
+          useRequestedModelString: true,
+        }
+      );
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      spyOn(factory, "resolveAndCreateModel").mockRestore();
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHome.path)
+      );
+      await enableAdvisorForHarness(harness, "openai:gpt-5.5");
+      await harness.config.editConfig((cfg) => ({
+        ...cfg,
+        routePriority: ["direct"],
+        routeOverrides: {},
+      }));
+      const snapshot = harness.service.captureModelRoutingSnapshot(workspaceId);
+      await harness.config.editConfig((cfg) => {
+        if (change === "priority") cfg.routePriority = ["openrouter", "direct"];
+        else cfg.routeOverrides = { "openai:gpt-5.5": "openrouter" };
+        return cfg;
+      });
+      const startTurn = (modelRoutingSnapshot: typeof snapshot) =>
+        harness.service.streamMessage({
+          messages: [createMuxMessage("user", "user", "Continue")],
+          workspaceId,
+          modelString: "openai:gpt-5.5",
+          thinkingLevel: "off",
+          experiments: { advisorTool: true, memory: true },
+          modelRoutingSnapshot,
+        });
+      const getRuntime = () => {
+        const config = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1];
+        const runtime = toolName === "advisor" ? config?.advisorRuntime : config?.intuitionRuntime;
+        if (!runtime) throw new Error("Expected tool runtime");
+        return runtime;
+      };
+      expect((await startTurn(snapshot)).success).toBe(true);
+      const capturedParentModel = harness.startStreamCalls.at(-1)?.model;
+      if (!capturedParentModel || typeof capturedParentModel === "string") {
+        throw new Error("Expected parent SDK model");
+      }
+      expect(capturedParentModel.modelId).toBe("gpt-5.5");
+      const captured = await getRuntime().createModel("openai:gpt-5.5");
+      if (typeof captured.model === "string") throw new Error("Expected SDK model");
+      expect(captured.model.modelId).toBe("gpt-5.5");
+      expect(
+        (await startTurn(harness.service.captureModelRoutingSnapshot(workspaceId))).success
+      ).toBe(true);
+      const parentModel = harness.startStreamCalls.at(-1)?.model;
+      if (!parentModel || typeof parentModel === "string")
+        throw new Error("Expected parent SDK model");
+      expect(parentModel.modelId).toBe("openai/gpt-5.5");
+      const current = await getRuntime().createModel("openai:gpt-5.5");
+      if (typeof current.model === "string") throw new Error("Expected SDK model");
+      expect(current.model.modelId).toBe("openai/gpt-5.5");
+    }
+  );
 
   it.each([
     { toolName: "advisor", change: "project-account" },

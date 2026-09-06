@@ -2892,6 +2892,10 @@ export class WorkspaceStore {
             )
           : undefined;
 
+      if (liveUsage && activeStreamId) {
+        liveUsage.effectiveContextLimit = aggregator.getActiveStreamContextLimit(activeStreamId);
+      }
+
       const rawCumulativeUsage = activeStreamId
         ? aggregator.getActiveStreamCumulativeUsage(activeStreamId)
         : undefined;

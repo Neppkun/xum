@@ -42,6 +42,51 @@ describe("calculateTokenMeterData", () => {
     },
   };
 
+  test("keeps the accepted limit during live usage and uses current settings when idle", () => {
+    const changedConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthDefaultAuth: "apiKey",
+        models: [{ id: "gpt-5.5", contextWindowTokens: 500_000 }],
+      },
+    };
+    const live = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      changedConfig,
+      { codexOauthAccountId: "different-account" },
+      272_000
+    );
+    const idle = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      changedConfig
+    );
+    expect(live.maxTokens).toBe(272_000);
+    expect(live.totalPercentage).toBeCloseTo((11_000 / 272_000) * 100);
+    expect(idle.maxTokens).toBe(500_000);
+    expect(idle.totalPercentage).toBeCloseTo(2.2);
+  });
+
+  test("keeps an unknown accepted limit despite a current model override", () => {
+    const result = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "anthropic:claude-sonnet-4-20250514",
+      true,
+      false,
+      providerConfigWithOverride,
+      undefined,
+      null
+    );
+    expect(result.maxTokens).toBeUndefined();
+  });
+
   test("uses custom context override for beta Sonnet models", () => {
     const result = calculateTokenMeterData(
       SAMPLE_USAGE,

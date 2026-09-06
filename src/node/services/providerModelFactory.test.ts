@@ -1713,6 +1713,88 @@ describe("ProviderModelFactory GitHub Copilot", () => {
   });
 });
 
+describe("ProviderModelFactory route config snapshots", () => {
+  it.each(["priority", "override"] as const)(
+    "keeps all resolution stages on captured %s settings",
+    async (change) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        const providersConfig = {
+          openai: { apiKey: "openai-key" },
+          anthropic: { apiKey: "anthropic-key" },
+          openrouter: { apiKey: "openrouter-key" },
+        };
+        store.saveProvidersConfig(providersConfig);
+        const routeConfig = {
+          routePriority: ["direct"],
+          routeOverrides: { "anthropic:claude-sonnet-4-5": "openrouter" },
+        };
+        await saveRoutePriority(
+          config,
+          change === "priority" ? ["openrouter", "direct"] : ["direct"],
+          {
+            routeOverrides: change === "override" ? { "openai:gpt-5.5": "openrouter" } : {},
+          }
+        );
+        for (const modelString of ["openai:gpt-5.5", "coder:openai/gpt-5.5"]) {
+          const resolved = await factory.resolveAndCreateModel(modelString, "off", undefined, {
+            providersConfig,
+            routeConfig,
+          });
+          expectSuccessfulRouteResult(resolved, {
+            effectiveModelString: "openai:gpt-5.5",
+            routeProvider: "openai",
+          });
+          if (!resolved.success) throw new Error("Expected a model");
+          expect((resolved.data.model as { provider?: unknown }).provider).toBe("openai.responses");
+          const direct = await factory.createModel(modelString, undefined, {
+            providersConfig,
+            routeConfig,
+          });
+          expect(direct.success).toBe(true);
+          if (direct.success)
+            expect((direct.data as { provider?: unknown }).provider).toBe("openai.responses");
+          expect(
+            factory.resolveEffectiveModelString(
+              modelString,
+              undefined,
+              providersConfig,
+              routeConfig
+            )
+          ).toBe("openai:gpt-5.5");
+          expect(
+            factory.resolveGatewayModelString(
+              modelString,
+              undefined,
+              undefined,
+              providersConfig,
+              routeConfig
+            )
+          ).toBe("openai:gpt-5.5");
+          const current = await factory.resolveAndCreateModel(modelString, "off");
+          expectSuccessfulRouteResult(current, {
+            effectiveModelString: "openrouter:openai/gpt-5.5",
+            routeProvider: "openrouter",
+          });
+        }
+        // Nested models resolve their own overrides, not a single route chosen for the parent.
+        const nested = await factory.resolveAndCreateModel(
+          "anthropic:claude-sonnet-4-5",
+          "off",
+          undefined,
+          {
+            providersConfig,
+            routeConfig,
+          }
+        );
+        expectSuccessfulRouteResult(nested, {
+          effectiveModelString: "openrouter:anthropic/claude-sonnet-4-5",
+          routeProvider: "openrouter",
+        });
+      });
+    }
+  );
+});
+
 describe("ProviderModelFactory OpenAI WebSocket transport", () => {
   it("attaches cleanup when enabled for Responses models", async () => {
     await withOpenAIBaseUrlEnvUnset(async () =>

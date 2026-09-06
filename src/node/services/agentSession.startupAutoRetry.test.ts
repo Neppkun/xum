@@ -425,6 +425,7 @@ describe("AgentSession startup auto-retry recovery", () => {
         await createSessionBundle(workspaceId);
       cleanups.push(cleanup);
       const initial: ModelRoutingSnapshot = {
+        routeConfig: { routePriority: ["direct"], routeOverrides: {} },
         providersConfig: { openai: { apiKey: "key", codexOauthDefaultAuth: "oauth" } },
         metadata: {
           openai: { apiKeySet: true, isEnabled: true, isConfigured: true, codexOauthSet: true },
@@ -446,6 +447,7 @@ describe("AgentSession startup auto-retry recovery", () => {
       try {
         expect((await session.resumeStream(options)).success).toBe(false);
         current = {
+          routeConfig: { routePriority: ["direct"], routeOverrides: {} },
           providersConfig: { openai: { apiKey: "key", codexOauthDefaultAuth: "apiKey" } },
           metadata: { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } },
           codexOauthSelection: { accountId: "personal", explicit: true },

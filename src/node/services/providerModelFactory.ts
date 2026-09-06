@@ -50,6 +50,7 @@ import { CopilotResponsesLanguageModel } from "@/node/services/copilot/copilotRe
 import type { PolicyService } from "@/node/services/policyService";
 import type { ProviderService } from "@/node/services/providerService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import type { RouteConfigSnapshot } from "./modelRoutingSnapshot";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import {
   coderAibridgeBaseUrl,
@@ -1120,6 +1121,8 @@ interface CreateModelOptions {
   /** Account selection snapshot from resolveAndCreateModel. */
   codexOauthSelection?: { accountId: string; explicit: boolean };
   routeContext?: RouteContext;
+  /** Captured routing rules keep accepted work independent from settings changes. */
+  routeConfig?: RouteConfigSnapshot;
   /**
    * Providers-config snapshot to create the model from. Passed by
    * resolveAndCreateModel so routing, the returned coderWire snapshot,
@@ -1330,7 +1333,8 @@ export class ProviderModelFactory {
         modelString = self.resolveEffectiveModelString(
           modelString,
           opts?.routeContext,
-          opts?.providersConfig
+          opts?.providersConfig,
+          opts?.routeConfig
         );
 
         // Parse model string (format: "provider:model-id")
@@ -2569,7 +2573,12 @@ export class ProviderModelFactory {
     muxProviderOptions?: MuxProviderOptions,
     opts?: Pick<
       CreateModelOptions,
-      "agentInitiated" | "workspaceId" | "projectPath" | "providersConfig" | "codexOauthSelection"
+      | "agentInitiated"
+      | "workspaceId"
+      | "projectPath"
+      | "providersConfig"
+      | "codexOauthSelection"
+      | "routeConfig"
     >
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
@@ -2583,7 +2592,12 @@ export class ProviderModelFactory {
     muxProviderOptions?: MuxProviderOptions,
     opts?: Pick<
       CreateModelOptions,
-      "agentInitiated" | "workspaceId" | "projectPath" | "providersConfig" | "codexOauthSelection"
+      | "agentInitiated"
+      | "workspaceId"
+      | "projectPath"
+      | "providersConfig"
+      | "codexOauthSelection"
+      | "routeConfig"
     >
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
@@ -2675,7 +2689,8 @@ export class ProviderModelFactory {
 
       const routeContext = self.resolveModelRoute(
         routeSeedModelString,
-        providersConfigForShadowCheck
+        providersConfigForShadowCheck,
+        opts?.routeConfig
       );
       if (rawCoderGatewayModelId != null) {
         const appConfig = self.config.loadConfigOrDefault();
@@ -2727,7 +2742,8 @@ export class ProviderModelFactory {
             routeSeedModelString,
             routeContext,
             undefined,
-            providersConfigForShadowCheck
+            providersConfigForShadowCheck,
+            opts?.routeConfig
           );
         }
       } else {
@@ -2735,7 +2751,8 @@ export class ProviderModelFactory {
           effectiveModelString,
           routeContext,
           explicitGateway,
-          providersConfigForShadowCheck
+          providersConfigForShadowCheck,
+          opts?.routeConfig
         );
       }
 
@@ -2885,7 +2902,8 @@ export class ProviderModelFactory {
 
   private resolveModelRoute(
     canonicalModel: string,
-    providersConfigSnapshot?: ProvidersConfig
+    providersConfigSnapshot?: ProvidersConfig,
+    routeConfigSnapshot?: RouteConfigSnapshot
   ): RouteContext {
     const config = this.config.loadConfigOrDefault();
     // resolveAndCreateModel passes its snapshot so route availability,
@@ -2899,8 +2917,8 @@ export class ProviderModelFactory {
     );
     return resolveRoute(
       canonicalModel,
-      config.routePriority ?? ["direct"],
-      config.routeOverrides ?? {},
+      routeConfigSnapshot?.routePriority ?? config.routePriority ?? ["direct"],
+      routeConfigSnapshot?.routeOverrides ?? config.routeOverrides ?? {},
       (provider) => {
         if (!Object.hasOwn(PROVIDER_REGISTRY, provider)) {
           return false;
@@ -2928,14 +2946,16 @@ export class ProviderModelFactory {
   resolveEffectiveModelString(
     modelString: string,
     routeContext?: RouteContext,
-    providersConfig?: ProvidersConfig
+    providersConfig?: ProvidersConfig,
+    routeConfig?: RouteConfigSnapshot
   ): string {
     const explicitGateway = getExplicitGatewayProvider(modelString);
     return this.resolveGatewayModelString(
       modelString,
       routeContext,
       explicitGateway,
-      providersConfig
+      providersConfig,
+      routeConfig
     );
   }
 
@@ -2943,7 +2963,8 @@ export class ProviderModelFactory {
     modelString: string,
     modelKeyOrRouteContext?: string | RouteContext,
     explicitGatewayOrLegacyFlag?: ProviderName | boolean,
-    providersConfigSnapshot?: ProvidersConfig
+    providersConfigSnapshot?: ProvidersConfig,
+    routeConfigSnapshot?: RouteConfigSnapshot
   ): string {
     // Legacy callers may still pass boolean true to mean an explicit mux-gateway request.
     const explicitGateway: ProviderName | undefined =
@@ -3006,8 +3027,8 @@ export class ProviderModelFactory {
         ? modelKeyOrRouteContext
         : resolveRoute(
             routingModel,
-            config.routePriority ?? ["direct"],
-            config.routeOverrides ?? {},
+            routeConfigSnapshot?.routePriority ?? config.routePriority ?? ["direct"],
+            routeConfigSnapshot?.routeOverrides ?? config.routeOverrides ?? {},
             (provider) => {
               if (!Object.hasOwn(PROVIDER_REGISTRY, provider)) {
                 return false;

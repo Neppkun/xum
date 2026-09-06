@@ -65,7 +65,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     has1MContext(contextDisplayModel),
     false,
     providersConfig,
-    { codexOauthAccountId }
+    { codexOauthAccountId },
+    usage.liveUsage?.effectiveContextLimit
   );
 
   // Warn when the compaction model can't fit the auto-compact threshold to avoid failures.

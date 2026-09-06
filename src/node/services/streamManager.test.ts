@@ -5,7 +5,11 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
+import {
+  StreamEndEventSchema,
+  ToolCallStartEventSchema,
+  UsageDeltaEventSchema,
+} from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
   ToolCallEndEvent,
@@ -4152,6 +4156,10 @@ describe("StreamManager - empty stream completions", () => {
   test("zero-output refusal with a configured fallback chain swaps models without any error event", async () => {
     const streamManager = new StreamManager(historyService);
     const errorEvents: unknown[] = [];
+    const limits: Array<number | null | undefined> = [];
+    onTurnEngineEvent(streamManager, "usage-delta", (event) =>
+      limits.push(event.effectiveContextLimit)
+    );
     const streamEndEvents: Array<{
       metadata?: {
         model?: string;
@@ -4188,6 +4196,7 @@ describe("StreamManager - empty stream completions", () => {
         (async function* () {
           await Promise.resolve();
           yield { type: "text-delta", text: "fallback answer" };
+          yield { type: "finish-step", usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 } };
           yield { type: "finish", finishReason: "stop" };
         })(),
         { inputTokens: 5, outputTokens: 3, totalTokens: 8 }
@@ -4211,6 +4220,7 @@ describe("StreamManager - empty stream completions", () => {
         Ok({
           model: fallbackLanguageModel,
           modelString: nextModelString,
+          effectiveContextLimit: 272_000,
           messages: [],
           system: "fallback system",
           tools: fallbackTools,
@@ -4241,6 +4251,7 @@ describe("StreamManager - empty stream completions", () => {
       startTime,
       lastPartTimestamp: startTime,
       model: KNOWN_MODELS.SONNET.id,
+      effectiveContextLimit: 200_000,
       metadataModel: KNOWN_MODELS.SONNET.id,
       historySequence,
       initialMetadata: { agentId: "plan" },
@@ -4258,6 +4269,7 @@ describe("StreamManager - empty stream completions", () => {
 
     // No terminal failure: TaskService and waiters never observe the refusal.
     expect(errorEvents).toHaveLength(0);
+    expect(limits).toEqual([200_000, 272_000]);
     expect(prepare).toHaveBeenCalledTimes(1);
     expect(prepare.mock.calls[0]?.[0]).toBe(fallbackModel);
     expect(prepare.mock.calls[0]?.[1]).toBeUndefined();
@@ -6226,6 +6238,7 @@ describe("StreamManager - replayStream", () => {
     setReplayStreamInfo(streamManager, workspaceId, {
       state: "streaming",
       messageId: "msg-usage",
+      effectiveContextLimit: 100_000,
       model: "claude-sonnet-4",
       metadataModel: "claude-sonnet-4",
       historySequence: 1,
@@ -6245,6 +6258,7 @@ describe("StreamManager - replayStream", () => {
 
     expect(usageEvents).toHaveLength(1);
     expect(usageEvents[0]?.replay).toBe(true);
+    expect(UsageDeltaEventSchema.parse(usageEvents[0]).effectiveContextLimit).toBe(100_000);
     expect(usageEvents[0]?.usage).toEqual({ inputTokens: 21, outputTokens: 3, totalTokens: 24 });
     expect(usageEvents[0]?.providerMetadata).toEqual({
       anthropic: { cacheReadInputTokens: 2 },

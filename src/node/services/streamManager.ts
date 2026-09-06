@@ -267,6 +267,7 @@ interface StreamRequestOptions {
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
   forcedFirstStepToolNames?: string[];
   providersConfigSnapshot?: ProvidersConfigMap;
+  effectiveContextLimit?: number | null;
   rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
 }
 
@@ -397,6 +398,7 @@ interface PreparedModelFallback {
    * usage identity.
    */
   providersConfig?: ProvidersConfigMap;
+  effectiveContextLimit?: number | null;
 }
 
 export interface ModelFallbackPrepareOptions {
@@ -571,6 +573,7 @@ function buildUsageDeltaEvent(opts: {
   cumulativeUsage: LanguageModelV2Usage;
   cumulativeProviderMetadata: Record<string, unknown> | undefined;
   costsIncluded: boolean | undefined;
+  effectiveContextLimit?: number | null;
   replay?: true;
 }): UsageDeltaEvent {
   return {
@@ -579,6 +582,7 @@ function buildUsageDeltaEvent(opts: {
     messageId: opts.messageId,
     ...(opts.replay ? { replay: true } : {}),
     usage: opts.usage,
+    effectiveContextLimit: opts.effectiveContextLimit,
     providerMetadata: opts.providerMetadata,
     cumulativeUsage: opts.cumulativeUsage,
     cumulativeProviderMetadata: markProviderMetadataCostsIncluded(
@@ -661,6 +665,7 @@ interface WorkspaceStreamInfo {
   model: string;
   /** Metadata model resolved from provider mapping for cost/token metadata lookups. */
   metadataModel: string;
+  effectiveContextLimit?: number | null;
   /** Effective thinking level after model policy clamping */
   thinkingLevel?: string;
   initialMetadata?: Partial<MuxMetadata>;
@@ -2650,6 +2655,7 @@ export class StreamManager {
       pendingToolExecutionStarts: new Map(),
       model: modelString,
       metadataModel,
+      effectiveContextLimit: options.effectiveContextLimit,
       thinkingLevel,
       initialMetadata,
       toolModelUsages: [],
@@ -3525,6 +3531,7 @@ export class StreamManager {
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
 
     streamInfo.model = prepared.data.modelString;
+    streamInfo.effectiveContextLimit = prepared.data.effectiveContextLimit;
     streamInfo.metadataModel = this.resolveMetadataModel(
       prepared.data.modelString,
       prepared.data.providersConfig
@@ -4134,6 +4141,7 @@ export class StreamManager {
                   cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
                   // Preserve gateway-billed zero-cost behavior throughout the stream.
                   costsIncluded: streamInfo.initialMetadata?.costsIncluded,
+                  effectiveContextLimit: streamInfo.effectiveContextLimit,
                 });
                 streamInfo.currentStepStartIndex = streamInfo.parts.length;
                 this.emitTurnEvent(usageEvent);
@@ -5754,6 +5762,7 @@ export class StreamManager {
         providerMetadata: streamInfo.lastStepProviderMetadata,
         cumulativeUsage: streamInfo.cumulativeUsage,
         cumulativeProviderMetadata: streamInfo.cumulativeProviderMetadata,
+        effectiveContextLimit: streamInfo.effectiveContextLimit,
         // Replays must preserve gateway-billed zero-cost behavior from the original stream.
         costsIncluded: streamInfo.initialMetadata?.costsIncluded,
       });

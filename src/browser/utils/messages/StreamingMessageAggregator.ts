@@ -537,6 +537,7 @@ export class StreamingMessageAggregator {
     string,
     {
       // Step-level: this step only (for context window display)
+      effectiveContextLimit?: number | null;
       step: { usage: LanguageModelV2Usage; providerMetadata?: Record<string, unknown> };
       // Cumulative: sum across all steps (for live cost display)
       cumulative: { usage: LanguageModelV2Usage; providerMetadata?: Record<string, unknown> };
@@ -3966,12 +3967,17 @@ export class StreamingMessageAggregator {
    */
   handleUsageDelta(data: UsageDeltaEvent): void {
     this.activeStreamUsage.set(data.messageId, {
+      effectiveContextLimit: data.effectiveContextLimit,
       step: { usage: data.usage, providerMetadata: data.providerMetadata },
       cumulative: {
         usage: data.cumulativeUsage,
         providerMetadata: data.cumulativeProviderMetadata,
       },
     });
+  }
+
+  getActiveStreamContextLimit(messageId: string): number | null | undefined {
+    return this.activeStreamUsage.get(messageId)?.effectiveContextLimit;
   }
 
   /**

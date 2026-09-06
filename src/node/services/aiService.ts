@@ -326,11 +326,18 @@ export class AIService extends EventEmitter {
     const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const workspace = workspaceId ? this.config.findWorkspace(workspaceId) : undefined;
     const routingProjectPath = getCodexOauthProjectPath(workspace) ?? projectPath;
+    const appConfig = this.config.loadConfigOrDefault();
     const projectAccountId = routingProjectPath
-      ? this.config.loadConfigOrDefault().projects.get(routingProjectPath)?.codexOauthAccountId
+      ? appConfig.projects.get(routingProjectPath)?.codexOauthAccountId
       : undefined;
+    // Copy routing rules before metadata reads. Nested models need their own captured overrides.
+    const routeConfig = {
+      routePriority: [...(appConfig.routePriority ?? ["direct"])],
+      routeOverrides: { ...appConfig.routeOverrides },
+    };
     return {
       providersConfig,
+      routeConfig,
       metadata: this.getProvidersConfig(providersConfig),
       codexOauthSelection: {
         accountId: getCodexOauthAccountId(providersConfig.openai, projectAccountId),
@@ -577,6 +584,7 @@ export class AIService extends EventEmitter {
       ...opts,
       providersConfig: opts?.modelRoutingSnapshot?.providersConfig ?? opts?.providersConfig,
       codexOauthSelection: opts?.modelRoutingSnapshot?.codexOauthSelection,
+      routeConfig: opts?.modelRoutingSnapshot?.routeConfig,
     });
   }
 
@@ -605,6 +613,7 @@ export class AIService extends EventEmitter {
       ...opts,
       providersConfig,
       codexOauthSelection: opts?.modelRoutingSnapshot?.codexOauthSelection,
+      routeConfig: opts?.modelRoutingSnapshot?.routeConfig,
     });
     if (!result.success) {
       return result;
@@ -618,7 +627,8 @@ export class AIService extends EventEmitter {
     const effectiveModelString = this.providerModelFactory.resolveEffectiveModelString(
       modelString,
       undefined,
-      providersConfig
+      providersConfig,
+      opts?.modelRoutingSnapshot?.routeConfig
     );
     const metadataSeed = effectiveModelString.startsWith("coder:")
       ? modelString

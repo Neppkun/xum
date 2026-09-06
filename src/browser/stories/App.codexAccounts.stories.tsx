@@ -3,6 +3,7 @@ import { StrictMode } from "react";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import {
   collapseLeftSidebar,
+  expandRightSidebar,
   expandLeftSidebar,
   expandProjects,
   selectWorkspace,
@@ -10,7 +11,9 @@ import {
 import { createMockORPCClient } from "./mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "./mocks/workspaces";
 import type { APIClient } from "@/browser/contexts/API";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap, WorkspaceChatMessage } from "@/common/orpc/types";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getModelKey, RIGHT_SIDEBAR_TAB_KEY } from "@/common/constants/storage";
 import { Err, Ok } from "@/common/types/result";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 
@@ -22,12 +25,17 @@ const browserLogin =
   fn<(input: Parameters<APIClient["codexOauth"]["startDesktopFlow"]>[0]) => void>();
 const generateTitle = fn<(input: Parameters<APIClient["nameGeneration"]["generate"]>[0]) => void>();
 
-function setupAccounts(revokedWork = false, workLabel = "Work") {
+function setupAccounts(
+  revokedWork = false,
+  workLabel = "Work",
+  onChat?: (workspaceId: string, emit: (event: WorkspaceChatMessage) => void) => void,
+  workspaceId = "codex-accounts"
+) {
   expandLeftSidebar();
   startLogin.mockClear();
   browserLogin.mockClear();
   const workspace = createWorkspace({
-    id: "codex-accounts",
+    id: workspaceId,
     name: "main",
     projectName: "my-app",
     projectPath: "/projects/my-app",
@@ -56,6 +64,7 @@ function setupAccounts(revokedWork = false, workLabel = "Work") {
     workspaces: [workspace],
     providersConfig: providers,
     providersList: ["openai"],
+    onChat,
   });
   const start: APIClient["codexOauth"]["startDeviceFlow"] = (input) => {
     startLogin(input);
@@ -557,6 +566,124 @@ export const DisconnectedDefaultRecovery: AppStory = {
 export const DisconnectedDefaultRecoveryPhone: AppStory = {
   ...Phone,
   play: DisconnectedDefaultRecovery.play,
+};
+
+let contextStream: { finish: () => void; next: () => void } | undefined;
+
+function setupLiveContextLimit(workspaceId = "codex-live-limit") {
+  contextStream = undefined;
+  const model = "openai:gpt-5.5";
+  const usage = { inputTokens: 100_000, outputTokens: 0, totalTokens: 100_000 };
+  const client = setupAccounts(
+    false,
+    "Work",
+    (workspaceId, emit) => {
+      let turn = 0;
+      const start = (effectiveContextLimit: number) => {
+        turn += 1;
+        const messageId = "context-turn-" + turn;
+        emit({
+          type: "stream-start",
+          workspaceId,
+          messageId,
+          model,
+          historySequence: turn,
+          startTime: 1000 + turn,
+        });
+        emit({
+          type: "usage-delta",
+          workspaceId,
+          messageId,
+          usage,
+          cumulativeUsage: usage,
+          effectiveContextLimit,
+        });
+      };
+      contextStream = {
+        finish: () =>
+          emit({
+            type: "stream-end",
+            workspaceId,
+            messageId: "context-turn-" + turn,
+            metadata: { model, usage, contextUsage: usage },
+            parts: [{ type: "text", text: "The first turn is complete." }],
+          }),
+        next: () => start(500_000),
+      };
+      queueMicrotask(() => {
+        emit({ type: "caught-up", hasOlderHistory: false });
+        start(272_000);
+      });
+    },
+    workspaceId
+  );
+  const getConfig = client.providers.getConfig;
+  client.providers.getConfig = async () => {
+    const providers = await getConfig();
+    return {
+      ...providers,
+      openai: { ...providers.openai, models: [{ id: "gpt-5.5", contextWindowTokens: 500_000 }] },
+    };
+  };
+  updatePersistedState(getModelKey(workspaceId), model);
+  updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, "costs");
+  expandRightSidebar();
+  return client;
+}
+
+async function exerciseLiveContextLimit(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  const checkMeters = async (limit: string, percentage: string) => {
+    await waitFor(
+      async () => {
+        await expect(
+          canvas.getByRole("button", { name: new RegExp("Context usage: 100.0k / " + limit) })
+        ).toHaveAccessibleName(expect.stringContaining(percentage));
+        await expect(canvas.getByTestId("context-usage")).toHaveTextContent(limit);
+        await expect(canvas.getByTestId("context-usage")).toHaveTextContent(percentage);
+      },
+      { timeout: 10000 }
+    );
+  };
+  await checkMeters("272.0k", "36.8%");
+  // Settings changes must not alter the active request's denominator.
+  const controls = within(await openAccounts(canvasElement));
+  const global = controls.getByRole("combobox", { name: "Global default account" });
+  const project = controls.getByRole("combobox", { name: "/projects/my-app" });
+  await userEvent.selectOptions(global, "work");
+  await waitFor(() => expect(global).toHaveValue("work"));
+  await waitFor(() => expect(project).toBeEnabled());
+  await userEvent.selectOptions(project, "work");
+  await waitFor(() => expect(project).toHaveValue("work"));
+  const preference = controls.getByRole("combobox", { name: "Default auth (when both are set)" });
+  await waitFor(() => expect(preference).toBeEnabled());
+  await userEvent.selectOptions(preference, "apiKey");
+  await waitFor(() => expect(preference).toHaveValue("apiKey"));
+  await userEvent.click(
+    canvas.getAllByRole("button", { name: /Close settings|Back to previous page/ })[0]
+  );
+  await checkMeters("272.0k", "36.8%");
+  if (!contextStream) throw new Error("The live context stream is missing");
+  contextStream.finish();
+  await checkMeters("500.0k", "20.0%");
+  contextStream.next();
+  await checkMeters("500.0k", "20.0%");
+  if (window.innerWidth < 768) {
+    const meter = canvas.getByTestId("context-usage");
+    await expect(meter.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+  }
+}
+
+export const LiveContextLimit: AppStory = {
+  render: () => <AppWithMocks setup={setupLiveContextLimit} />,
+  play: async ({ canvasElement }) => exerciseLiveContextLimit(canvasElement),
+};
+
+export const LiveContextLimitPhone: AppStory = {
+  ...LiveContextLimit,
+  render: () => <AppWithMocks setup={() => setupLiveContextLimit("codex-live-limit-phone")} />,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
 };
 
 function setupLoginFailure() {

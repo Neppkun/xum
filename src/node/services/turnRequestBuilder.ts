@@ -53,6 +53,7 @@ import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
 import type { StreamManager } from "./streamManager";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import {
   type ModelFallbackOptions,
   type StreamTextOnChunk,
@@ -93,6 +94,7 @@ import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentToo
 import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
 import {
   buildProviderOptions,
+  isAnthropic1MEffectivelyEnabled,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
@@ -557,6 +559,7 @@ export interface PrepareModelAttemptOptions {
 }
 
 interface PreparedModelAttempt {
+  effectiveContextLimit: number | null;
   providerOptions: Record<string, unknown>;
   requestHeaders: Record<string, string> | undefined;
   resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
@@ -714,6 +717,17 @@ export class TurnRequestBuilder {
     };
     options.recordStartupPhaseTiming?.("buildRequestConfigMs", buildRequestConfigStartedAt);
     return {
+      // Match compaction using this request's accepted metadata and provider options.
+      effectiveContextLimit: getEffectiveContextLimit(
+        options.rawModelString,
+        isAnthropic1MEffectivelyEnabled(
+          options.rawModelString,
+          options.muxProviderOptions,
+          options.providersConfigSnapshot
+        ),
+        options.providersConfigSnapshot,
+        { openaiWireFormat: options.muxProviderOptions.openai?.wireFormat }
+      ),
       providerOptions: mergeExtras(providerOptions),
       requestHeaders,
       resolvedOverrides,
@@ -918,6 +932,7 @@ export class TurnRequestBuilder {
           ...(opts.modelRoutingSnapshot && {
             providersConfig: opts.modelRoutingSnapshot.providersConfig,
             codexOauthSelection: opts.modelRoutingSnapshot.codexOauthSelection,
+            routeConfig: opts.modelRoutingSnapshot.routeConfig,
           }),
         }
       );
@@ -1952,7 +1967,8 @@ export class TurnRequestBuilder {
         this.dependencies.providerModelFactory.resolveEffectiveModelString(
           toolModelString,
           undefined,
-          toolProvidersConfig
+          toolProvidersConfig,
+          opts.modelRoutingSnapshot?.routeConfig
         );
       const toolOnCoderRoute = toolEffectiveModelString.startsWith("coder:");
       // Creation-time identity from the SAME snapshot the model
@@ -2549,6 +2565,7 @@ export class TurnRequestBuilder {
           engineTools: attemptPayload.tools ?? attemptTools,
           toolNamesForSentinel,
           forcedFirstStepToolNames,
+          effectiveContextLimit: preparedAttempt.effectiveContextLimit,
           providerOptions: preparedAttempt.providerOptions,
           headers: preparedAttempt.requestHeaders,
           resolvedOverrides: preparedAttempt.resolvedOverrides,
@@ -2876,6 +2893,7 @@ export class TurnRequestBuilder {
                 rebuildProviderOptionsForThinkingLevel:
                   nextRequest.rebuildProviderOptionsForThinkingLevel,
                 providersConfig: nextRequest.providersConfig,
+                effectiveContextLimit: nextRequest.effectiveContextLimit,
                 initialMetadataPatch: {
                   routedThroughGateway: nextRequest.routedThroughGateway,
                   ...(nextRequest.routeProvider != null
@@ -2977,6 +2995,7 @@ export class TurnRequestBuilder {
       rebuildProviderOptionsForThinkingLevel,
       forcedFirstStepToolNames,
       providersConfigSnapshot: requestProvidersConfig,
+      effectiveContextLimit: primaryRequest.effectiveContextLimit,
       onStreamConstructed: emitPrimaryEnvelope,
       rebuildFirstStepForThinkingLevel: primaryRequest.rebuildFirstStepForThinkingLevel,
     };

@@ -623,13 +623,29 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const activeUsageModel = usage?.liveUsage?.model ?? null;
   const contextDisplayModel = activeUsageModel ?? baseModel;
   const use1M = has1MContext(contextDisplayModel);
+  const liveContextLimit = usage?.liveUsage?.effectiveContextLimit;
   const contextUsageData = useMemo(() => {
     return lastUsage
-      ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig, {
-          codexOauthAccountId,
-        })
+      ? calculateTokenMeterData(
+          lastUsage,
+          contextDisplayModel,
+          use1M,
+          false,
+          providersConfig,
+          {
+            codexOauthAccountId,
+          },
+          liveContextLimit
+        )
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
-  }, [lastUsage, contextDisplayModel, use1M, providersConfig, codexOauthAccountId]);
+  }, [
+    lastUsage,
+    contextDisplayModel,
+    use1M,
+    providersConfig,
+    codexOauthAccountId,
+    liveContextLimit,
+  ]);
   const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
     useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
   const autoCompactionProps = useMemo(
