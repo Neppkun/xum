@@ -153,6 +153,78 @@ describe("HistoryService context-budget request rejection", () => {
     }
   );
 
+  test("rejects the newest duplicate trigger identity and its own preludes without poisoning later sends", async () => {
+    const oldPrelude = createMuxMessage("old-prelude", "assistant", "accepted prelude", {
+      synthetic: true,
+    });
+    const oldTrigger = createMuxMessage("duplicate-trigger", "user", "accepted request", {
+      requestPreludeMessageIds: [oldPrelude.id],
+    });
+    const currentPrelude = createMuxMessage("current-prelude", "assistant", "rejected prelude", {
+      synthetic: true,
+    });
+    const currentTrigger = createMuxMessage(oldTrigger.id, "user", "rejected request", {
+      requestPreludeMessageIds: [currentPrelude.id],
+    });
+    expect(
+      (
+        await h.historyService.appendManyToHistory(workspaceId, [
+          oldPrelude,
+          oldTrigger,
+          currentPrelude,
+          currentTrigger,
+        ])
+      ).success
+    ).toBe(true);
+    // Simulate a repaired/replayed row that reused both identifiers, not its payload.
+    const historyPath = path.join(h.config.sessionsDir, workspaceId, "chat.jsonl");
+    const rows = [
+      oldPrelude,
+      {
+        ...oldTrigger,
+        metadata: {
+          ...oldTrigger.metadata,
+          historySequence: currentTrigger.metadata!.historySequence,
+        },
+      },
+      currentPrelude,
+      currentTrigger,
+    ];
+    const malformed = Buffer.from('{"metadata":{"contextBoundaryKind":"reset"},broken\n');
+    await fs.writeFile(
+      historyPath,
+      Buffer.concat([
+        malformed,
+        Buffer.from(rows.map((row) => JSON.stringify(row)).join("\n") + "\n"),
+      ])
+    );
+
+    const rejected = await h.historyService.rejectContextBudgetRequest(workspaceId, currentTrigger);
+    expect(rejected.success).toBe(true);
+    if (!rejected.success) throw new Error(rejected.error);
+    expect(rejected.data.map((row) => row.id)).toEqual([currentPrelude.id, currentTrigger.id]);
+    expect(
+      MuxMessageSchema.parse(restoreContextBudgetRejectedMessageForDisplay(rejected.data.at(-1)!))
+        .parts
+    ).toEqual(MuxMessageSchema.parse(currentTrigger).parts);
+    expect((await fs.readFile(historyPath)).subarray(0, malformed.length)).toEqual(malformed);
+    expect(
+      await h.historyService.rejectContextBudgetRequest(workspaceId, rejected.data.at(-1)!)
+    ).toEqual(rejected);
+    const later = createMuxMessage("later", "user", "later accepted request");
+    expect((await h.historyService.appendToHistory(workspaceId, later)).success).toBe(true);
+    const persisted = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!persisted.success) throw new Error(persisted.error);
+    const newestDuplicate = persisted.data.findLast((row) => row.id === currentTrigger.id);
+    expect(newestDuplicate?.metadata?.contextBudgetRejected).toBe(true);
+    expect(newestDuplicate?.parts).toEqual([]);
+    expect(
+      prepareProviderRequestMessages(persisted.data, "openai", "off").providerRequestMessages.map(
+        (row) => MuxMessageSchema.parse(row).parts
+      )
+    ).toEqual([oldPrelude, oldTrigger, later].map((row) => MuxMessageSchema.parse(row).parts));
+  });
+
   test("a stale trigger identity leaves the entire request unchanged", async () => {
     const payload = createMuxMessage("payload", "assistant", "Payload", { synthetic: true });
     const trigger = createMuxMessage("trigger", "user", "Request", {

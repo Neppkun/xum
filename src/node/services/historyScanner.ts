@@ -1,3 +1,4 @@
+import { createScanner, SyntaxKind } from "jsonc-parser";
 import * as fs from "node:fs/promises";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createHash } from "node:crypto";
@@ -66,6 +67,43 @@ export function hasRawResetMarker(text: string): boolean {
     (_match: string, hex: string) => String.fromCharCode(Number.parseInt(hex, 16))
   );
   return decoded.includes(SESSION_HISTORY_RESET_NEEDLE);
+}
+
+/** Call only for parsed reset candidates; oversized rows cannot establish a rollover exemption. */
+export function hasAmbiguousResetKeys(text: string): boolean {
+  if (Buffer.byteLength(text, "utf8") > SESSION_HISTORY_MAX_LINE_BYTES) return true;
+  const scanner = createScanner(text, true);
+  const scopes: Array<Set<string> | null> = [];
+  let previousString: string | undefined;
+  for (let token = scanner.scan(); token !== SyntaxKind.EOF; token = scanner.scan()) {
+    switch (token) {
+      case SyntaxKind.OpenBraceToken:
+        scopes.push(new Set());
+        break;
+      case SyntaxKind.OpenBracketToken:
+        scopes.push(null);
+        break;
+      case SyntaxKind.CloseBraceToken:
+      case SyntaxKind.CloseBracketToken:
+        scopes.pop();
+        break;
+      case SyntaxKind.StringLiteral:
+        // Token values decode escapes, so metadata and metad\\u0061ta collide.
+        previousString = scanner.getTokenValue();
+        continue;
+      case SyntaxKind.ColonToken: {
+        const keys = scopes.at(-1);
+        assert(keys && previousString !== undefined, "parsed JSON colon must follow an object key");
+        if (keys.has(previousString)) return true;
+        keys.add(previousString);
+        break;
+      }
+      default:
+        break;
+    }
+    previousString = undefined;
+  }
+  return false;
 }
 
 export interface BoundedHistoryRow {
@@ -276,6 +314,9 @@ export async function scanHistoryFilesBounded(
               rowReset = true;
               possibleReset = true;
             }
+            // Last-key-wins parsing must not disguise a manual reset as a
+            // complete rollover. Reject ambiguous objects before the exemption.
+            if (rowReset && hasAmbiguousResetKeys(line)) throw new Error();
             if (!isReadableHistoryMessage(raw)) throw new Error();
             message = normalizeLegacyMuxMetadata(raw);
           } catch {

@@ -1606,6 +1606,91 @@ describe("session_history real disk recovery", () => {
     );
   });
 
+  const rolloverJson = JSON.stringify(rollover);
+  const rolloverDetailsJson = JSON.stringify(rollover.muxMetadata);
+  for (const [name, metadataFields] of [
+    [
+      "duplicate root metadata",
+      `"metadata":{"contextBoundaryKind":"reset"},"metadata":${rolloverJson}`,
+    ],
+    [
+      "escaped equivalent root key",
+      `"metadata":{"contextBoundaryKind":"reset"},"${unicodeEscapes("metadata")}":${rolloverJson}`,
+    ],
+    [
+      "duplicate nested metadata",
+      `"metadata":{"contextBoundaryKind":"reset","muxMetadata":{"type":"manual"},"muxMetadata":${rolloverDetailsJson}}`,
+    ],
+    [
+      "duplicate nested leaf",
+      `"metadata":${rolloverJson.replace('"maxTokens":6000', '"maxTokens":0,"maxTokens":6000')}`,
+    ],
+    [
+      "escaped equivalent nested key",
+      `"metadata":${rolloverJson.replace('"reason":"on-send"', `"reason":"manual","${unicodeEscapes("reason")}":"on-send"`)}`,
+    ],
+  ]) {
+    test(`${name} cannot disguise a manual reset as a rollover in direct or resumed recovery`, async () => {
+      await append("private", "private facts");
+      const first = await call({ action: "search", query: "facts", limit: 1 });
+      expect(first.nextCursor).toBeString();
+      const ambiguousRow = `{"id":"ambiguous-reset","role":"assistant","parts":[],${metadataFields}}\n`;
+      await appendTrackedHistory(
+        chatPath,
+        ambiguousRow +
+          JSON.stringify(createMuxMessage("public-after-ambiguous", "assistant", "public facts")) +
+          "\n"
+      );
+      expect(
+        (await call({ action: "search", query: "facts", cursor: first.nextCursor })).error
+      ).toBe("stale_cursor");
+      const direct = await pages({ action: "search", query: "facts" });
+      expect(direct.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
+        "public facts",
+      ]);
+      expect(direct.reduce((sum, page) => sum + (page.malformedLines ?? 0), 0)).toBeGreaterThan(0);
+      expect((await pages({ action: "read_item", item_id: "0" })).at(-1)?.error).toBe(
+        "item_not_found"
+      );
+      // Rewriting metadata must not turn the same raw floor into a valid rollover.
+      expect((await fixture.historyService.migrateWorkspaceId("old-id", workspaceId)).success).toBe(
+        true
+      );
+      expect((await fs.readFile(chatPath)).includes(Buffer.from(ambiguousRow))).toBe(true);
+      expect(
+        (await pages({ action: "search", query: "private facts" })).flatMap(
+          (page) => page.items ?? []
+        )
+      ).toEqual([]);
+    });
+  }
+
+  test("valid rollovers allow repeated key names in distinct objects and string values", async () => {
+    await append("private", "private facts");
+    const first = await call({ action: "search", query: "facts", limit: 1 });
+    await appendTrackedHistory(
+      chatPath,
+      JSON.stringify({
+        id: "unambiguous-rollover",
+        role: "assistant",
+        parts: [],
+        metadata: {
+          ...rollover,
+          probes: [{ metadata: 1, "\\u006detadata": 2 }, { metadata: 2 }],
+          quoted: '"metadata":0,"metadata":1',
+        },
+      }) + "\n"
+    );
+    const resumed = await call({ action: "search", query: "facts", cursor: first.nextCursor });
+    expect(resumed.success).toBe(true);
+    expect(resumed.items?.map((item) => item.text)).toEqual(["private facts"]);
+    expect(
+      (await pages({ action: "read_item", item_id: "0" }))
+        .flatMap((page) => page.items ?? [])
+        .map((item) => item.text)
+    ).toEqual(["opening facts"]);
+  });
+
   test("a fully pretty-printed reset still protects the earlier transcript", async () => {
     await appendTrackedHistory(
       chatPath,

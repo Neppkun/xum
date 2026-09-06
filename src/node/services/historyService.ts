@@ -6,6 +6,7 @@ import {
 import { SESSION_HISTORY_MAX_SCAN_BYTES } from "@/common/constants/contextBudget";
 import {
   hasRawResetMarker,
+  hasAmbiguousResetKeys,
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
   type BoundedHistoryScanOptions,
@@ -2453,12 +2454,18 @@ export class HistoryService {
     messages: MuxMessage[];
   }> {
     const raw = (await this.readExistingFileBytes(filePath)) ?? Buffer.alloc(0);
-    const rows = splitHistoryLines(raw).map((line) => ({
-      raw: line,
-      message: this.parseMessages(line.toString("utf8"), filePath, (value) =>
-        isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : null
-      )[0],
-    }));
+    const rows = splitHistoryLines(raw).map((line) => {
+      const text = line.toString("utf8");
+      return {
+        raw: line,
+        message: this.parseMessages(text, filePath, (value) =>
+          isReadableHistoryMessage(value) &&
+          !(hasRawResetMarker(text) && hasAmbiguousResetKeys(text))
+            ? normalizeLegacyMuxMetadata(value)
+            : null
+        )[0],
+      };
+    });
     return { rows, messages: rows.flatMap((row) => (row.message ? [row.message] : [])) };
   }
 
@@ -2805,7 +2812,8 @@ export class HistoryService {
         invalidateHistoryAppendProvenance();
         const historyPath = this.getChatHistoryPath(workspaceId);
         const { rows, messages } = await this.readHistoryForRewrite(historyPath);
-        const triggerIndex = messages.findIndex(
+        // Match request assembly's newest identity when repaired history reuses an id/sequence.
+        const triggerIndex = messages.findLastIndex(
           (row) =>
             row?.id === trigger.id &&
             row.metadata?.historySequence === trigger.metadata?.historySequence
