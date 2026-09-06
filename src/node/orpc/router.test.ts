@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/no-unsafe-argument, @typescript-eslint/require-await, local/no-sync-fs-methods */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { createRouterClient } from "@orpc/server";
+import { createRouterClient, ORPCError } from "@orpc/server";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -242,5 +242,25 @@ describe("router config transcript mutation", () => {
     await client.config.updateChatTranscriptFullWidth({ enabled: false });
     expect((await client.config.getConfig()).chatTranscriptFullWidth).toBe(false);
     expect(config.loadConfigOrDefault().chatTranscriptFullWidth).toBeUndefined();
+  });
+
+  test("refuses procedure calls once the server has begun shutting down", async () => {
+    let shuttingDown = false;
+    const context = {
+      config,
+      serverService: { isShuttingDown: () => shuttingDown },
+    } as unknown as ORPCContext;
+    const client = createRouterClient(router(), { context });
+    expect(await client.general.ping("alive")).toBe("Pong: alive");
+
+    shuttingDown = true;
+    let error: unknown;
+    try {
+      await client.general.ping("late");
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(ORPCError);
+    expect((error as ORPCError<string, unknown>).code).toBe("SERVICE_UNAVAILABLE");
   });
 });

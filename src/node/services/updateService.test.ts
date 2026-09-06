@@ -46,7 +46,7 @@ describe("UpdateService channel persistence", () => {
     expect(service.getChannel()).toBe("stable");
   });
 
-  it("restores the runtime channel when persistence fails", async () => {
+  it("leaves the runtime untouched when persistence fails", async () => {
     const { config, setUpdateChannel } = createMockConfig("stable");
     setUpdateChannel.mockRejectedValueOnce(new Error("disk full"));
     const service = new UpdateService(config);
@@ -67,7 +67,32 @@ describe("UpdateService channel persistence", () => {
       failed = true;
     }
     expect(failed).toBe(true);
-    expect(channels).toEqual(["nightly", "stable"]);
+    expect(channels).toEqual([]);
+    expect(service.getChannel()).toBe("stable");
+  });
+
+  it("reverts the persisted channel when the runtime refuses the switch", async () => {
+    const { config, setUpdateChannel } = createMockConfig("stable");
+    const service = new UpdateService(config);
+    const internal = service as unknown as {
+      impl: { setChannel(channel: UpdateChannel): void; getChannel(): UpdateChannel };
+      currentStatus: { type: string };
+    };
+    internal.impl = {
+      setChannel: () => {
+        throw new Error("An update operation is in progress");
+      },
+      getChannel: () => "stable",
+    };
+    internal.currentStatus = { type: "downloading" };
+    let failed = false;
+    try {
+      await service.setChannel("nightly");
+    } catch {
+      failed = true;
+    }
+    expect(failed).toBe(true);
+    expect(setUpdateChannel.mock.calls.map((call) => call[0])).toEqual(["nightly", "stable"]);
     expect(service.getChannel()).toBe("stable");
   });
 });

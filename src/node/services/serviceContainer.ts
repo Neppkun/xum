@@ -699,6 +699,7 @@ export class ServiceContainer {
     // Chat recovery that housekeeping scheduled runs past its own promise and observes neither the
     // abort nor the join, so latch every session before the wait: nothing may start a stream inside
     // it, and nothing may dispatch through the provider/runtime services torn down below.
+    shutdownStep("serverService.beginShutdown", () => this.serverService.beginShutdown());
     shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
     shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
     shutdownStep("projectService.beginShutdown", () => this.projectService.beginShutdown());

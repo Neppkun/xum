@@ -154,7 +154,10 @@ export class DesktopSessionManager {
   }
 
   getSessionCount(): number {
-    return new Set([...this.sessions.keys(), ...this.startupPromises.keys()]).size;
+    const live = new Set(this.startupPromises.keys());
+    for (const [workspaceId, session] of this.sessions)
+      if (session.isAlive()) live.add(workspaceId);
+    return live.size;
   }
 
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;

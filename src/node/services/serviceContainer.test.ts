@@ -224,7 +224,8 @@ describe("ServiceContainer", () => {
       workspace.archivingWorkspaces.add("removing");
       workspace.renamingWorkspaces.add("renaming");
       releaseWorkflow = registerInProcessWorkflowRun("workflow-workspace");
-      desktop.sessions.set("desktop-live", {});
+      desktop.sessions.set("desktop-live", { isAlive: () => true });
+      desktop.sessions.set("desktop-exited", { isAlive: () => false });
       desktop.startupPromises.set("desktop-starting", new Promise(() => undefined));
       project.activeGitInits.add("/tmp/new-project");
       terminals.pendingSessionCreations.set("terminal-starting", 2);
@@ -265,7 +266,9 @@ describe("ServiceContainer", () => {
 
   it("refuses new sessions, commands, and terminals synchronously during disposal", async () => {
     services = new ServiceContainer(stores);
+    expect(services.serverService.isShuttingDown()).toBe(false);
     const disposal = services.dispose();
+    expect(services.serverService.isShuttingDown()).toBe(true);
     expect(() => services!.workspaceService.getOrCreateSession("cold-workspace")).toThrow(
       "shutting down"
     );
