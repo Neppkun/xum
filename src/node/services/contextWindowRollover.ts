@@ -114,7 +114,16 @@ export function estimateLastStepToolResults(message: MuxMessage | undefined): {
   imageParts: number;
 } {
   if (!message) return { toolResultChars: 0, imageParts: 0 };
-  const start = message.metadata?.stepStartPartIndices?.at(-1) ?? 0;
+  const indices = message.metadata?.stepStartPartIndices;
+  const lastStart = Array.isArray(indices) ? indices.at(-1) : undefined;
+  // Damaged persisted metadata must not crash a send or hide settled tool outputs.
+  const start =
+    typeof lastStart === "number" &&
+    Number.isSafeInteger(lastStart) &&
+    lastStart >= 0 &&
+    lastStart <= message.parts.length
+      ? lastStart
+      : 0;
   return estimateToolResultSize(
     message.parts
       .slice(start)

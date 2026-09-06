@@ -82,6 +82,30 @@ describe("context window rollover recovery", () => {
     ).toBe(true);
   });
 
+  test.each(
+    [1, {}, "1", null, [], [-1], [1.5], [99], ["1"], [null]].map((stepStartPartIndices) => ({
+      stepStartPartIndices,
+    }))
+  )("malformed persisted step boundaries %j conservatively retain settled outputs", (fixture) => {
+    const message = createMuxMessage("damaged-boundaries", "assistant", "", {});
+    message.parts = [
+      {
+        type: "dynamic-tool",
+        toolName: "bash",
+        toolCallId: "settled",
+        state: "output-available",
+        input: {},
+        output: "large result".repeat(1000),
+      },
+      { type: "text", text: "after the result" },
+    ];
+    const allOutputs = estimateLastStepToolResults(message);
+    expect(allOutputs.toolResultChars).toBeGreaterThan(10_000);
+    // Tolerant history loading permits damaged metadata from external edits.
+    Object.assign(message.metadata!, fixture);
+    expect(estimateLastStepToolResults(message)).toEqual(allOutputs);
+  });
+
   test("restart estimates only settled outputs from the final step, not prior steps or tool arguments", () => {
     const message = createMuxMessage("answer", "assistant", "", {
       stepStartPartIndices: [0, 2],
@@ -118,6 +142,10 @@ describe("context window rollover recovery", () => {
     expect(finalStep.imageParts).toBe(0);
     message.metadata!.stepStartPartIndices = [0];
     expect(estimateLastStepToolResults(message).toolResultChars).toBeGreaterThan(300_000);
+    message.metadata!.stepStartPartIndices = [0, message.parts.length];
+    expect(estimateLastStepToolResults(message).toolResultChars).toBeLessThan(
+      finalStep.toolResultChars
+    );
     expect(estimateLastStepToolResults(undefined)).toEqual({ toolResultChars: 0, imageParts: 0 });
   });
 });
