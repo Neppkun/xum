@@ -1236,7 +1236,10 @@ export class ProviderModelFactory {
 
     // OpenAI Codex OAuth is a valid credential path even without an API key;
     // routing should treat it as available so direct OpenAI routes are honored.
-    const hasCodexOauth = provider === "openai" && getCodexOauthAccounts(providerConfig).length > 0;
+    // Rejected slots remain for reconnect, but must not hide configured gateway routes.
+    const hasCodexOauth =
+      provider === "openai" &&
+      getCodexOauthAccounts(providerConfig).some(({ auth }) => auth.invalidReason === undefined);
 
     if (!credentials.isConfigured && !hasCodexOauth) {
       return false;

@@ -2280,6 +2280,45 @@ describe("ProviderModelFactory routing", () => {
     }
   );
 
+  it.each(["default", "work"])(
+    "skips a revoked %s OAuth slot when a gateway is configured",
+    async (accountId) => {
+      const savedKey = process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_API_KEY;
+      try {
+        await withTempConfig(async (config, factory) => {
+          const auth = {
+            type: "oauth" as const,
+            access: "access",
+            refresh: "refresh",
+            expires: Date.now() + 60_000,
+            invalidReason: "invalid_grant" as const,
+          };
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openai: {
+              ...(accountId === "default"
+                ? { codexOauth: auth }
+                : { codexOauthAccounts: { work: { label: "Work", auth } } }),
+              codexOauthDefaultAccountId: accountId,
+            },
+            openrouter: { apiKey: "or-test" },
+          });
+
+          for (const routeOverrides of [{}, { "openai:gpt-5.2": "direct" }]) {
+            await saveRoutePriority(config, ["direct", "openrouter"], { routeOverrides });
+            const result = await factory.resolveAndCreateModel("openai:gpt-5.2", "off");
+            expectSuccessfulRouteResult(result, {
+              effectiveModelString: "openrouter:openai/gpt-5.2",
+              routeProvider: "openrouter",
+            });
+          }
+        });
+      } finally {
+        if (savedKey !== undefined) process.env.OPENAI_API_KEY = savedKey;
+      }
+    }
+  );
+
   it("leaves direct-provider model strings unchanged when direct routing wins", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({

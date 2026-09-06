@@ -609,7 +609,10 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
     }
 
     // OpenAI Codex OAuth is a valid credential path even without apiKey.
-    if (providerKey === "openai" && getCodexOauthAccounts(rawConfig).length > 0) {
+    if (
+      providerKey === "openai" &&
+      getCodexOauthAccounts(rawConfig).some(({ auth }) => auth.invalidReason === undefined)
+    ) {
       return true;
     }
 

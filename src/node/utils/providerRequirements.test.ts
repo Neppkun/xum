@@ -113,6 +113,28 @@ describe("hasAnyConfiguredProvider", () => {
     expect(hasAnyConfiguredProvider(providers)).toBe(true);
   });
 
+  it.each(["default", "work"])("does not count a revoked %s account as configured", (accountId) => {
+    const savedKey = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      const auth = {
+        type: "oauth" as const,
+        access: "access",
+        refresh: "refresh",
+        expires: Date.now() + 60_000,
+        invalidReason: "invalid_grant" as const,
+      };
+      const openai =
+        accountId === "default"
+          ? { codexOauth: auth }
+          : { codexOauthAccounts: { work: { label: "Work", auth } } };
+      expect(hasAnyConfiguredProvider({ openai })).toBe(false);
+      expect(hasAnyConfiguredProvider({ openai, openrouter: { apiKey: "or-test" } })).toBe(true);
+    } finally {
+      if (savedKey !== undefined) process.env.OPENAI_API_KEY = savedKey;
+    }
+  });
+
   it("returns true for keyless providers with explicit config", () => {
     const providers: ProvidersConfig = {
       ollama: {
