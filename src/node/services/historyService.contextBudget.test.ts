@@ -1,3 +1,6 @@
+import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import { filterEmptyAssistantMessages } from "@/browser/utils/messages/modelMessageTransform";
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -71,7 +74,41 @@ describe("HistoryService context-budget request rejection", () => {
     const persisted = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!persisted.success) throw new Error(persisted.error);
     expect(persisted.data.map((row) => row.id)).toEqual(rows.map((row) => row.id));
-    expect(persisted.data.map((row) => row.parts)).toEqual(rows.map((row) => row.parts));
+    expect(
+      persisted.data.map(
+        (row) => MuxMessageSchema.parse(restoreContextBudgetRejectedMessageForDisplay(row)).parts
+      )
+    ).toEqual(rows.map((row) => MuxMessageSchema.parse(row).parts));
+    const legacySchema = MuxMessageSchema.extend({
+      metadata: MuxMessageSchema.shape.metadata
+        .unwrap()
+        .omit({
+          contextBudgetRejected: true,
+          contextBudgetRejectedMessage: true,
+        })
+        .optional(),
+    });
+    // Exercise the old assistant-only filter after discarding every field unknown to that build.
+    const legacyRows = persisted.data.map((row) => legacySchema.parse(row));
+    expect(filterEmptyAssistantMessages(legacyRows, true).map((row) => row.id)).toEqual([
+      prior.id,
+      shared.id,
+      future.id,
+    ]);
+    for (const row of result.data) {
+      expect(row.role).toBe("assistant");
+      expect(row.parts).toEqual([]);
+      expect(row.metadata?.partial).toBeUndefined();
+      expect(row.metadata?.requestPreludeMessageIds).toBeUndefined();
+      expect(row.metadata?.agentSkillSnapshot).toBeUndefined();
+      expect(row.metadata?.mcpPromptSnapshot).toBeUndefined();
+      expect(row.metadata?.fileAtMentionSnapshot).toBeUndefined();
+    }
+    const repeated = await h.historyService.rejectContextBudgetRequest(
+      workspaceId,
+      result.data.at(-1)!
+    );
+    expect(repeated).toEqual(result);
     expect(
       prepareProviderRequestMessages(persisted.data, "openai", "off").providerRequestMessages.map(
         (row) => row.id

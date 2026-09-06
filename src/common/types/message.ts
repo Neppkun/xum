@@ -931,6 +931,12 @@ export interface ModelFallbackRecord {
   refusedModels: string[];
 }
 
+export interface ContextBudgetRejectedMessage {
+  role: "user" | "assistant";
+  parts: MuxMessage["parts"];
+  metadata?: Omit<MuxMetadata, "contextBudgetRejectedMessage">;
+}
+
 // Our custom metadata type
 export interface MuxMetadata {
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
@@ -993,6 +999,8 @@ export interface MuxMetadata {
   uiVisible?: boolean;
   /** Display-only input rejected by the token-budget gate before provider submission. */
   contextBudgetRejected?: true;
+  /** Inert original content for transcript display only; never restore it for provider requests. */
+  contextBudgetRejectedMessage?: ContextBudgetRejectedMessage;
   /** Accepted snapshots and assistant payloads that must travel with this turn on retry. */
   requestPreludeMessageIds?: string[];
   /** Display-only insertion point within an assistant message that was streaming. */

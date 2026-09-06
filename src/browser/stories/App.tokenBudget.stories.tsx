@@ -1,5 +1,6 @@
 import { expect, userEvent, waitFor, within } from "@storybook/test";
 import { createMuxMessage } from "@/common/types/message";
+import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
 import { getAutoCompactionThresholdKey, getModelKey } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
@@ -196,11 +197,12 @@ export const RejectedTail: AppStory = {
               model: MODEL,
             }),
             {
-              ...createMuxMessage("rejected-tail", "user", "An oversized request was rejected.", {
-                historySequence: 3,
-                timestamp: STABLE_TIMESTAMP,
-                contextBudgetRejected: true,
-              }),
+              ...createContextBudgetRejectedMessage(
+                createMuxMessage("rejected-tail", "user", "An oversized request was rejected.", {
+                  historySequence: 3,
+                  timestamp: STABLE_TIMESTAMP,
+                })
+              ),
               type: "message",
             },
           ],

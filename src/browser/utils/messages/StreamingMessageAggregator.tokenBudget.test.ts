@@ -1,3 +1,5 @@
+import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
+import { buildEditingStateFromDisplayed } from "@/browser/utils/chatEditing";
 import {
   hasInterruptedStream,
   isEligibleForAutoRetry,
@@ -71,36 +73,94 @@ describe("token-budget replay", () => {
     expect(aggregator.getActiveStreamMessageId()).toBeUndefined();
   });
 
-  test("rejected replay tails are visible terminal barriers, not retry candidates", () => {
-    const aggregator = new StreamingMessageAggregator(CREATED_AT);
-    aggregator.loadHistoricalMessages(
-      [
-        createMuxMessage("completed-user", "user", "Already handled", { historySequence: 1 }),
-        createMuxMessage("completed-answer", "assistant", "Completed response", {
-          historySequence: 2,
-        }),
-        createMuxMessage("rejected-user", "user", "Rejected request", {
-          historySequence: 3,
-          contextBudgetRejected: true,
-        }),
-      ].map((message) => MuxMessageSchema.parse(message)),
-      false
-    );
-    const displayed = aggregator.getDisplayedMessages();
-    const tail = displayed.at(-1);
-    expect(tail).toMatchObject({ type: "user", content: "Rejected request" });
-    expect(hasInterruptedStream(displayed)).toBe(false);
-    expect(isEligibleForAutoRetry(displayed)).toBe(false);
-    expect(isPreTokenInterruptedUserTurn(tail, { reason: "startup", at: 1 })).toBe(false);
-    aggregator.loadHistoricalMessages(
-      [
-        MuxMessageSchema.parse(
-          createMuxMessage("next", "user", "New request", { historySequence: 4 })
+  test.each([false, true])(
+    "rejected replay tails are visible terminal barriers (capsule=%s)",
+    (capsule) => {
+      const aggregator = new StreamingMessageAggregator(CREATED_AT);
+      aggregator.loadHistoricalMessages(
+        [
+          createMuxMessage("completed-user", "user", "Already handled", { historySequence: 1 }),
+          createMuxMessage("completed-answer", "assistant", "Completed response", {
+            historySequence: 2,
+          }),
+          createMuxMessage("rejected-user", "user", "Rejected request", {
+            historySequence: 3,
+            contextBudgetRejected: true,
+          }),
+        ].map((message) =>
+          MuxMessageSchema.parse(
+            capsule && message.metadata?.contextBudgetRejected
+              ? createContextBudgetRejectedMessage(message)
+              : message
+          )
         ),
-      ],
-      false
+        false
+      );
+      const displayed = aggregator.getDisplayedMessages();
+      const tail = displayed.at(-1);
+      expect(tail).toMatchObject({ type: "user", content: "Rejected request" });
+      if (tail?.type !== "user") throw new Error("Expected visible rejected user input");
+      expect(buildEditingStateFromDisplayed(tail)).toMatchObject({
+        id: "rejected-user",
+        pending: { content: "Rejected request" },
+      });
+      if (capsule)
+        expect(aggregator.getAllMessages().at(-1)).toMatchObject({ role: "assistant", parts: [] });
+      expect(hasInterruptedStream(displayed)).toBe(false);
+      expect(isEligibleForAutoRetry(displayed)).toBe(false);
+      expect(isPreTokenInterruptedUserTurn(tail, { reason: "startup", at: 1 })).toBe(false);
+      aggregator.loadHistoricalMessages(
+        [
+          MuxMessageSchema.parse(
+            createMuxMessage("next", "user", "New request", { historySequence: 4 })
+          ),
+        ],
+        false
+      );
+      expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(true);
+    }
+  );
+
+  test.each(["live", "append"])("capsules replace richer original rows on %s updates", (mode) => {
+    const original = createMuxMessage(
+      "rejected",
+      "user",
+      "Editable input",
+      { historySequence: 1 },
+      [
+        {
+          type: "file",
+          url: "data:image/png;base64,abc",
+          mediaType: "image/png",
+          filename: "image.png",
+        },
+      ]
     );
-    expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(true);
+    const hidden = createMuxMessage("snapshot", "user", "Model-only file contents", {
+      historySequence: 0,
+      synthetic: true,
+      fileAtMentionSnapshot: ["@file.txt"],
+    });
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages([hidden, original], false);
+    expect(aggregator.getDisplayedMessages()).toHaveLength(1);
+    const capsules = [hidden, original].map(createContextBudgetRejectedMessage);
+    if (mode === "live") capsules.forEach((capsule) => aggregator.addMessage(capsule));
+    else aggregator.loadHistoricalMessages(capsules, false, { mode: "append" });
+    const displayed = aggregator.getDisplayedMessages();
+    expect(displayed).toHaveLength(1);
+    const user = displayed[0];
+    if (user.type !== "user") throw new Error("Expected rejected input to remain editable");
+    expect(buildEditingStateFromDisplayed(user)).toMatchObject({
+      id: original.id,
+      pending: { content: "Editable input", fileParts: [{ filename: "image.png" }] },
+    });
+    expect(hasInterruptedStream(displayed)).toBe(false);
+    expect(aggregator.getAllMessages().every((message) => message.parts.length === 0)).toBe(true);
+    // An older duplicate cannot undo the authoritative quarantine.
+    aggregator.addMessage(original);
+    expect(hasInterruptedStream(aggregator.getDisplayedMessages())).toBe(false);
+    expect(aggregator.getAllMessages().at(-1)?.parts).toEqual([]);
   });
 
   test.each([false, true])(

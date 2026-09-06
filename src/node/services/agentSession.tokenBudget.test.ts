@@ -1,3 +1,4 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -210,30 +211,51 @@ describe("AgentSession token-budget lifecycle", () => {
     );
   }
 
-  test("a rejected tail never retries the older completed turn after restart", async () => {
-    const first = await setup();
-    await seedHistory(first, 20_000);
-    const previous = await allRows(first);
-    expect((await first.session.sendMessage("oversized ".repeat(60_000), options)).success).toBe(
-      false
-    );
-    const rejected = (await allRows(first)).at(-1)!;
-    expect(rejected.metadata?.contextBudgetRejected).toBe(true);
-    first.session.dispose();
-    const h = await setup({ previous: first });
-    h.session.ensureStartupAutoRetryCheck();
-    await (h.session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
-      .startupAutoRetryCheckPromise;
-    expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
-    expect(await h.session.getStartupAutoRetryModelHint()).toBeNull();
-    expect((await h.session.resumeStream(options)).success).toBe(false);
-    expect(h.requests).toHaveLength(0);
-    expect((await allRows(h)).filter((row) => previous.some((old) => old.id === row.id))).toEqual(
-      previous
-    );
-    expect((await h.session.sendMessage("A genuinely new request", options)).success).toBe(true);
-    expect(h.requests).toHaveLength(1);
-  });
+  test.each([false, true])(
+    "a rejected tail never retries the older completed turn after restart (legacy=%s)",
+    async (legacy) => {
+      const first = await setup();
+      await seedHistory(first, 20_000);
+      const previous = await allRows(first);
+      expect((await first.session.sendMessage("oversized ".repeat(60_000), options)).success).toBe(
+        false
+      );
+      const rejected = (await allRows(first)).at(-1)!;
+      expect(rejected.metadata?.contextBudgetRejected).toBe(true);
+      expect(rejected.role).toBe("assistant");
+      expect(rejected.parts).toEqual([]);
+      expect(rejected.metadata?.partial).not.toBe(true);
+      if (legacy) {
+        // Seed the preceding flag-only representation to retain upgrade compatibility.
+        expect(
+          (
+            await first.historyService.updateHistory(
+              workspaceId,
+              createMuxMessage(rejected.id, "user", "Legacy rejected request", {
+                historySequence: rejected.metadata?.historySequence,
+                timestamp: rejected.metadata?.timestamp,
+                contextBudgetRejected: true,
+              })
+            )
+          ).success
+        ).toBe(true);
+      }
+      first.session.dispose();
+      const h = await setup({ previous: first });
+      h.session.ensureStartupAutoRetryCheck();
+      await (h.session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
+        .startupAutoRetryCheckPromise;
+      expect(h.events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
+      expect(await h.session.getStartupAutoRetryModelHint()).toBeNull();
+      expect((await h.session.resumeStream(options)).success).toBe(false);
+      expect(h.requests).toHaveLength(0);
+      expect((await allRows(h)).filter((row) => previous.some((old) => old.id === row.id))).toEqual(
+        previous
+      );
+      expect((await h.session.sendMessage("A genuinely new request", options)).success).toBe(true);
+      expect(h.requests).toHaveLength(1);
+    }
+  );
 
   test("single-user token-budget sends use append-only storage even when automatic compaction is off", async () => {
     const h = await setup();
@@ -916,9 +938,10 @@ describe("AgentSession token-budget lifecycle", () => {
     await h.session.waitForIdle();
     const shouldReject = mode !== "had-delta" && mode !== "experiment-off";
     const active = sliceMessagesForProviderFromLatestContextBoundary(await allRows(h));
-    const accepted = active.filter(
-      (row) => text(row) === "Peer trigger" || text(row) === "Oversized peer payload"
-    );
+    const accepted = active.filter((row) => {
+      const visible = restoreContextBudgetRejectedMessageForDisplay(row);
+      return text(visible) === "Peer trigger" || text(visible) === "Oversized peer payload";
+    });
     expect(accepted).toHaveLength(2);
     expect(
       prepareProviderRequestMessages(accepted, "openai", "off").providerRequestMessages
@@ -1170,9 +1193,18 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(h.requests).toHaveLength(0);
       expect((await h.session.sendMessage("Short replacement", sendOptions)).success).toBe(true);
       const rows = await allRows(h);
-      const rejected = rows.find((row) => text(row) === rejectedText.trim());
+      const rejected = rows.find(
+        (row) => text(restoreContextBudgetRejectedMessageForDisplay(row)) === rejectedText.trim()
+      );
       expect(rejected).toBeDefined();
-      expect(rejected?.metadata?.synthetic).not.toBe(true);
+      expect(rejected).toMatchObject({
+        role: "assistant",
+        parts: [],
+        metadata: { synthetic: true, uiVisible: false },
+      });
+      expect(restoreContextBudgetRejectedMessageForDisplay(rejected!).metadata?.synthetic).not.toBe(
+        true
+      );
       expect(
         prepareProviderRequestMessages([MuxMessageSchema.parse(rejected!)], "openai", "off")
           .providerRequestMessages
@@ -1207,7 +1239,9 @@ describe("AgentSession token-budget lifecycle", () => {
       });
       expect(h.requests).toHaveLength(mode === "retry" ? 2 : 1);
       const active = sliceMessagesForProviderFromLatestContextBoundary(await allRows(h));
-      const rejected = active.findLast((row) => text(row) === rejectedText);
+      const rejected = active.findLast(
+        (row) => text(restoreContextBudgetRejectedMessageForDisplay(row)) === rejectedText
+      );
       expect(rejected).toBeDefined();
       expect(
         prepareProviderRequestMessages([MuxMessageSchema.parse(rejected!)], "openai", "off")
@@ -1261,8 +1295,12 @@ describe("AgentSession token-budget lifecycle", () => {
         )
       ).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
       const active = sliceMessagesForProviderFromLatestContextBoundary(await allRows(h));
-      const trigger = active.findLast((row) => text(row) === "Read @rejected.txt")!;
-      const preludeIds = new Set(trigger.metadata?.requestPreludeMessageIds);
+      const trigger = active.findLast(
+        (row) => text(restoreContextBudgetRejectedMessageForDisplay(row)) === "Read @rejected.txt"
+      )!;
+      const preludeIds = new Set(
+        trigger.metadata?.contextBudgetRejectedMessage?.metadata?.requestPreludeMessageIds
+      );
       expect(preludeIds.size).toBe(3);
       const preludes = active.filter((row) => preludeIds.has(row.id));
       expect(

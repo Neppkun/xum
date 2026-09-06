@@ -1,4 +1,5 @@
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
+import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
@@ -2042,13 +2043,12 @@ export class AgentSession {
     return parseSubagentReportEnvelope(text)?.status === "completed";
   }
 
-  /** A rejected user row terminates retry lookup; it must never expose an older completed turn. */
+  /** Rejected rows terminate retry lookup, including empty assistant capsules from newer builds. */
   private findLastRetryUserMessage(messages: MuxMessage[]): MuxMessage | undefined {
     return messages.findLast(
       (message) =>
-        message.role === "user" &&
-        (Boolean(message.metadata?.contextBudgetRejected) ||
-          this.shouldUseUserMessageForRetry(message))
+        Boolean(message.metadata?.contextBudgetRejected) ||
+        this.shouldUseUserMessageForRetry(message)
     );
   }
 
@@ -5258,19 +5258,25 @@ export class AgentSession {
           // Without it a rejected queued send would pause a never-driven goal
           // on the next getGoal.
           timestamp: Date.now(),
-          ...(rejection.type === "context_budget_blocked" ? { contextBudgetRejected: true } : {}),
           ...(enqueuedAtMs != null ? { enqueuedAtMs } : {}),
         },
         additionalParts.length > 0 ? additionalParts : undefined
       );
-      const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
+      const persistedMessage =
+        rejection.type === "context_budget_blocked" || rejection.type === "context_budget_exceeded"
+          ? createContextBudgetRejectedMessage(userMessage)
+          : userMessage;
+      const appendResult = await this.historyService.appendToHistory(
+        this.workspaceId,
+        persistedMessage
+      );
       if (!appendResult.success) {
         log.warn("Failed to persist user message after pre-stream gate rejection", {
           workspaceId: this.workspaceId,
           error: appendResult.error,
         });
       } else if (!this.disposed) {
-        this.emitChatEvent({ ...userMessage, type: "message" });
+        this.emitChatEvent({ ...persistedMessage, type: "message" });
       }
     } catch (error) {
       log.warn("Unexpected error persisting user message after pre-stream gate rejection", {

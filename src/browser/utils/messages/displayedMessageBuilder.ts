@@ -1,3 +1,4 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
   BashMonitorWakeDisplayRecord,
   CompactionRequestData,
@@ -813,7 +814,8 @@ function buildAssistantDisplayedMessages(options: {
 export function buildDisplayedMessagesForMessage(
   options: BuildDisplayedMessagesForMessageOptions
 ): DisplayedMessage[] {
-  const { message, agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const { agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const message = restoreContextBudgetRejectedMessageForDisplay(options.message);
   const baseTimestamp = message.metadata?.timestamp;
   const historySequence = message.metadata?.historySequence ?? 0;
   const planRows = buildPlanDisplayMessages(message, historySequence);

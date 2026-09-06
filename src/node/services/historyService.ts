@@ -11,6 +11,7 @@ import {
   type BoundedHistoryScanOptions,
 } from "./historyScanner";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
+import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import * as path from "path";
 import { createHash, randomUUID } from "node:crypto";
 import { renameSync } from "node:fs";
@@ -2789,7 +2790,10 @@ export class HistoryService {
     workspaceId: string,
     trigger: MuxMessage
   ): Promise<Result<MuxMessage[]>> {
-    assert(trigger.role === "user", "context-budget rejection requires a user trigger");
+    assert(
+      trigger.role === "user" || trigger.metadata?.contextBudgetRejected === true,
+      "context-budget rejection requires a user trigger or rejected capsule"
+    );
     assert(
       isNonNegativeInteger(trigger.metadata?.historySequence),
       "rejected trigger must be persisted"
@@ -2807,10 +2811,13 @@ export class HistoryService {
             row.metadata?.historySequence === trigger.metadata?.historySequence
         );
         const persisted = messages[triggerIndex];
-        if (!persisted || persisted.role !== "user")
+        if (!persisted || (persisted.role !== "user" && !persisted.metadata?.contextBudgetRejected))
           return Err("Rejected request no longer exists");
         const preludeIds = new Set(
-          getRequestPreludeMessageIds(persisted.metadata?.requestPreludeMessageIds)
+          getRequestPreludeMessageIds(
+            persisted.metadata?.contextBudgetRejectedMessage?.metadata?.requestPreludeMessageIds ??
+              persisted.metadata?.requestPreludeMessageIds
+          )
         );
         const rejected: MuxMessage[] = [];
         const earlier = new Set(messages.slice(0, triggerIndex));
@@ -2822,10 +2829,7 @@ export class HistoryService {
             (isSyntheticSnapshotUserMessage(row) ||
               (row.role === "assistant" && row.metadata?.synthetic === true));
           if (row !== persisted && !ownedPrelude) return row;
-          const marked: MuxMessage = {
-            ...row,
-            metadata: { ...row.metadata, contextBudgetRejected: true },
-          };
+          const marked = createContextBudgetRejectedMessage(row);
           rejected.push(marked);
           return marked;
         });
