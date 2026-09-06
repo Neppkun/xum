@@ -22,6 +22,7 @@ import {
   StreamManager,
   type ModelFallbackPrepareOptions,
   type TurnEngineEvent,
+  type TurnCompletion,
   type TurnExecutionOptions,
 } from "./streamManager";
 import type {
@@ -49,6 +50,7 @@ import { closeScopeBounded } from "./di/appRuntime";
 import { Scope } from "effect";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { countTokens } from "@/node/utils/main/tokenizer";
+import * as tokenizer from "@/node/utils/main/tokenizer";
 import { shouldRunIntegrationTests, validateApiKeys } from "../../../tests/testUtils";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
@@ -56,6 +58,10 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
 import { onTurnEngineEvent } from "./streamManager.testHarness";
+import { AIService } from "./aiService";
+import { InitStateManager } from "./initStateManager";
+import { ProviderService } from "./providerService";
+import { createAgentSessionHarness } from "./agentSession.testHarness";
 
 function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
   return {
@@ -77,10 +83,15 @@ if (shouldRunIntegrationTests()) {
 
 // Real HistoryService backed by a temp directory (created fresh per test)
 let historyService: HistoryService;
+let historyConfig: Awaited<ReturnType<typeof createTestHistoryService>>["config"];
 let historyCleanup: () => Promise<void>;
 
 beforeEach(async () => {
-  ({ historyService, cleanup: historyCleanup } = await createTestHistoryService());
+  ({
+    historyService,
+    config: historyConfig,
+    cleanup: historyCleanup,
+  } = await createTestHistoryService());
 });
 
 afterEach(async () => {
@@ -1343,10 +1354,221 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(terminal.map((event) => event.type)).toEqual(["stream-abort"]);
     expect((terminal[0] as StreamAbortEvent).abortReason).toBe("system");
     // ... and the turn handle plus the registry were settled before the close resolved.
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "system" });
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
   });
+
+  test.each([
+    "tokenization",
+    "sink-sync",
+    "sink-async",
+    "preflush",
+    "processing",
+    "usage",
+    "soft-tokenization",
+    "soft-preflush",
+    "soft-usage",
+  ] as const)("abort completion survives %s failure", async (failure) => {
+    const workspaceId = `abort-failure-${failure}`;
+    const soft = failure.startsWith("soft-");
+    const failureKind = failure.replace("soft-", "");
+    const releaseBoundary = Promise.withResolvers<void>();
+    const providerEntered = Promise.withResolvers<void>();
+    const { streamManager, events } = createSupervisedStreamManagerForTests(
+      (signal) =>
+        (async function* () {
+          yield { type: "reasoning-delta", text: "unfinished reasoning" };
+          providerEntered.resolve();
+          if (soft) {
+            await releaseBoundary.promise;
+            yield { type: "text-end" };
+          }
+          if (!signal.aborted) {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener("abort", () => resolve(), { once: true })
+            );
+          }
+        })(),
+      { supervised: false }
+    );
+    const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
+    await providerEntered.promise;
+    const streamInfo = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as Record<
+      string,
+      unknown
+    >;
+    const usage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+    streamInfo.cumulativeUsage = usage;
+    const processingPromise = streamInfo.processingPromise as Promise<void>;
+    const abortController = streamInfo.abortController as AbortController;
+    const countTokensSpy = spyOn(tokenizer, "countTokens");
+    const flush = getPrivateMethodForTests<(...args: never[]) => Promise<void>>(
+      streamManager,
+      "flushPartialWrite"
+    );
+    let outcome: TurnCompletion | undefined;
+    const observed = handle.completion.then((value) => {
+      outcome = value;
+    });
+    try {
+      if (failureKind === "tokenization") {
+        countTokensSpy.mockRejectedValueOnce(new Error("tokenizer unavailable"));
+      } else if (failureKind === "sink-sync" || failureKind === "sink-async") {
+        streamManager.setEventSink((event) => {
+          events.push(event);
+          if (event.type !== "stream-abort") return;
+          if (failureKind === "sink-sync") throw new Error("synchronous sink failure");
+          return Promise.reject(new Error("asynchronous sink failure"));
+        });
+      } else if (failureKind === "preflush") {
+        Reflect.set(streamManager, "flushPartialWrite", () => {
+          Reflect.set(streamManager, "flushPartialWrite", flush);
+          return Promise.reject(new Error("pre-cancel flush failure"));
+        });
+      } else if (failureKind === "usage") {
+        Reflect.set(streamManager, "recordSessionUsage", () =>
+          Promise.reject(new Error("usage attribution unavailable"))
+        );
+      } else {
+        // A teardown failure after the provider exits rejects the processing join.
+        streamInfo.processingPromise = processingPromise.then(() => {
+          throw new Error("processing teardown failure");
+        });
+      }
+      expect(
+        (await streamManager.stopStream(workspaceId, { abortReason: "user", soft })).success
+      ).toBe(true);
+      if (soft) {
+        releaseBoundary.resolve();
+        await processingPromise;
+        await streamInfo.cancelPromise;
+      }
+      // stop intentionally does not await sink delivery; drain its settlement microtasks.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(outcome).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: {
+          messageId: handle.messageId,
+          metadata: { usage },
+        },
+      });
+      await observed;
+      expect(abortController.signal.aborted).toBe(true);
+      expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
+      expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
+    } finally {
+      countTokensSpy.mockRestore();
+      Reflect.set(streamManager, "flushPartialWrite", flush);
+      abortController.abort();
+      releaseBoundary.resolve();
+      await processingPromise;
+    }
+  });
+
+  test.each(["interrupt", "edit", "raw-listener", "partial-commit"] as const)(
+    "%s finishes and publishes its abort despite cancellation bookkeeping failure",
+    async (scenario) => {
+      const workspaceId = `session-abort-failure-${scenario}`;
+      const providerEntered = Promise.withResolvers<void>();
+      const replacementEntered = Promise.withResolvers<void>();
+      let providerCalls = 0;
+      const { streamManager } = createSupervisedStreamManagerForTests(
+        (signal) =>
+          (async function* () {
+            yield { type: "text-delta", text: "retained partial" };
+            yield { type: "reasoning-delta", text: "unfinished reasoning" };
+            if (++providerCalls === 1) providerEntered.resolve();
+            else replacementEntered.resolve();
+            if (!signal.aborted)
+              await new Promise<void>((resolve) =>
+                signal.addEventListener("abort", () => resolve(), { once: true })
+              );
+          })(),
+        { supervised: false }
+      );
+      const service = new AIService(
+        historyConfig,
+        historyService,
+        new InitStateManager(historyConfig),
+        new ProviderService(historyConfig),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        streamManager
+      );
+      let turns = 0;
+      spyOn(service, "streamMessage").mockImplementation(async () =>
+        Ok(await startSupervisedStreamForTests(streamManager, workspaceId, ++turns * 2 - 1))
+      );
+      const h = await createAgentSessionHarness({
+        workspaceId,
+        config: historyConfig,
+        historyService,
+        aiService: service,
+        streamManager,
+        captureEvents: true,
+      });
+      const countTokensSpy = spyOn(tokenizer, "countTokens");
+      const commitSpy = spyOn(historyService, "commitPartial");
+      const throwFromRawListener = () => {
+        throw new Error("raw abort subscriber failure");
+      };
+      const options = { model: "openai:gpt-4.1-mini", agentId: "exec" };
+      try {
+        await h.session.sendMessage("original", options);
+        await providerEntered.promise;
+        const streamInfo = getWorkspaceStreamsForTests(streamManager).get(workspaceId) as Record<
+          string,
+          unknown
+        >;
+        streamInfo.cumulativeUsage = { inputTokens: 120, outputTokens: 30, totalTokens: 150 };
+        if (scenario === "raw-listener") service.on("stream-abort", throwFromRawListener);
+        else if (scenario === "partial-commit")
+          commitSpy.mockRejectedValueOnce(new Error("disk unavailable"));
+        else countTokensSpy.mockRejectedValueOnce(new Error("tokenizer unavailable"));
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (!history.success) throw new Error(history.error);
+        const userId = history.data.find((message) => message.role === "user")!.id;
+        const result =
+          scenario === "edit"
+            ? await h.session.sendMessage("edited", { ...options, editMessageId: userId })
+            : await h.session.interruptStream();
+        expect(result.success).toBe(true);
+        expect(h.events.filter((event) => event.type === "stream-abort")).toMatchObject([
+          { abortReason: "user", messageId: `${workspaceId}-msg-1` },
+        ]);
+        if (scenario !== "edit") {
+          expect(h.session.isBusy()).toBe(false);
+          const partial = await historyService.readPartial(workspaceId);
+          if (scenario === "partial-commit") expect(partial).not.toBeNull();
+          else expect(partial).toBeNull();
+          if (scenario !== "partial-commit") {
+            const committed = await historyService.getHistoryFromLatestBoundary(workspaceId);
+            if (!committed.success) throw new Error(committed.error);
+            expect(
+              committed.data.find((message) => message.role === "assistant")?.metadata?.usage
+            ).toMatchObject({ inputTokens: 120, outputTokens: 30 });
+          }
+          expect((await h.session.sendMessage("next", options)).success).toBe(true);
+        }
+        await replacementEntered.promise;
+        expect(providerCalls).toBe(2);
+        expect(h.session.isBusy()).toBe(true);
+      } finally {
+        service.off("stream-abort", throwFromRawListener);
+        countTokensSpy.mockRestore();
+        commitSpy.mockRestore();
+        h.session.dispose();
+        await streamManager.stopStream(workspaceId, { abortReason: "system" });
+      }
+    }
+  );
 
   test("a wedged provider (never yields, ignores abort) cannot pin the bounded close", async () => {
     const workspaceId = "supervised-wedged-workspace";
@@ -1374,7 +1596,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
 
     const handle = await startSupervisedStreamForTests(streamManager, workspaceId);
 
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "system" });
     expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
   });
@@ -1432,7 +1654,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       expect(terminalEvents(events)).toEqual([]);
 
       releaseFinalWrite.resolve();
-      expect(await handle.completion).toEqual({ status: "completed" });
+      expect(await handle.completion).toMatchObject({ status: "completed" });
       expect(await stopPromise).toEqual(Ok(undefined));
       await completionObserved;
 
@@ -1485,7 +1707,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     expect(aborts[0].abortReason).toBe("user");
     expect(terminalEvents(events)).toHaveLength(1);
     expect(settleCount).toBe(1);
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
   });
 
@@ -1533,7 +1755,10 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     const result = await startPromise;
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("expected Ok");
-    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "system" });
+    expect(await result.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "system",
+    });
     expect(events.filter((event) => event.type === "stream-start")).toHaveLength(0);
     expect(terminalEvents(events)).toHaveLength(1);
     expect(streamManager.isStreaming(workspaceId)).toBe(false);
@@ -1564,7 +1789,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
       Ok(undefined)
     );
 
-    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+    expect(await handle.completion).toMatchObject({ status: "aborted", abortReason: "user" });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(terminalEvents(events).map((event) => event.type)).toEqual(["stream-abort"]);
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
@@ -1581,7 +1806,7 @@ describe("StreamManager - engine supervision (AppFiberScope occupant)", () => {
     );
     for (let i = 1; i <= 50; i++) {
       const handle = await startSupervisedStreamForTests(streamManager, workspaceId, i);
-      expect(await handle.completion).toEqual({ status: "completed" });
+      expect(await handle.completion).toMatchObject({ status: "completed" });
     }
     expect(getWorkspaceStreamsForTests(streamManager).size).toBe(0);
     expect(events.filter((event) => event.type === "stream-end")).toHaveLength(50);
@@ -2751,6 +2976,7 @@ describe("StreamManager - turn completion", () => {
     createStreamResult?: (request: unknown, abortController: AbortController) => unknown;
     sink?: (event: TurnEngineEvent) => void | Promise<void>;
     events?: TurnEngineEvent[];
+    systemMessageTokens?: number;
   }) {
     const streamManager = new StreamManager(
       historyService,
@@ -2775,6 +3001,7 @@ describe("StreamManager - turn completion", () => {
         messageId: input.messageId,
         model: createTestLanguageModel(),
         providedRuntimeTempDir: "",
+        initialMetadata: { systemMessageTokens: input.systemMessageTokens },
       })
     );
     expect(result.success).toBe(true);
@@ -2807,7 +3034,10 @@ describe("StreamManager - turn completion", () => {
     );
     expect(aborted.success).toBe(true);
     if (!aborted.success) throw new Error("Expected aborted startup handle");
-    expect(await aborted.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(await aborted.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "startup",
+    });
   });
 
   test("completed, failed, and debug-injected turns settle once after their terminal event", async () => {
@@ -2826,7 +3056,7 @@ describe("StreamManager - turn completion", () => {
     void completed.handle.completion.then(() => {
       completedSettlements += 1;
     });
-    expect(await completed.handle.completion).toEqual({ status: "completed" });
+    expect(await completed.handle.completion).toMatchObject({ status: "completed" });
     await Promise.resolve();
     expect(completedEvents.at(-1)?.type).toBe("stream-end");
     expect(completedSettlements).toBe(1);
@@ -2879,6 +3109,7 @@ describe("StreamManager - turn completion", () => {
     const { streamManager, handle } = await startWithStreamResult({
       workspaceId,
       messageId: "completion-abort-message",
+      systemMessageTokens: 733,
       createStreamResult: (_request, controller) =>
         createStreamResultForTests(
           (async function* () {
@@ -2922,7 +3153,13 @@ describe("StreamManager - turn completion", () => {
       expect(settled).toBe(false);
 
       releaseAbortDelivery.resolve();
-      expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
+      expect(await handle.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "user",
+        systemMessageTokens: 733,
+        streamAbort: { type: "stream-abort", workspaceId, messageId: handle.messageId },
+      });
+      expect(streamManager.getStreamInfo(workspaceId)).toBeUndefined();
       const observed = await completionObserved;
       expect(observed.partial).toBeNull();
       expect(observed.history.success).toBe(true);
@@ -3223,7 +3460,10 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
     const result = await startPromise;
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("Expected aborted startup handle");
-    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
+    expect(await result.data.completion).toMatchObject({
+      status: "aborted",
+      abortReason: "startup",
+    });
     expect(createCalled).toBe(false);
     expect(cleanupCalled).toBe(true);
     expect(processCalled).toBe(false);

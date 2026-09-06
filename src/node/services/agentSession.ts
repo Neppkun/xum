@@ -123,6 +123,7 @@ import {
   type RuntimeStatusEvent,
   type StreamAbortReason,
   type StreamEndEvent,
+  type StreamAbortEvent,
   type StreamLifecycleSnapshot,
 } from "@/common/types/stream";
 import type { GoalStreamOriginKind, WorkspaceGoalService } from "./workspaceGoalService";
@@ -871,6 +872,17 @@ export class AgentSession {
   /** Tracks whether the current stream included post-compaction attachments. */
   private activeStreamHadPostCompactionInjection = false;
 
+  // Registered before streamMessage: mock/simulation terminals can arrive before its handle.
+  private activeTurnOperation?: {
+    messageId?: string;
+    consumed: boolean;
+    startupMessageId?: string;
+    startupAbortNotified: boolean;
+    compaction: boolean;
+    started: boolean;
+    policySettlement: { promise: Promise<void>; resolve: () => void };
+  };
+
   /**
    * muxMetadata of the queued entry currently being dispatched, held from
    * dequeue until its sendMessage settles (the stream has started or failed).
@@ -1079,6 +1091,13 @@ export class AgentSession {
       return;
     }
     this.disposed = true;
+    this.activeTurnOperation?.policySettlement.resolve();
+    for (const messageId of this.compactionCompletionDecisions.keys()) {
+      this.resolveCompactionCompletionDecision(messageId, false);
+    }
+    for (const messageId of this.streamErrorRecoveryDecisions.keys()) {
+      this.resolveStreamErrorRecoveryDecision(messageId, "terminal");
+    }
     this.continuousCompactor.reset("dispose");
 
     this.activePreparedTurnAbortController?.abort();
@@ -3551,6 +3570,8 @@ export class AgentSession {
           const abortController = this.activePreparedTurnAbortController;
           this.activePreparedTurnAbortController = null;
           abortController.abort();
+          // Editing now owns history, even before its replacement reaches PREPARING.
+          this.clearActiveTurnOperation();
           this.setTurnPhase(TurnPhase.IDLE);
           preemptedPreparing = true;
         }
@@ -4263,7 +4284,7 @@ export class AgentSession {
           return Ok(undefined);
         }
 
-        // Turn-phase transitions for success are driven by stream events.
+        // Raw terminals reserve COMPLETING; delivered completion runs terminal policy.
         const streamResult = await this.streamWithHistory(
           modelForStream,
           optionsForStream,
@@ -5320,6 +5341,16 @@ export class AgentSession {
     abandonPartial?: boolean;
   }): Promise<Result<void>> {
     this.assertNotDisposed("interruptStream");
+    // Send-now callers may replace the turn immediately after this returns. Capture
+    // its settlement before any await so the old abort reaches accounting and the
+    // renderer before replacement PREPARING invalidates its operation identity.
+    // Startup edits must still preempt a blocked envelope; soft stop only requests
+    // a future boundary, so neither joins policy here.
+    const interruptedOperation = this.activeTurnOperation;
+    const interruptedPolicy =
+      options?.soft !== true && interruptedOperation?.started
+        ? interruptedOperation.policySettlement.promise
+        : undefined;
     if (options?.abandonPartial || this.midStreamCompactionPending) {
       this.continuousCompactionAbandoned = true;
       this.continuousCompactor.reset("user-interrupt");
@@ -5351,6 +5382,7 @@ export class AgentSession {
       return Err(stopResult.error);
     }
 
+    await interruptedPolicy;
     return Ok(undefined);
   }
 
@@ -5404,19 +5436,62 @@ export class AgentSession {
     return { success: false, error, failureHandled: true };
   }
 
-  private consumeTurnCompletion(handle: TurnStreamHandle): void {
-    void handle.completion
-      .then(async (outcome) => {
-        // A disposed session must not persist retry/goal state post-teardown.
-        if (outcome.status !== "failed" || this.disposed) return;
+  private clearActiveTurnOperation(): void {
+    // A replaced operation may never get a handle back (startup cancellation).
+    // Release any explicit interrupt waiter when ownership is relinquished.
+    this.activeTurnOperation?.policySettlement.resolve();
+    this.activeTurnOperation = undefined;
+  }
 
+  private isCurrentTurnOperation(operation: AgentSession["activeTurnOperation"]): boolean {
+    return !this.disposed && this.activeTurnOperation === operation;
+  }
+
+  private consumeTurnCompletion(
+    handle: TurnStreamHandle,
+    operation: NonNullable<AgentSession["activeTurnOperation"]>
+  ): Promise<void> {
+    // Never join terminal policy from the engine sink: a follow-up may await the
+    // old processingPromise. Completion is delivered only after engine cleanup.
+    return handle.completion
+      .then(async (outcome) => {
+        if (operation.consumed) return;
+        operation.consumed = true;
         try {
-          await this.handleStreamError(outcome.streamError);
+          if (!this.isCurrentTurnOperation(operation)) return;
+          switch (outcome.status) {
+            case "failed":
+              await this.handleStreamError({ ...outcome.streamError, messageId: handle.messageId });
+              break;
+            case "completed":
+              await this.handleTurnSuccess({ ...outcome.streamEnd, messageId: handle.messageId });
+              break;
+            case "aborted":
+              if (outcome.streamAbort) {
+                const payload = {
+                  ...outcome.streamAbort,
+                  messageId: handle.messageId,
+                  abortReason: outcome.abortReason,
+                };
+                if (operation.started) {
+                  await this.handleTurnAbort(payload, outcome.systemMessageTokens);
+                } else if (!operation.startupAbortNotified) {
+                  // A registered engine can abort during envelope preparation, before
+                  // provider startup. Preserve startup policy: no accounting or compaction.
+                  operation.startupAbortNotified = true;
+                  await this.handleStartupAbort(payload);
+                }
+              }
+              break;
+          }
         } finally {
-          this.resolveStreamErrorRecoveryDecision(outcome.streamError.messageId, "terminal");
+          this.resolveStreamErrorRecoveryDecision(handle.messageId, "terminal");
+          this.resolveCompactionCompletionDecision(handle.messageId, false);
+          operation.policySettlement.resolve();
         }
       })
       .catch((error: unknown) => {
+        operation.policySettlement.resolve();
         log.error("Failed to consume turn completion", {
           workspaceId: this.workspaceId,
           error: getErrorMessage(error),
@@ -5447,6 +5522,16 @@ export class AgentSession {
     if (isStreamStartAborted()) {
       return Ok(undefined);
     }
+
+    const operation: NonNullable<AgentSession["activeTurnOperation"]> = {
+      consumed: false,
+      startupAbortNotified: false,
+      compaction: false,
+      started: false,
+      policySettlement: Promise.withResolvers<void>(),
+    };
+    this.clearActiveTurnOperation();
+    this.activeTurnOperation = operation;
 
     // Reset per-stream flags (used for retries / crash-safe bookkeeping).
     this.compactionMonitor.resetForNewStream();
@@ -5642,6 +5727,7 @@ export class AgentSession {
     // emit an error event for fire-and-forget senders and then return Err;
     // collect them so the Err path resolves each exactly once.
     const preStartErrors: StreamErrorPayload[] = [];
+    operation.compaction = this.activeCompactionRequest != null;
     const streamResult = await this.aiService.streamMessage({
       messages: requestMessages,
       workspaceId: this.workspaceId,
@@ -5680,17 +5766,31 @@ export class AgentSession {
       minThinkingLevel,
       activeTurnThinkingOverride,
       onPreStartError: ({ workspaceId: _workspaceId, ...payload }) => preStartErrors.push(payload),
+      onStreamStarting: (messageId) => {
+        operation.startupMessageId = messageId;
+      },
     });
 
     if (!streamResult.success) {
-      return await this.handleStreamWithHistoryFailure(
-        streamResult.error,
-        acpPromptId,
-        preStartErrors
-      );
+      try {
+        if (!this.isCurrentTurnOperation(operation)) {
+          for (const payload of preStartErrors) {
+            this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+          }
+          return { success: false, error: streamResult.error, failureHandled: true };
+        }
+        return await this.handleStreamWithHistoryFailure(
+          streamResult.error,
+          acpPromptId,
+          preStartErrors
+        );
+      } finally {
+        operation.policySettlement.resolve();
+      }
     }
 
-    this.consumeTurnCompletion(streamResult.data);
+    operation.messageId = streamResult.data.messageId;
+    void this.consumeTurnCompletion(streamResult.data, operation);
     return Ok(undefined);
   }
 
@@ -6180,6 +6280,7 @@ export class AgentSession {
   }
 
   private async handleStreamError(data: StreamErrorPayload): Promise<void> {
+    const operation = this.activeTurnOperation;
     this.setTurnPhase(TurnPhase.COMPLETING);
 
     this.queuedProviderToolEndAbortInFlight = false;
@@ -6210,6 +6311,7 @@ export class AgentSession {
     this.setTerminalStreamLifecycle("failed");
     this.terminalStreamError = streamErrorMessage;
     await this.restoreGoalAccountingSnapshot();
+    if (!this.isCurrentTurnOperation(operation)) return;
     this.activeCompactionRequest = undefined;
     this.resetActiveStreamState();
 
@@ -6221,11 +6323,334 @@ export class AgentSession {
       type: failureType,
       message: data.error,
     });
+    if (!this.isCurrentTurnOperation(operation)) return;
     await this.updateStartupAutoRetryAbandonFromFailure(failureType, failedUserMessageId);
+    if (!this.isCurrentTurnOperation(operation)) return;
     this.resolveStreamErrorRecoveryDecision(data.messageId, "terminal");
 
     this.emitChatEvent(streamErrorMessage);
     this.setTurnPhase(TurnPhase.IDLE);
+  }
+
+  private async handleStartupAbort(payload: StreamAbortEvent): Promise<void> {
+    const operation = this.activeTurnOperation;
+    log.debug("Forwarding stream-abort without phase transition (not in STREAMING)", {
+      workspaceId: this.workspaceId,
+      turnPhase: this.turnPhase,
+    });
+
+    const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
+    if (this.turnPhase === TurnPhase.PREPARING) {
+      this.clearPreparingRuntimeStatus();
+      this.setTerminalStreamLifecycle("interrupted", {
+        abortReason: preStreamAbortReason,
+        hadAnyOutput: false,
+      });
+    }
+    if (preStreamAbortReason === "user") {
+      await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
+      if (!this.isCurrentTurnOperation(operation)) return;
+    }
+    await this.updateStartupAutoRetryAbandonFromAbort(
+      preStreamAbortReason,
+      this.activeStreamUserMessageId
+    );
+    if (!this.isCurrentTurnOperation(operation)) return;
+
+    this.queuedProviderToolEndAbortInFlight = false;
+    this.activeToolCallIds.clear();
+    this.emitChatEvent(payload);
+  }
+
+  private markStartedTurnCompleting(messageId: string): void {
+    const operation = this.activeTurnOperation;
+    if (
+      operation?.started &&
+      operation.messageId === messageId &&
+      !operation.consumed &&
+      this.isCurrentTurnOperation(operation) &&
+      this.turnPhase === TurnPhase.STREAMING
+    ) {
+      // Raw terminal observers can initiate edits before engine cleanup settles.
+      // Make those edits wait for completion instead of stopping an already-ended stream.
+      this.setTurnPhase(TurnPhase.COMPLETING);
+    }
+  }
+
+  private async handleTurnAbort(
+    payload: StreamAbortEvent,
+    systemMessageTokens?: number
+  ): Promise<void> {
+    const operation = this.activeTurnOperation;
+    this.setTurnPhase(TurnPhase.COMPLETING);
+    const activeModelForAbort = this.activeStreamContext?.modelString;
+    const activeOptionsForAbort = this.activeStreamContext?.options;
+    this.lastSystemMessageTokens = systemMessageTokens ?? this.lastSystemMessageTokens;
+    if (activeModelForAbort) {
+      this.updateUsageStateFromModelUsage({
+        model: activeModelForAbort,
+        usage: payload.metadata?.contextUsage,
+        providerMetadata:
+          payload.metadata?.contextProviderMetadata ?? payload.metadata?.providerMetadata,
+        live: false,
+      });
+    }
+    this.clearLiveUsageState();
+
+    const failedUserMessageId = this.activeStreamUserMessageId;
+    const hadCompactionRequest = this.activeCompactionRequest !== undefined;
+    const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
+    const isQueuedProviderToolEndAbort =
+      this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
+    if (abortReason === "user") {
+      await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
+      if (!this.isCurrentTurnOperation(operation)) return;
+    }
+    if (activeModelForAbort) {
+      // Forward goalKind / agentInitiated from the active stream context so
+      // an interrupted continuation/wrap stream is correctly classified
+      // as `goal_continuation` / `goal_budget_limit` and counts toward
+      // the turn cap. Without this, getGoalStreamOriginKind falls back to
+      // `"user"` and the interrupted synthetic turn would not consume a
+      // turn, under-enforcing limits (Codex P2 PRRT_kwDOPxxmWM5_t9Bu).
+      await this.recordGoalAccountingFromUsage({
+        model: activeModelForAbort,
+        usage: payload.metadata?.usage,
+        providerMetadata: payload.metadata?.providerMetadata,
+        goalKind: this.activeStreamContext?.goalKind,
+        agentInitiated: this.activeStreamContext?.agentInitiated,
+        isCompaction: hadCompactionRequest,
+      });
+      if (!this.isCurrentTurnOperation(operation)) return;
+    }
+    if (abortReason !== "user") {
+      await this.workspaceGoalService?.applyPendingAfterStreamEnd(this.workspaceId);
+      if (!this.isCurrentTurnOperation(operation)) return;
+    }
+    this.setTerminalStreamLifecycle("interrupted", { abortReason });
+    this.activeCompactionRequest = undefined;
+    this.resetActiveStreamState();
+    if (!hadCompactionRequest && activeModelForAbort && !this.continuousCompactionAbandoned) {
+      await this.observeContinuousCompactionAtStreamEnd(activeModelForAbort, activeOptionsForAbort);
+      if (!this.isCurrentTurnOperation(operation)) return;
+    }
+    if (hadCompactionRequest && !this.disposed) {
+      this.clearQueue();
+    }
+    if (!isQueuedProviderToolEndAbort) {
+      await this.handleStreamFailureForAutoRetry({
+        type: "aborted",
+        message: abortReason,
+      });
+      if (!this.isCurrentTurnOperation(operation)) return;
+    }
+    await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
+    if (!this.isCurrentTurnOperation(operation)) return;
+    this.emitChatEvent(payload);
+    const dispatchedQueuedMessage =
+      !this.midStreamCompactionPending &&
+      !this.continuousCompactor.isApplying() &&
+      this.dispatchQueuedProviderToolEndMessageAfterAbort(abortReason);
+    if (!dispatchedQueuedMessage) {
+      this.setTurnPhase(TurnPhase.IDLE);
+    }
+  }
+
+  private async handleTurnSuccess(payload: StreamEndEvent): Promise<void> {
+    const operation = this.activeTurnOperation;
+    this.setTurnPhase(TurnPhase.COMPLETING);
+    this.retryManager.handleStreamSuccess();
+    await this.clearStartupAutoRetryAbandon();
+    if (!this.isCurrentTurnOperation(operation)) return;
+
+    const streamEndPayload = payload;
+    const activeStreamGoalKind = this.activeStreamContext?.goalKind;
+    const activeStreamOptions = this.activeStreamContext?.options;
+
+    let goalContinuationRequest: {
+      sendOptions: SendMessageOptions;
+      streamEndedAtMs: number;
+    } | null = null;
+    let emittedStreamEnd = false;
+    const completedCompactionRequest = this.activeCompactionRequest;
+    let continuedAfterCompaction = false;
+
+    try {
+      this.activeCompactionRequest = undefined;
+      this.lastSystemMessageTokens =
+        streamEndPayload.metadata.systemMessageTokens ?? this.lastSystemMessageTokens;
+      this.updateUsageStateFromModelUsage({
+        model: streamEndPayload.metadata.model,
+        usage: streamEndPayload.metadata.contextUsage,
+        providerMetadata:
+          streamEndPayload.metadata.contextProviderMetadata ??
+          streamEndPayload.metadata.providerMetadata,
+        live: false,
+      });
+      this.clearLiveUsageState();
+
+      const handled = await this.compactionHandler.handleCompletion(
+        streamEndPayload,
+        completedCompactionRequest?.id
+      );
+      if (!this.isCurrentTurnOperation(operation)) return;
+
+      await this.recordGoalAccountingFromUsage({
+        model: streamEndPayload.metadata.model,
+        usage: streamEndPayload.metadata.usage,
+        providerMetadata: streamEndPayload.metadata.providerMetadata,
+        metadataModel: streamEndPayload.metadata.metadataModel,
+        goalKind: this.activeStreamContext?.goalKind,
+        agentInitiated: this.activeStreamContext?.agentInitiated,
+        isCompaction: handled,
+      });
+      if (!this.isCurrentTurnOperation(operation)) return;
+      await this.workspaceGoalService?.applyPendingAfterStreamEnd(this.workspaceId);
+      if (!this.isCurrentTurnOperation(operation)) return;
+
+      if (!handled) {
+        this.emitChatEvent(payload);
+        emittedStreamEnd = true;
+
+        if (this.ackPendingPostCompactionStateOnStreamEnd) {
+          this.ackPendingPostCompactionStateOnStreamEnd = false;
+          try {
+            await this.compactionHandler.ackPendingStateConsumed();
+            if (!this.isCurrentTurnOperation(operation)) return;
+          } catch (error) {
+            log.warn("Failed to ack pending post-compaction state", {
+              workspaceId: this.workspaceId,
+              error: getErrorMessage(error),
+            });
+          }
+          this.onPostCompactionStateChange?.();
+        }
+      } else {
+        // CompactionHandler emits its own sanitized stream-end; mark as handled
+        // so the catch block doesn't re-emit the unsanitized original payload.
+        emittedStreamEnd = true;
+
+        // Compaction collapses history to a boundary summary, so prior context-usage snapshots
+        // are stale. Clear them to prevent immediate re-trigger loops on the follow-up turn.
+        this.clearUsageState();
+
+        if (completedCompactionRequest?.source === "auto-compaction") {
+          this.emitChatEvent({
+            type: "auto-compaction-completed",
+            newUsagePercent: 0,
+          });
+        }
+      }
+
+      // IMPORTANT: reset BEFORE anything that can start a new stream,
+      // so the next turn doesn't get its state clobbered by our cleanup.
+      this.resetActiveStreamState();
+      if (!handled && !completedCompactionRequest) {
+        await this.observeContinuousCompactionAtStreamEnd(
+          streamEndPayload.metadata.model,
+          activeStreamOptions
+        );
+        if (!this.isCurrentTurnOperation(operation)) return;
+      }
+
+      if (handled) {
+        // Dispatch follow-up AFTER reset so it can set its own stream state. Child lifecycle
+        // settlement defers only when this durable continuation was actually accepted.
+        // RLM keep-recent floor: when tail copies were appended the summary is
+        // not the last row, so target it by ID (stashed in onCompactionComplete).
+        const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
+        this.pendingCompactionFollowUpSummaryId = null;
+        continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
+        if (!this.isCurrentTurnOperation(operation)) return;
+      }
+
+      // Stream end: auto-send queued messages (for user messages typed during streaming)
+      // and suppress goal continuations for external slash workflow follow-ups waiting on idle.
+      // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
+      const hadQueuedMessages = this.hasPendingManualFollowUp();
+      const continuousApplyPending =
+        this.midStreamCompactionPending || this.continuousCompactor.isApplying();
+      if (this.deferQueuedFlushUntilAfterEdit || continuousApplyPending) {
+        this.queuedProviderToolEndAbortInFlight = false;
+        // Clear the queued-message signal while the edit flow owns the next dispatch.
+        this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
+        // Do not dispatch stream-end follow-ups while the edit flow is waiting
+        // for IDLE; truncation must run before any synthetic turn resumes.
+      } else {
+        this.sendQueuedMessages();
+      }
+
+      if (
+        !handled &&
+        !this.deferQueuedFlushUntilAfterEdit &&
+        !continuousApplyPending &&
+        !hadQueuedMessages
+      ) {
+        const sendOptions = activeStreamOptions ?? {
+          model: streamEndPayload.metadata.model,
+          agentId: WORKSPACE_DEFAULTS.agentId,
+        };
+        if (sendOptions.agentId !== "plan" && sendOptions.agentId !== "compact") {
+          // If a `goal_continuation` turn ended without any tool calls,
+          // interpret the text-only finish as an implicit `complete_goal`.
+          // The continuation prompt asks the agent to call `complete_goal`
+          // explicitly, but real models sometimes finish with a plain
+          // "looks done" reply instead — without this fallback the
+          // continuation loop would re-fire on the same idle output until
+          // budget/cooldown gates intervene. We restrict to continuation
+          // turns (not user messages, not budget-limit wrap-ups) so a
+          // user's first manual turn answered with text is never
+          // mistaken for completion. `requestContinuationAfterStreamEnd`
+          // below safely no-ops once the goal flips to `complete`.
+          if (activeStreamGoalKind === GOAL_CONTINUATION_KIND) {
+            await this.maybeAutoCompleteGoalFromSilentContinuation(streamEndPayload);
+            if (!this.isCurrentTurnOperation(operation)) return;
+          }
+
+          goalContinuationRequest = {
+            sendOptions,
+            streamEndedAtMs: Date.now(),
+          };
+        }
+      }
+    } catch (error) {
+      const streamEndCleanupError = getErrorMessage(error);
+      log.error("stream-end cleanup failed", {
+        workspaceId: this.workspaceId,
+        error: streamEndCleanupError,
+      });
+
+      // Defense-in-depth: unblock renderer if compaction handler threw before we emitted.
+      if (this.isCurrentTurnOperation(operation) && !emittedStreamEnd) {
+        try {
+          this.emitChatEvent(payload);
+        } catch {
+          // Best-effort; don't mask the original error.
+        }
+      }
+    } finally {
+      if (completedCompactionRequest != null) {
+        this.resolveCompactionCompletionDecision(
+          streamEndPayload.messageId,
+          continuedAfterCompaction
+        );
+      }
+
+      // Only clean up if we're still in COMPLETING — a new turn started by
+      // dispatchPendingFollowUp() or sendQueuedMessages()
+      // owns the stream state now.
+      if (this.isCurrentTurnOperation(operation) && this.turnPhase === TurnPhase.COMPLETING) {
+        this.resetActiveStreamState();
+        this.setTurnPhase(TurnPhase.IDLE);
+        if (goalContinuationRequest != null) {
+          await this.workspaceGoalService?.requestContinuationAfterStreamEnd({
+            workspaceId: this.workspaceId,
+            sendOptions: goalContinuationRequest.sendOptions,
+            streamEndedAtMs: goalContinuationRequest.streamEndedAtMs,
+          });
+        }
+      }
+    }
   }
 
   private attachAiListeners(): void {
@@ -6251,6 +6676,10 @@ export class AgentSession {
 
     forward("stream-start", (payload) => {
       if (payload.type === "stream-start") {
+        if (this.activeTurnOperation && !this.activeTurnOperation.consumed) {
+          this.activeTurnOperation.messageId = payload.messageId;
+          this.activeTurnOperation.started = true;
+        }
         this.continuousCompactionAbandoned = false;
         this.dispatchingQueuedEntry = false;
         this.dispatchingQueuedEntryMuxMetadata = undefined;
@@ -6461,118 +6890,20 @@ export class AgentSession {
         await this.interruptForCompaction();
       }
     });
-    forward("stream-abort", async (payload) => {
-      if (payload.type !== "stream-abort") {
-        this.emitChatEvent(payload);
-        return;
+    forward("stream-abort", (payload) => {
+      if (payload.type !== "stream-abort") return;
+      const operation = this.activeTurnOperation;
+      // Only the facade's synthetic startup identity (or an empty no-stream ID)
+      // is handleless. A registered STARTING engine may abort before stream-start;
+      // its assistant-ID event still belongs exclusively to delivered completion.
+      if (
+        !payload.messageId ||
+        (operation?.startupMessageId === payload.messageId && !operation.startupAbortNotified)
+      ) {
+        if (operation) operation.startupAbortNotified = true;
+        return this.handleStartupAbort(payload);
       }
-
-      // stopStream() emits synthetic aborts even when no real stream is active
-      // (e.g., during PREPARING or after COMPLETING). We must still forward the
-      // event to the renderer so it clears "starting…" / "interrupting…" UI, but
-      // we must NOT clobber the turn phase or reset stream state — the originating
-      // code path handles its own transition back to IDLE:
-      //   PREPARING → sendMessage error handler / sendQueuedMessages .then() handler
-      //   COMPLETING → stream-end finally block
-      if (this.turnPhase !== TurnPhase.STREAMING) {
-        log.debug("Forwarding stream-abort without phase transition (not in STREAMING)", {
-          workspaceId: this.workspaceId,
-          turnPhase: this.turnPhase,
-        });
-
-        const preStreamAbortReason = "abortReason" in payload ? payload.abortReason : undefined;
-        if (this.turnPhase === TurnPhase.PREPARING) {
-          this.clearPreparingRuntimeStatus();
-          this.setTerminalStreamLifecycle("interrupted", {
-            abortReason: preStreamAbortReason,
-            hadAnyOutput: false,
-          });
-        }
-        if (preStreamAbortReason === "user") {
-          await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
-        }
-        await this.updateStartupAutoRetryAbandonFromAbort(
-          preStreamAbortReason,
-          this.activeStreamUserMessageId
-        );
-
-        this.queuedProviderToolEndAbortInFlight = false;
-        this.activeToolCallIds.clear();
-        this.emitChatEvent(payload);
-        return;
-      }
-
-      this.setTurnPhase(TurnPhase.COMPLETING);
-      const activeModelForAbort = this.activeStreamContext?.modelString;
-      const activeOptionsForAbort = this.activeStreamContext?.options;
-      this.lastSystemMessageTokens =
-        this.streamManager.getStreamInfo(this.workspaceId)?.initialMetadata?.systemMessageTokens ??
-        this.lastSystemMessageTokens;
-      if (activeModelForAbort) {
-        this.updateUsageStateFromModelUsage({
-          model: activeModelForAbort,
-          usage: payload.metadata?.contextUsage,
-          providerMetadata:
-            payload.metadata?.contextProviderMetadata ?? payload.metadata?.providerMetadata,
-          live: false,
-        });
-      }
-      this.clearLiveUsageState();
-
-      const failedUserMessageId = this.activeStreamUserMessageId;
-      const hadCompactionRequest = this.activeCompactionRequest !== undefined;
-      const abortReason = "abortReason" in payload ? payload.abortReason : undefined;
-      const isQueuedProviderToolEndAbort =
-        this.queuedProviderToolEndAbortInFlight && abortReason !== "user";
-      if (abortReason === "user") {
-        await this.workspaceGoalService?.recordUserStoppedStream(this.workspaceId);
-      }
-      if (activeModelForAbort) {
-        // Forward goalKind / agentInitiated from the active stream context so
-        // an interrupted continuation/wrap stream is correctly classified
-        // as `goal_continuation` / `goal_budget_limit` and counts toward
-        // the turn cap. Without this, getGoalStreamOriginKind falls back to
-        // `"user"` and the interrupted synthetic turn would not consume a
-        // turn, under-enforcing limits (Codex P2 PRRT_kwDOPxxmWM5_t9Bu).
-        await this.recordGoalAccountingFromUsage({
-          model: activeModelForAbort,
-          usage: payload.metadata?.usage,
-          providerMetadata: payload.metadata?.providerMetadata,
-          goalKind: this.activeStreamContext?.goalKind,
-          agentInitiated: this.activeStreamContext?.agentInitiated,
-          isCompaction: hadCompactionRequest,
-        });
-      }
-      if (abortReason !== "user") {
-        await this.workspaceGoalService?.applyPendingAfterStreamEnd(this.workspaceId);
-      }
-      this.setTerminalStreamLifecycle("interrupted", { abortReason });
-      this.activeCompactionRequest = undefined;
-      this.resetActiveStreamState();
-      if (!hadCompactionRequest && activeModelForAbort && !this.continuousCompactionAbandoned) {
-        await this.observeContinuousCompactionAtStreamEnd(
-          activeModelForAbort,
-          activeOptionsForAbort
-        );
-      }
-      if (hadCompactionRequest && !this.disposed) {
-        this.clearQueue();
-      }
-      if (!isQueuedProviderToolEndAbort) {
-        await this.handleStreamFailureForAutoRetry({
-          type: "aborted",
-          message: abortReason,
-        });
-      }
-      await this.updateStartupAutoRetryAbandonFromAbort(abortReason, failedUserMessageId);
-      this.emitChatEvent(payload);
-      const dispatchedQueuedMessage =
-        !this.midStreamCompactionPending &&
-        !this.continuousCompactor.isApplying() &&
-        this.dispatchQueuedProviderToolEndMessageAfterAbort(abortReason);
-      if (!dispatchedQueuedMessage) {
-        this.setTurnPhase(TurnPhase.IDLE);
-      }
+      this.markStartedTurnCompleting(payload.messageId);
     });
     forward("runtime-status", (payload) => {
       if (payload.type === "runtime-status") {
@@ -6581,200 +6912,20 @@ export class AgentSession {
       this.emitChatEvent(payload);
     });
 
-    forward("stream-end", async (payload) => {
-      if (payload.type !== "stream-end") {
-        this.emitChatEvent(payload);
-        return;
+    forward("stream-end", (payload) => {
+      if (payload.type !== "stream-end") return;
+      const operation = this.activeTurnOperation;
+      // TaskService observes raw events before acquiring its workspace lock. Publish
+      // the decision now, while compaction context and queue attribution still exist.
+      if (
+        operation?.messageId === payload.messageId &&
+        operation.compaction &&
+        !operation.consumed
+      ) {
+        this.beginCompactionCompletionDecision(payload.messageId);
       }
-
-      this.setTurnPhase(TurnPhase.COMPLETING);
-      this.retryManager.handleStreamSuccess();
-      await this.clearStartupAutoRetryAbandon();
-
-      const streamEndPayload = payload;
-      const activeStreamGoalKind = this.activeStreamContext?.goalKind;
-      const activeStreamOptions = this.activeStreamContext?.options;
-
-      let goalContinuationRequest: {
-        sendOptions: SendMessageOptions;
-        streamEndedAtMs: number;
-      } | null = null;
-      let emittedStreamEnd = false;
-      const completedCompactionRequest = this.activeCompactionRequest;
-      let continuedAfterCompaction = false;
-
-      try {
-        this.activeCompactionRequest = undefined;
-        if (completedCompactionRequest != null) {
-          this.beginCompactionCompletionDecision(streamEndPayload.messageId);
-        }
-        this.lastSystemMessageTokens =
-          streamEndPayload.metadata.systemMessageTokens ?? this.lastSystemMessageTokens;
-        this.updateUsageStateFromModelUsage({
-          model: streamEndPayload.metadata.model,
-          usage: streamEndPayload.metadata.contextUsage,
-          providerMetadata:
-            streamEndPayload.metadata.contextProviderMetadata ??
-            streamEndPayload.metadata.providerMetadata,
-          live: false,
-        });
-        this.clearLiveUsageState();
-
-        const handled = await this.compactionHandler.handleCompletion(
-          streamEndPayload,
-          completedCompactionRequest?.id
-        );
-
-        await this.recordGoalAccountingFromUsage({
-          model: streamEndPayload.metadata.model,
-          usage: streamEndPayload.metadata.usage,
-          providerMetadata: streamEndPayload.metadata.providerMetadata,
-          metadataModel: streamEndPayload.metadata.metadataModel,
-          goalKind: this.activeStreamContext?.goalKind,
-          agentInitiated: this.activeStreamContext?.agentInitiated,
-          isCompaction: handled,
-        });
-        await this.workspaceGoalService?.applyPendingAfterStreamEnd(this.workspaceId);
-
-        if (!handled) {
-          this.emitChatEvent(payload);
-          emittedStreamEnd = true;
-
-          if (this.ackPendingPostCompactionStateOnStreamEnd) {
-            this.ackPendingPostCompactionStateOnStreamEnd = false;
-            try {
-              await this.compactionHandler.ackPendingStateConsumed();
-            } catch (error) {
-              log.warn("Failed to ack pending post-compaction state", {
-                workspaceId: this.workspaceId,
-                error: getErrorMessage(error),
-              });
-            }
-            this.onPostCompactionStateChange?.();
-          }
-        } else {
-          // CompactionHandler emits its own sanitized stream-end; mark as handled
-          // so the catch block doesn't re-emit the unsanitized original payload.
-          emittedStreamEnd = true;
-
-          // Compaction collapses history to a boundary summary, so prior context-usage snapshots
-          // are stale. Clear them to prevent immediate re-trigger loops on the follow-up turn.
-          this.clearUsageState();
-
-          if (completedCompactionRequest?.source === "auto-compaction") {
-            this.emitChatEvent({
-              type: "auto-compaction-completed",
-              newUsagePercent: 0,
-            });
-          }
-        }
-
-        // IMPORTANT: reset BEFORE anything that can start a new stream,
-        // so the next turn doesn't get its state clobbered by our cleanup.
-        this.resetActiveStreamState();
-        if (!handled && !completedCompactionRequest) {
-          await this.observeContinuousCompactionAtStreamEnd(
-            streamEndPayload.metadata.model,
-            activeStreamOptions
-          );
-        }
-
-        if (handled) {
-          // Dispatch follow-up AFTER reset so it can set its own stream state. Child lifecycle
-          // settlement defers only when this durable continuation was actually accepted.
-          // RLM keep-recent floor: when tail copies were appended the summary is
-          // not the last row, so target it by ID (stashed in onCompactionComplete).
-          const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
-          this.pendingCompactionFollowUpSummaryId = null;
-          continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
-        }
-
-        // Stream end: auto-send queued messages (for user messages typed during streaming)
-        // and suppress goal continuations for external slash workflow follow-ups waiting on idle.
-        // P2: if an edit is waiting, skip the queue flush so the edit truncates first.
-        const hadQueuedMessages = this.hasPendingManualFollowUp();
-        const continuousApplyPending =
-          this.midStreamCompactionPending || this.continuousCompactor.isApplying();
-        if (this.deferQueuedFlushUntilAfterEdit || continuousApplyPending) {
-          this.queuedProviderToolEndAbortInFlight = false;
-          // Clear the queued-message signal while the edit flow owns the next dispatch.
-          this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
-          // Do not dispatch stream-end follow-ups while the edit flow is waiting
-          // for IDLE; truncation must run before any synthetic turn resumes.
-        } else {
-          this.sendQueuedMessages();
-        }
-
-        if (
-          !handled &&
-          !this.deferQueuedFlushUntilAfterEdit &&
-          !continuousApplyPending &&
-          !hadQueuedMessages
-        ) {
-          const sendOptions = activeStreamOptions ?? {
-            model: streamEndPayload.metadata.model,
-            agentId: WORKSPACE_DEFAULTS.agentId,
-          };
-          if (sendOptions.agentId !== "plan" && sendOptions.agentId !== "compact") {
-            // If a `goal_continuation` turn ended without any tool calls,
-            // interpret the text-only finish as an implicit `complete_goal`.
-            // The continuation prompt asks the agent to call `complete_goal`
-            // explicitly, but real models sometimes finish with a plain
-            // "looks done" reply instead — without this fallback the
-            // continuation loop would re-fire on the same idle output until
-            // budget/cooldown gates intervene. We restrict to continuation
-            // turns (not user messages, not budget-limit wrap-ups) so a
-            // user's first manual turn answered with text is never
-            // mistaken for completion. `requestContinuationAfterStreamEnd`
-            // below safely no-ops once the goal flips to `complete`.
-            if (activeStreamGoalKind === GOAL_CONTINUATION_KIND) {
-              await this.maybeAutoCompleteGoalFromSilentContinuation(streamEndPayload);
-            }
-
-            goalContinuationRequest = {
-              sendOptions,
-              streamEndedAtMs: Date.now(),
-            };
-          }
-        }
-      } catch (error) {
-        const streamEndCleanupError = getErrorMessage(error);
-        log.error("stream-end cleanup failed", {
-          workspaceId: this.workspaceId,
-          error: streamEndCleanupError,
-        });
-
-        // Defense-in-depth: unblock renderer if compaction handler threw before we emitted.
-        if (!emittedStreamEnd) {
-          try {
-            this.emitChatEvent(payload);
-          } catch {
-            // Best-effort; don't mask the original error.
-          }
-        }
-      } finally {
-        if (completedCompactionRequest != null) {
-          this.resolveCompactionCompletionDecision(
-            streamEndPayload.messageId,
-            continuedAfterCompaction
-          );
-        }
-
-        // Only clean up if we're still in COMPLETING — a new turn started by
-        // dispatchPendingFollowUp() or sendQueuedMessages()
-        // owns the stream state now.
-        if (this.turnPhase === TurnPhase.COMPLETING) {
-          this.resetActiveStreamState();
-          this.setTurnPhase(TurnPhase.IDLE);
-          if (goalContinuationRequest != null) {
-            await this.workspaceGoalService?.requestContinuationAfterStreamEnd({
-              workspaceId: this.workspaceId,
-              sendOptions: goalContinuationRequest.sendOptions,
-              streamEndedAtMs: goalContinuationRequest.streamEndedAtMs,
-            });
-          }
-        }
-      }
+      // Register the decision before this transition emits a reentrant lifecycle event.
+      this.markStartedTurnCompleting(payload.messageId);
     });
 
     const errorHandler = (...args: unknown[]) => {
@@ -6840,6 +6991,7 @@ export class AgentSession {
 
   private setTurnPhase(next: TurnPhase): void {
     this.turnPhase = next;
+    if (next === TurnPhase.PREPARING) this.clearActiveTurnOperation();
     this.clearPreparingRuntimeStatus();
 
     if (next !== TurnPhase.IDLE) {
@@ -7411,7 +7563,7 @@ export class AgentSession {
 
   async waitForPendingCompactionCompletionDecision(messageId: string): Promise<boolean> {
     if (!this.compactionCompletionDecisions.has(messageId)) {
-      if (this.activeCompactionRequest == null) return false;
+      if (this.disposed || this.activeCompactionRequest == null) return false;
       this.beginCompactionCompletionDecision(messageId);
     }
     const decision = this.compactionCompletionDecisions.get(messageId);
