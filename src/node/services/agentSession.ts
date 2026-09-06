@@ -3834,15 +3834,23 @@ export class AgentSession {
       await this.seedUsageStateFromHistory();
       const prepared = await this.prepareContextBudgetSend(userMessage, optionsForStream);
       if (!prepared.success) {
-        if (isManualUserMessage)
-          await this.preserveRejectedManualSend(
+        if (isManualUserMessage) {
+          const actionable = await this.preserveRejectedManualSend(
             message,
             options,
             prepared.error,
             internal?.enqueuedAtMs
           );
-        else
+          // Rejection does not cancel the user's intervention; match the pricing gate's safety.
+          if (actionable) {
+            await this.applyManualUserMessageGoalSafety({
+              policy: "pause",
+              enqueuedAtMs: internal?.enqueuedAtMs,
+            });
+          }
+        } else {
           this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(prepared.error)));
+        }
         return prepared;
       }
       contextBudgetPrefix = prepared.data.prefix;
