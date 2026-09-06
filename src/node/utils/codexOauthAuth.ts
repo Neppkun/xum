@@ -114,8 +114,10 @@ export function getCodexOauthAccounts(config: unknown): Array<{
       )
         continue;
       const auth = parseCodexOauthAuth(entry.auth);
-      if (!auth || typeof entry.label !== "string" || !entry.label.trim()) continue;
-      accounts.push({ id, label: entry.label.trim(), auth });
+      if (!auth) continue;
+      // Damaged display labels must not hide credentials from reconnect, rename, or disconnect.
+      const label = typeof entry.label === "string" ? entry.label.trim() : "";
+      accounts.push({ id, label: label || id, auth });
     }
   }
   return accounts;

@@ -189,6 +189,8 @@ function generateWorkspaceStatusEffect(
       });
     }
 
+    // Retries belong to one operation. Keep its billing identity when settings change.
+    const modelRoutingSnapshot = aiService.captureModelRoutingSnapshot(options.workspaceId);
     const maxAttempts = Math.min(candidates.length, 3);
     let lastError: NameGenerationError | null = null;
     // Track whether any candidate's createModel call succeeded — i.e., whether
@@ -210,6 +212,7 @@ function generateWorkspaceStatusEffect(
         aiService.createModelWithPinnedMetadata(modelString, {
           agentInitiated: true,
           workspaceId: options.workspaceId,
+          modelRoutingSnapshot,
         })
       );
       if (!modelResult.success) {

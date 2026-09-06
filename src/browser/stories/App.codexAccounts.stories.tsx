@@ -22,7 +22,7 @@ const browserLogin =
   fn<(input: Parameters<APIClient["codexOauth"]["startDesktopFlow"]>[0]) => void>();
 const generateTitle = fn<(input: Parameters<APIClient["nameGeneration"]["generate"]>[0]) => void>();
 
-function setupAccounts(revokedWork = false) {
+function setupAccounts(revokedWork = false, workLabel = "Work") {
   expandLeftSidebar();
   startLogin.mockClear();
   browserLogin.mockClear();
@@ -45,7 +45,7 @@ function setupAccounts(revokedWork = false) {
       codexOauthDefaultAccountId: revokedWork ? "work" : undefined,
       codexOauthAccounts: [
         { id: "default", label: "Personal" },
-        { id: "work", label: "Work", reconnectRequired: revokedWork || undefined },
+        { id: "work", label: workLabel, reconnectRequired: revokedWork || undefined },
       ],
     },
   };
@@ -317,6 +317,70 @@ export const KeyboardCommandsPhone: AppStory = {
   ...Phone,
   render: KeyboardCommands.render,
   play: KeyboardCommands.play,
+};
+
+async function exerciseDuplicateAccountLabels(canvasElement: HTMLElement) {
+  const section = await openAccounts(canvasElement);
+  const controls = within(section);
+  const global = controls.getByRole("combobox", { name: "Global default account" });
+  const project = controls.getByRole("combobox", { name: "/projects/my-app" });
+  const first = within(global).getByRole("option", { name: /Personal.*default/ });
+  const second = within(global).getByRole("option", { name: /Personal.*work/ });
+  const firstLabel = first.textContent?.trim();
+  const secondLabel = second.textContent?.trim();
+  if (!firstLabel || !secondLabel) throw new Error("Expected distinct account labels");
+  await expect(firstLabel).not.toBe(secondLabel);
+  await expect(controls.getByRole("listitem", { name: firstLabel })).toBeVisible();
+  await expect(controls.getByRole("listitem", { name: secondLabel })).toBeVisible();
+  await expect(
+    within(project).getByRole("option", { name: /Inherit global default/ })
+  ).toHaveTextContent(firstLabel);
+
+  // The visible choice must select its stable ID, not the first matching stored name.
+  await userEvent.selectOptions(global, second);
+  await waitFor(() => expect(global).toHaveValue("work"));
+  await waitFor(() => expect(project).toBeEnabled());
+  await userEvent.selectOptions(project, within(project).getByRole("option", { name: firstLabel }));
+  await waitFor(() => expect(project).toHaveValue("default"));
+  await runAccountCommand(canvasElement, "Reconnect account", secondLabel);
+  await waitFor(() => expect(startLogin).toHaveBeenLastCalledWith({ accountId: "work" }));
+  await waitFor(() => expect(global).toBeEnabled());
+
+  await runAccountCommand(canvasElement, "Rename account", firstLabel);
+  const name = await controls.findByRole("textbox", { name: "Account name" });
+  await expect(name).toHaveValue("Personal");
+  await userEvent.clear(name);
+  await userEvent.type(name, "Home{Enter}");
+  await controls.findByRole("listitem", { name: "Home" });
+  await expect(global).toHaveDisplayValue("Personal");
+  await expect(project).toHaveDisplayValue("Home");
+  await expect(global).toHaveValue("work");
+  await expect(project).toHaveValue("default");
+
+  await runAccountCommand(canvasElement, "Rename account", "Home");
+  const rename = await controls.findByRole("textbox", { name: "Account name" });
+  await userEvent.clear(rename);
+  await userEvent.type(rename, "Personal{Enter}");
+  await controls.findByRole("listitem", { name: firstLabel });
+  await expect(global).toHaveDisplayValue(secondLabel);
+  await expect(project).toHaveDisplayValue(firstLabel);
+  section.scrollIntoView({ block: "start" });
+  if (window.innerWidth < 768) {
+    await expect(section.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+    await expect(section.scrollWidth).toBeLessThanOrEqual(section.clientWidth);
+  }
+}
+
+export const DuplicateAccountLabels: AppStory = {
+  ...Desktop,
+  render: () => <AppWithMocks setup={() => setupAccounts(false, "Personal")} />,
+  play: async ({ canvasElement }) => exerciseDuplicateAccountLabels(canvasElement),
+};
+
+export const DuplicateAccountLabelsPhone: AppStory = {
+  ...Phone,
+  render: DuplicateAccountLabels.render,
+  play: DuplicateAccountLabels.play,
 };
 
 async function exerciseRevokedSelections(canvasElement: HTMLElement) {

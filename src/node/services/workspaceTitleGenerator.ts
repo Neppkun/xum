@@ -192,6 +192,12 @@ export async function generateWorkspaceIdentity(
     return Err({ type: "unknown", raw: "No model candidates provided for name generation" });
   }
 
+  // Retries belong to one operation. Keep its billing identity when settings change.
+  const modelRoutingSnapshot = aiService.captureModelRoutingSnapshot(
+    context?.workspaceId,
+    context?.projectPath
+  );
+
   // Try up to 3 candidates
   const maxAttempts = Math.min(candidates.length, 3);
 
@@ -204,6 +210,7 @@ export async function generateWorkspaceIdentity(
     const modelResult = await aiService.createModel(modelString, undefined, {
       ...context,
       agentInitiated: true,
+      modelRoutingSnapshot,
     });
     if (!modelResult.success) {
       lastError = mapModelCreationError(modelResult.error, modelString);

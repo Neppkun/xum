@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type Ref } from "react";
 import { useSettings, type CodexAccountSettingsIntent } from "@/browser/contexts/SettingsContext";
 import { Loader2 } from "lucide-react";
+import { formatCodexAccountLabel } from "@/browser/utils/codexAccountDisplay";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -28,8 +29,9 @@ const noAccounts: Account[] = [];
 const inputClassName =
   "bg-background border-border-light text-foreground w-full min-w-0 rounded border px-2 py-1.5 text-xs";
 
-function accountSelectionLabel(account: Account): string {
-  return account.reconnectRequired ? account.label + " (Reconnect required)" : account.label;
+function accountSelectionLabel(account: Account, accounts: readonly Account[]): string {
+  const label = formatCodexAccountLabel(account, accounts);
+  return account.reconnectRequired ? label + " (Reconnect required)" : label;
 }
 
 function AccountSelect(props: {
@@ -62,7 +64,7 @@ function AccountSelect(props: {
         {/* Disabled options preserve stored selections without offering rejected credentials. */}
         {props.accounts.map((account) => (
           <option key={account.id} value={account.id} disabled={account.reconnectRequired}>
-            {accountSelectionLabel(account)}
+            {accountSelectionLabel(account, props.accounts)}
           </option>
         ))}
       </select>
@@ -100,7 +102,7 @@ export function CodexAccounts() {
   const defaultId = openai?.codexOauthDefaultAccountId ?? CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
   const defaultAccount = accounts.find((account) => account.id === defaultId);
   const defaultLabel = defaultAccount
-    ? accountSelectionLabel(defaultAccount)
+    ? accountSelectionLabel(defaultAccount, accounts)
     : `Missing account (${defaultId})`;
   const isDesktop = !!window.api;
   const showBrowser =
@@ -313,7 +315,7 @@ export function CodexAccounts() {
         {accounts.map((account) => (
           <li
             key={account.id}
-            aria-label={account.label}
+            aria-label={formatCodexAccountLabel(account, accounts)}
             className="border-border-light min-w-0 space-y-2 rounded border p-2"
           >
             {rename?.id === account.id ? (
@@ -349,7 +351,7 @@ export function CodexAccounts() {
             ) : (
               <>
                 <p className="text-foreground text-xs font-medium break-words">
-                  {account.label}
+                  {formatCodexAccountLabel(account, accounts)}
                   {account.id === defaultId && (
                     <span className="text-muted font-normal"> · Global default</span>
                   )}

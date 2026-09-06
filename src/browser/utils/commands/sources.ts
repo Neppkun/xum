@@ -3,6 +3,7 @@ import type {
   CodexAccountSettingsIntent,
   OpenSettingsOptions,
 } from "@/browser/contexts/SettingsContext";
+import { formatCodexAccountLabel } from "@/browser/utils/codexAccountDisplay";
 import { CODEX_OAUTH_DEFAULT_ACCOUNT_ID } from "@/common/constants/codexOauthAccounts";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import type { APIClient } from "@/browser/contexts/API";
@@ -1649,12 +1650,14 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 type: "select",
                 name: "accountId",
                 label: "Account",
-                getOptions: () =>
-                  getCodexAccounts().map((account) => ({
+                getOptions: () => {
+                  const accounts = getCodexAccounts();
+                  return accounts.map((account) => ({
                     id: account.id,
-                    label: account.label,
+                    label: formatCodexAccountLabel(account, accounts),
                     keywords: [account.id],
-                  })),
+                  }));
+                },
               },
             ],
             onSubmit: (values) => openCodexAction({ type, accountId: values.accountId }),

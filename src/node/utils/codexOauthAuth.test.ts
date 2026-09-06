@@ -306,6 +306,51 @@ describe("Codex OAuth account slots", () => {
     expect(getCodexOauthAccountId(config, "missing")).toBe("missing");
   });
 
+  it.each([
+    { damage: "missing", label: undefined },
+    { damage: "null", label: null },
+    { damage: "number", label: 42 },
+    { damage: "boolean", label: false },
+    { damage: "object", label: {} },
+    { damage: "array", label: [] },
+    { damage: "empty", label: "" },
+    { damage: "whitespace", label: " \t\n" },
+  ])("preserves named credentials when the label is $damage", ({ label }) => {
+    const auth = { ...work, access: "damaged-label-access" };
+    const config = {
+      codexOauth: legacy,
+      codexOauthDefaultAccountId: "damaged",
+      codexOauthAccounts: {
+        damaged: { label, auth },
+        work: { label: " Work ", auth: work },
+      },
+    };
+    expect(getCodexOauthAccounts(config).map(({ id, label }) => ({ id, label }))).toEqual([
+      { id: "default", label: "Default" },
+      { id: "damaged", label: "damaged" },
+      { id: "work", label: "Work" },
+    ]);
+    expect(getCodexOauthAuth(config)).toMatchObject(auth);
+    expect(getCodexOauthAuth(config, "damaged")).toMatchObject(auth);
+  });
+
+  it("rejects malformed named credentials regardless of label validity", () => {
+    const config = {
+      codexOauthAccounts: {
+        missingAuth: {},
+        invalidType: { label: "Valid label", auth: { ...work, type: "apiKey" } },
+        invalidAccess: { label: 42, auth: { ...work, access: null } },
+        invalidRefresh: { auth: { ...work, refresh: "" } },
+        invalidExpiry: { label: " ", auth: { ...work, expires: Infinity } },
+        work: { label: "Work", auth: work },
+      },
+    };
+    expect(getCodexOauthAccounts(config).map(({ id }) => id)).toEqual(["work"]);
+    for (const id of Object.keys(config.codexOauthAccounts)) {
+      if (id !== "work") expect(getCodexOauthAuth(config, id)).toBeNull();
+    }
+  });
+
   it("excludes stored IDs that cannot pass account mutation validation", () => {
     const invalidIds = ["", "__proto__", "constructor", "prototype", "../bad", "x".repeat(201)];
     const accounts = Object.fromEntries(
@@ -323,7 +368,7 @@ describe("Codex OAuth account slots", () => {
       codexOauthAccounts: {
         default: { label: "Duplicate", auth: work },
         broken: { label: "Broken", auth: {} },
-        blank: { label: " ", auth: work },
+        blank: { label: " ", auth: null },
         work: { label: "Work", auth: work },
       },
     };

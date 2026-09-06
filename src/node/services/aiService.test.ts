@@ -1041,6 +1041,141 @@ describe("AIService.captureModelRoutingSnapshot", () => {
     mock.restore();
   });
 
+  it.each([
+    { workspaceId: undefined, project: "project", accountId: "project" },
+    { workspaceId: "routing-workspace", project: "project", accountId: "workspace" },
+    { workspaceId: "routing-workspace", project: undefined, accountId: "workspace" },
+    { workspaceId: "unknown-workspace", project: "project", accountId: "project" },
+    { workspaceId: undefined, project: undefined, accountId: "global" },
+  ])("captures the factory account scope: %j", async (testCase) => {
+    using xumHome = new DisposableTempDir("snapshot-project-scope");
+    const { config, service, providersConfigStore } = createBasicAIService(xumHome.path);
+    const root = path.join(xumHome.path, "root");
+    const subproject = path.join(root, "subproject");
+    const project = path.join(xumHome.path, "project");
+    await config.editConfig((cfg) => {
+      cfg.projects.set(root, {
+        codexOauthAccountId: "root",
+        workspaces: [
+          {
+            id: "routing-workspace",
+            name: "routing-workspace",
+            path: root,
+            subProjectPath: subproject,
+          },
+        ],
+      });
+      cfg.projects.set(subproject, { codexOauthAccountId: "workspace", workspaces: [] });
+      cfg.projects.set(project, { codexOauthAccountId: "project", workspaces: [] });
+      return cfg;
+    });
+    providersConfigStore.saveProvidersConfig({ openai: { codexOauthDefaultAccountId: "global" } });
+    const context = {
+      workspaceId: testCase.workspaceId,
+      projectPath: testCase.project ? project : undefined,
+    };
+    const snapshot = service.captureModelRoutingSnapshot(context.workspaceId, context.projectPath);
+    expect(snapshot.codexOauthSelection).toEqual({ accountId: testCase.accountId, explicit: true });
+  });
+
+  it("createModel keeps captured config and selection ahead of live settings and raw overrides", async () => {
+    using xumHome = new DisposableTempDir("snapshot-model-options");
+    const { config, service, providersConfigStore } = createBasicAIService(xumHome.path);
+    const projectPath = path.join(xumHome.path, "project");
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, { codexOauthAccountId: "work", workspaces: [] });
+      return cfg;
+    });
+    const requests: RecordedFetchRequest[] = [];
+    const fetch = createRecordingOpenAIFetch(requests);
+    const auth: Record<string, typeof TEST_CODEX_OAUTH> = {
+      work: { ...TEST_CODEX_OAUTH, access: "work-access", accountId: "work-provider-id" },
+      personal: {
+        ...TEST_CODEX_OAUTH,
+        access: "personal-access",
+        accountId: "personal-provider-id",
+      },
+    };
+    const providersConfig = {
+      openai: {
+        apiKey: "stored-api-key",
+        codexOauthAccounts: {
+          work: { label: "Work", auth: auth.work },
+          personal: { label: "Personal", auth: auth.personal },
+        },
+        fetch,
+      },
+    };
+    const read = spyOn(providersConfigStore, "loadProvidersConfig").mockReturnValue(
+      providersConfig
+    );
+    const getValidAuth = mock((accountId: string) =>
+      Promise.resolve({ success: true, data: auth[accountId] })
+    );
+    service.turnRequestBuilderBindings.codexOauthService = {
+      getValidAuth,
+    } as unknown as CodexOauthService;
+    const modelRoutingSnapshot = service.captureModelRoutingSnapshot(undefined, projectPath);
+    await config.editConfig((cfg) => {
+      cfg.projects.get(projectPath)!.codexOauthAccountId = "personal";
+      return cfg;
+    });
+    read.mockReturnValue({
+      openai: { ...providersConfig.openai, codexOauthDefaultAuth: "apiKey" },
+    });
+    const rawOverride = { openai: { apiKey: "override-api-key", fetch } };
+    const pinned = await service.createModel("openai:gpt-5.5", undefined, {
+      projectPath,
+      providersConfig: rawOverride,
+      modelRoutingSnapshot,
+    });
+    expect(pinned.success).toBe(true);
+    if (!pinned.success || typeof pinned.data === "string")
+      throw new Error("Expected an SDK model");
+    await pinned.data.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(getValidAuth).toHaveBeenCalledWith("work", expect.any(Object));
+    expect(getFetchUrl(requests[0].input)).toBe(CODEX_ENDPOINT);
+    expect(new Headers(requests[0].init?.headers).get("authorization")).toBe("Bearer work-access");
+    expect(new Headers(requests[0].init?.headers).get("chatgpt-account-id")).toBe(
+      "work-provider-id"
+    );
+
+    // Raw overrides retain their existing precedence when no routing snapshot exists.
+    const overridden = await service.createModel("openai:gpt-5.5", undefined, {
+      providersConfig: rawOverride,
+    });
+    expect(overridden.success).toBe(true);
+    if (!overridden.success || typeof overridden.data === "string")
+      throw new Error("Expected an SDK model");
+    await overridden.data.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(getFetchUrl(requests[1].input)).not.toBe(CODEX_ENDPOINT);
+    expect(new Headers(requests[1].init?.headers).get("authorization")).toBe(
+      "Bearer override-api-key"
+    );
+
+    const nextSnapshot = service.captureModelRoutingSnapshot(undefined, projectPath);
+    expect(nextSnapshot.codexOauthSelection.accountId).toBe("personal");
+    const next = await service.createModel("openai:gpt-5.5", undefined, {
+      projectPath,
+      modelRoutingSnapshot: nextSnapshot,
+    });
+    expect(next.success).toBe(true);
+    if (!next.success || typeof next.data === "string") throw new Error("Expected an SDK model");
+    await next.data.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(getFetchUrl(requests[2].input)).not.toBe(CODEX_ENDPOINT);
+    expect(new Headers(requests[2].init?.headers).get("authorization")).toBe(
+      "Bearer stored-api-key"
+    );
+    expect(requests).toHaveLength(3);
+    expect(getValidAuth).toHaveBeenCalledTimes(1);
+  });
+
   it("uses permanent provider credentials with temporary workspace routing config", async () => {
     using temporaryHome = new DisposableTempDir("snapshot-temporary-routing");
     using permanentHome = new DisposableTempDir("snapshot-permanent-providers");

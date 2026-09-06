@@ -321,12 +321,13 @@ export class AIService extends EventEmitter {
   }
 
   /** Keep model credentials and compaction limits on one backend-only snapshot for the turn. */
-  captureModelRoutingSnapshot(workspaceId: string): ModelRoutingSnapshot {
+  captureModelRoutingSnapshot(workspaceId?: string, projectPath?: string): ModelRoutingSnapshot {
     // CLI routing config can be temporary. Read credentials from the injected provider store.
     const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
-    const projectPath = getCodexOauthProjectPath(this.config.findWorkspace(workspaceId));
-    const projectAccountId = projectPath
-      ? this.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
+    const workspace = workspaceId ? this.config.findWorkspace(workspaceId) : undefined;
+    const routingProjectPath = getCodexOauthProjectPath(workspace) ?? projectPath;
+    const projectAccountId = routingProjectPath
+      ? this.config.loadConfigOrDefault().projects.get(routingProjectPath)?.codexOauthAccountId
       : undefined;
     return {
       providersConfig,
@@ -569,9 +570,14 @@ export class AIService extends EventEmitter {
       projectPath?: string;
       /** Snapshot pass-through (see ProviderModelFactory.createModel). */
       providersConfig?: ProvidersConfig;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
     }
   ): Promise<Result<LanguageModel, SendMessageError>> {
-    return this.providerModelFactory.createModel(modelString, muxProviderOptions, opts);
+    return this.providerModelFactory.createModel(modelString, muxProviderOptions, {
+      ...opts,
+      providersConfig: opts?.modelRoutingSnapshot?.providersConfig ?? opts?.providersConfig,
+      codexOauthSelection: opts?.modelRoutingSnapshot?.codexOauthSelection,
+    });
   }
 
   /**
