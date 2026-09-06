@@ -61,6 +61,16 @@ describe("parseCodexOauthAuth", () => {
     }
   });
 
+  it("preserves only the supported invalid credential marker", () => {
+    const auth = { type: "oauth" as const, access: "access", refresh: "refresh", expires: 1000 };
+    const marked = parseCodexOauthAuth({ ...auth, invalidReason: "invalid_grant" });
+    expect(marked).toEqual({ ...auth, invalidReason: "invalid_grant" });
+    expect(getCodexOauthAccounts({ codexOauth: marked })).toHaveLength(1);
+    for (const invalidReason of [null, "other", 42]) {
+      expect(parseCodexOauthAuth({ ...auth, invalidReason })).toBeNull();
+    }
+  });
+
   it("returns null for non-object values", () => {
     expect(parseCodexOauthAuth(null)).toBeNull();
     expect(parseCodexOauthAuth(undefined)).toBeNull();

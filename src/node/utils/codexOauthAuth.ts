@@ -20,6 +20,8 @@ export interface CodexOauthAuth {
   type: "oauth";
   /** Identifies this login across token rotations and processes. */
   credentialId?: string;
+  /** Blocks requests while retaining the login identity for reconnect. */
+  invalidReason?: "invalid_grant";
   /** OAuth access token (JWT). */
   access: string;
   /** OAuth refresh token. */
@@ -49,6 +51,7 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
   const expires = value.expires;
   const accountId = value.accountId;
   const credentialId = credentialIdSchema.safeParse(value.credentialId);
+  const invalidReason = value.invalidReason;
 
   if (type !== "oauth") return null;
   if (typeof access !== "string" || !access) return null;
@@ -60,6 +63,7 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
   }
 
   if (!credentialId.success) return null;
+  if (invalidReason !== undefined && invalidReason !== "invalid_grant") return null;
 
   return {
     type: "oauth",
@@ -68,6 +72,7 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
     expires,
     accountId,
     credentialId: credentialId.data,
+    invalidReason,
   };
 }
 
@@ -80,7 +85,7 @@ export function isValidCodexOauthAccountId(accountId: string): boolean {
   );
 }
 
-/** Read connected slots from an OpenAI provider config. */
+/** Read stored slots, including invalid credentials that need reconnect. */
 export function getCodexOauthAccounts(config: unknown): Array<{
   id: string;
   label: string;

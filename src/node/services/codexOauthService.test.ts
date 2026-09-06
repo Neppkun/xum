@@ -291,73 +291,71 @@ describe("CodexOauthService", () => {
   // Invalid grant cleanup
   // -------------------------------------------------------------------------
 
-  describe("invalid grant cleanup", () => {
-    it("calls disconnect + clears stored auth on invalid_grant response", async () => {
-      const expired = expiredAuth();
-      deps.providersConfig = { openai: { codexOauth: expired } };
-
-      mockFetch(() =>
-        Promise.resolve(
-          new Response(JSON.stringify({ error: "invalid_grant" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          })
-        )
-      );
-
-      const result = await service.getValidAuth();
-      expect(result.success).toBe(false);
-
-      // Should have called setConfigValue to clear auth (disconnect)
-      const clearCall = deps.setConfigValueCalls.find(
-        (c) => c.provider === "openai" && c.keyPath[0] === "codexOauth" && c.value === undefined
-      );
-      expect(clearCall).toBeDefined();
-    });
-
-    it("clears auth when error text contains 'revoked'", async () => {
-      const expired = expiredAuth();
-      deps.providersConfig = { openai: { codexOauth: expired } };
-
-      mockFetch(() =>
-        Promise.resolve(
-          new Response("Token has been revoked", {
-            status: 401,
-          })
-        )
-      );
-
-      const result = await service.getValidAuth();
-      expect(result.success).toBe(false);
-
-      const clearCall = deps.setConfigValueCalls.find(
-        (c) => c.provider === "openai" && c.keyPath[0] === "codexOauth" && c.value === undefined
-      );
-      expect(clearCall).toBeDefined();
-    });
-
-    it("subsequent getValidAuth returns error after invalid_grant cleanup", async () => {
-      const expired = expiredAuth();
-      deps.providersConfig = { openai: { codexOauth: expired } };
-
-      mockFetch(() =>
-        Promise.resolve(
-          new Response(JSON.stringify({ error: "invalid_grant" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          })
-        )
-      );
-
-      // First call triggers disconnect
-      await service.getValidAuth();
-
-      // Second call should see no stored auth
-      const result = await service.getValidAuth();
-      expect(result.success).toBe(false);
-      if (!result.success) {
-        expect(result.error).toContain("not configured");
+  describe("invalid grant marking", () => {
+    it.each(["invalid_grant", "Token has been revoked"])(
+      "retains credential identity after %s",
+      async (error) => {
+        const expired = expiredAuth();
+        deps.providersConfig = { openai: { codexOauth: expired } };
+        mockFetch(() => Promise.resolve(mockRefreshResponse({ error }, 400)));
+        expect((await service.getValidAuth()).success).toBe(false);
+        expect(getCodexOauthAuth(deps.providersConfig.openai)).toEqual({
+          ...expired,
+          invalidReason: "invalid_grant",
+        });
+        expect(getCodexOauthAccounts(deps.providersConfig.openai)).toHaveLength(1);
       }
+    );
+
+    it.each([false, true])(
+      "never returns or refreshes marked credentials (expired=%s)",
+      async (expired) => {
+        const auth = expired
+          ? expiredAuth({ invalidReason: "invalid_grant" })
+          : validAuth({ invalidReason: "invalid_grant" });
+        const legacy = validAuth({ access: "other" });
+        deps.providersConfig = {
+          openai: {
+            codexOauth: legacy,
+            codexOauthAccounts: { work: { label: "Work", auth } },
+            codexOauthDefaultAccountId: "work",
+          },
+        };
+        let fetchCount = 0;
+        mockFetch(() => {
+          fetchCount++;
+          return Promise.reject(new Error("Must not refresh"));
+        });
+        expect((await service.getValidAuth()).success).toBe(false);
+        expect((await service.getValidAuth("work")).success).toBe(false);
+        expect(await service.getValidAuth("default")).toEqual(Ok(legacy));
+        expect(fetchCount).toBe(0);
+        expect(getCodexOauthAccounts(deps.providersConfig.openai)).toHaveLength(2);
+        expect(await service.disconnect("work")).toEqual(Ok(undefined));
+        expect(getCodexOauthAuth(deps.providersConfig.openai, "work")).toBeNull();
+      }
+    );
+
+    it("rejects a marker after the local refresh mutex without refreshing again", async () => {
+      deps.providersConfig = { openai: { codexOauth: expiredAuth() } };
+      const started = createDeferred<void>();
+      const response = createDeferred<Response>();
+      let fetchCount = 0;
+      mockFetch(() => {
+        fetchCount++;
+        started.resolve(undefined);
+        return response.promise;
+      });
+      const first = service.getValidAuth();
+      await started.promise;
+      const second = service.getValidAuth();
+      response.resolve(mockRefreshResponse({ error: "invalid_grant" }, 400));
+      expect((await first).success).toBe(false);
+      expect((await second).success).toBe(false);
+      expect((await service.getValidAuth()).success).toBe(false);
+      expect(fetchCount).toBe(1);
+      expect(await service.disconnect()).toEqual(Ok(undefined));
+      expect(getCodexOauthAuth(deps.providersConfig.openai)).toBeNull();
     });
   });
 
@@ -557,7 +555,7 @@ describe("CodexOauthService", () => {
       expect(deps.setConfigValueCalls).toHaveLength(0);
     });
 
-    it("enforces policy when a revoked refresh attempts to clear credentials", async () => {
+    it("enforces policy when a revoked refresh attempts to mark credentials", async () => {
       const stored = expiredAuth();
       deps.providersConfig = { openai: { codexOauth: stored } };
       deps.policyDenied = true;
@@ -587,6 +585,102 @@ describe("CodexOauthService", () => {
   });
 
   describe("account refresh isolation", () => {
+    it.each([
+      { change: "rotation", accepted: true },
+      { change: "replacement", accepted: false },
+      { change: "expired replacement", accepted: false },
+      { change: "dropped ID", accepted: false },
+      { change: "legacy rotation", accepted: true },
+      { change: "legacy stamp", accepted: false },
+      { change: "marked", accepted: false },
+      { change: "removed", accepted: false },
+    ])("checks the pinned credential after lease wait: $change", async ({ change, accepted }) => {
+      const initial = expiredAuth(change.startsWith("legacy") ? { credentialId: undefined } : {});
+      const latest = validAuth({
+        ...initial,
+        access: "updated",
+        expires: change === "expired replacement" ? Date.now() - 1000 : Date.now() + 3600000,
+        credentialId:
+          change.includes("replacement") || change === "legacy stamp"
+            ? "50e00a32-b964-4ce2-b131-6b53356ce2db"
+            : change === "dropped ID"
+              ? undefined
+              : initial.credentialId,
+        invalidReason: change === "marked" ? "invalid_grant" : undefined,
+      });
+      const provider = new ProviderService(new Config(deps.rootDir));
+      const store = provider.providersConfigStore;
+      store.saveProvidersConfig({ openai: { codexOauth: initial } });
+      const entered = createDeferred<void>();
+      const release = createDeferred<void>();
+      const attempted = createDeferred<void>();
+      const holder = new FileLeaseManager(deps.rootDir).withCodexOauthRefreshLock(
+        "default",
+        async () => {
+          entered.resolve(undefined);
+          await release.promise;
+        }
+      );
+      await entered.promise;
+      class ObservedLeaseManager extends FileLeaseManager {
+        override withCodexOauthRefreshLock<T>(
+          accountId: string,
+          fn: () => Promise<T> | T
+        ): Promise<T> {
+          attempted.resolve(undefined);
+          return super.withCodexOauthRefreshLock(accountId, fn);
+        }
+      }
+      const waiting = new CodexOauthService(
+        store,
+        provider,
+        undefined,
+        new ObservedLeaseManager(deps.rootDir)
+      );
+      let fetchCount = 0;
+      mockFetch(() => {
+        fetchCount++;
+        return Promise.reject(new Error("Unexpected refresh"));
+      });
+      try {
+        const pending = waiting.getValidAuth();
+        await attempted.promise;
+        store.saveProvidersConfig({ openai: change === "removed" ? {} : { codexOauth: latest } });
+        release.resolve(undefined);
+        await holder;
+        const result = await pending;
+        expect(result.success).toBe(accepted);
+        if (accepted) expect(result).toEqual(Ok(latest));
+        expect(fetchCount).toBe(0);
+      } finally {
+        release.resolve(undefined);
+        await holder;
+        await waiting.dispose();
+      }
+    });
+
+    it("does not adopt a replaced credential after waiting for the local mutex", async () => {
+      deps.providersConfig = { openai: { codexOauth: expiredAuth() } };
+      const started = createDeferred<void>();
+      const response = createDeferred<Response>();
+      let fetchCount = 0;
+      mockFetch(() => {
+        fetchCount++;
+        started.resolve(undefined);
+        return response.promise;
+      });
+      const first = service.getValidAuth();
+      await started.promise;
+      const waiting = service.getValidAuth();
+      deps.providersConfig.openai.codexOauth = validAuth({
+        credentialId: "50e00a32-b964-4ce2-b131-6b53356ce2db",
+      });
+      response.resolve(mockRefreshResponse({ access_token: "old-rotation", expires_in: 3600 }));
+      expect((await first).success).toBe(false);
+      expect((await waiting).success).toBe(false);
+      expect(fetchCount).toBe(1);
+    });
+
     it("shares a refresh lease across service instances and persists the rotated token", async () => {
       const store = new ProvidersConfigStore(deps.rootDir);
       store.saveProvidersConfig({
@@ -1020,6 +1114,97 @@ describe("CodexOauthService", () => {
         ),
       };
     }
+
+    it("reconnects a marked legacy credential that has no durable ID", async () => {
+      deps.providersConfig = {
+        openai: {
+          codexOauth: expiredAuth({ credentialId: undefined, invalidReason: "invalid_grant" }),
+        },
+      };
+      deviceFetch();
+      const flow = await service.startDeviceFlow({ accountId: "default" });
+      if (!flow.success) throw new Error(flow.error);
+      const stamped = getCodexOauthAuth(deps.providersConfig.openai);
+      expect(stamped?.credentialId).toBeDefined();
+      expect(stamped?.invalidReason).toBe("invalid_grant");
+      expect(await service.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+      const reconnected = await service.getValidAuth();
+      expect(reconnected.success).toBe(true);
+      if (reconnected.success) {
+        expect(reconnected.data.invalidReason).toBeUndefined();
+        expect(reconnected.data.credentialId).not.toBe(stamped?.credentialId);
+      }
+    });
+
+    it("completes cross-process reconnect over the same credential's invalid marker", async () => {
+      const initial = expiredAuth();
+      const { store, first, second } = sharedServices(initial);
+      deviceFetch((init) =>
+        Promise.resolve(
+          new URLSearchParams(requestBody(init)).get("grant_type") === "refresh_token"
+            ? mockRefreshResponse({ error: "invalid_grant" }, 400)
+            : mockRefreshResponse({
+                access_token: "reconnected",
+                refresh_token: "new-login",
+                expires_in: 3600,
+              })
+        )
+      );
+      try {
+        const flow = await first.startDeviceFlow({ accountId: "work" });
+        if (!flow.success) throw new Error(flow.error);
+        expect((await second.getValidAuth("work")).success).toBe(false);
+        expect(getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")).toEqual({
+          ...initial,
+          invalidReason: "invalid_grant",
+        });
+        expect(await first.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+        const result = await first.getValidAuth("work");
+        expect(result.success).toBe(true);
+        if (result.success) {
+          expect(result.data.credentialId).not.toBe(initial.credentialId);
+          expect(result.data.invalidReason).toBeUndefined();
+          expect(result.data.access).toBe("reconnected");
+        }
+      } finally {
+        await first.dispose();
+        await second.dispose();
+      }
+    });
+
+    it("does not invalidate a completed reconnect when an older process refresh fails", async () => {
+      const { store, first, second } = sharedServices(expiredAuth());
+      const started = createDeferred<void>();
+      const response = createDeferred<Response>();
+      deviceFetch((init) => {
+        if (new URLSearchParams(requestBody(init)).get("grant_type") === "refresh_token") {
+          started.resolve(undefined);
+          return response.promise;
+        }
+        return Promise.resolve(
+          mockRefreshResponse({
+            access_token: "reconnected",
+            refresh_token: "new-login",
+            expires_in: 3600,
+          })
+        );
+      });
+      try {
+        const refresh = second.getValidAuth("work");
+        await started.promise;
+        const flow = await first.startDeviceFlow({ accountId: "work" });
+        if (!flow.success) throw new Error(flow.error);
+        expect(await first.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+        const reconnected = getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work");
+        response.resolve(mockRefreshResponse({ error: "invalid_grant" }, 400));
+        expect((await refresh).success).toBe(false);
+        expect(getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")).toEqual(reconnected);
+        expect((await first.getValidAuth("work")).success).toBe(true);
+      } finally {
+        await first.dispose();
+        await second.dispose();
+      }
+    });
 
     it("completes reconnect after another service refreshes the same credential", async () => {
       const initial = expiredAuth();
