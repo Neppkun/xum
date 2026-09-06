@@ -327,6 +327,39 @@ describe("WorkspaceTurnManager settlement authorization", () => {
     expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
   });
 
+  test.each([null, 42, [], [{ synthetic: true }]].map((metadata) => [metadata] as const))(
+    "malformed outer metadata cannot hide manual intervention with malformed parts: %j",
+    async (metadata) => {
+      const h = await startTurn();
+      const id = "damaged-metadata-input";
+      await appendFile(
+        join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+        JSON.stringify({ id, role: "user", parts: [null], metadata }) + "\n"
+      );
+      await h.append(createMuxMessage(h.uncorrelatedEnd.messageId, "assistant", "Manual response"));
+      const { causes } = observeCauseInsideLock(h.manager);
+      expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+      expect(causes).toHaveBeenCalledWith({ kind: "manual-supersession", messageId: id });
+      expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
+    }
+  );
+
+  test("invalid IDs still conservatively interrupt when metadata is also damaged", async () => {
+    const h = await startTurn();
+    await appendFile(
+      join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+      JSON.stringify({ id: 42, role: "user", metadata: null }) + "\n"
+    );
+    await h.append(createMuxMessage(h.uncorrelatedEnd.messageId, "assistant", "Manual response"));
+    const { causes } = observeCauseInsideLock(h.manager);
+    expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+    expect(causes).toHaveBeenCalledWith({
+      kind: "uncorrelated-conservative-fallback",
+      reason: "invalid-manual-input-id",
+    });
+    expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
+  });
+
   test.each(["before", "after"])(
     "control evidence never crosses an unreadable floor %s the turn anchor",
     async (position) => {

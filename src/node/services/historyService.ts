@@ -1857,8 +1857,8 @@ export class HistoryService {
     // by older builds so this read (and every later one) stays O(active epoch).
     await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
 
-    // Raw privacy floors are provider-only: UI browsing and archival rotation
-    // keep using the shared durable-boundary locator and retain the full log.
+    // Provider and control-evidence reads share raw privacy floors. UI browsing
+    // and archival rotation keep the durable-boundary locator and the full log.
     return Ok(
       await readProviderHistoryFromLatestBoundary(
         {

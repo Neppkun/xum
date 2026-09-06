@@ -166,11 +166,17 @@ describe("HistoryService provider-only raw privacy floors", () => {
       42,
       "bad-parts",
       "legacy",
+      "wrong-metadata",
     ]);
     expect(evidence.data[1]).not.toHaveProperty("id");
     expect(evidence.data.every((row) => !("parts" in row))).toBe(true);
-    expect(evidence.data.at(-1)?.metadata?.muxMetadata).toEqual(correlation);
-    expect(evidence.data.at(-1)?.metadata).not.toHaveProperty("cmuxMetadata");
+    expect(evidence.data.find((row) => row.id === "legacy")?.metadata?.muxMetadata).toEqual(
+      correlation
+    );
+    expect(evidence.data.find((row) => row.id === "legacy")?.metadata).not.toHaveProperty(
+      "cmuxMetadata"
+    );
+    expect(evidence.data.find((row) => row.id === "wrong-metadata")).not.toHaveProperty("metadata");
     expect(await providerIds()).toEqual([old.id, "legacy"]);
   });
 

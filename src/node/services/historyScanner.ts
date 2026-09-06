@@ -255,7 +255,7 @@ async function findProviderHistoryStart(
     : { kind: "start", offset };
 }
 
-/** Keep raw location and provider tail reads on one verified snapshot, without write-lock re-entry. */
+/** Keep raw location and projected tail reads on one verified snapshot, without write-lock re-entry. */
 async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
   skip: number,
@@ -363,11 +363,11 @@ export function readHistoryControlEvidenceFromLatestBoundary(
     const row = isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : value;
     if (!isPlainObject(row)) return null;
     if (row.role !== "user" && row.role !== "assistant" && row.role !== "system") return null;
-    if (row.metadata !== undefined && !isPlainObject(row.metadata)) return null;
+    // Damaged metadata cannot hide recognized control input or establish synthetic status.
     return {
       ...("id" in row ? { id: row.id } : {}),
       role: row.role,
-      ...(row.metadata === undefined ? {} : { metadata: row.metadata }),
+      ...(isPlainObject(row.metadata) ? { metadata: row.metadata } : {}),
     };
   });
 }
