@@ -5,8 +5,13 @@ import { EventEmitter } from "events";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { Err, Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
+import type { StreamEndEvent, StreamAbortEvent } from "@/common/types/stream";
 import type { TurnStreamHandle } from "@/node/services/streamManager";
-import { AgentSession, type AgentSessionAIService } from "@/node/services/agentSession";
+import {
+  AgentSession,
+  type AgentSessionAIService,
+  type AgentSessionStreamManager,
+} from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -31,6 +36,32 @@ export function createFailedTurnHandle(
       streamError: { messageId, ...failure },
     }),
   };
+}
+
+/**
+ * Isolated terminal-policy tests with no engine. Lifecycle tests must instead
+ * return controllable handles through streamMessage (see turnCompletion.test.ts).
+ */
+export function runSessionTerminalPolicy(
+  session: AgentSession,
+  emitter: EventEmitter,
+  payload: StreamEndEvent | StreamAbortEvent
+): Promise<void> {
+  const policy = session as unknown as {
+    handleTurnSuccess(payload: StreamEndEvent): Promise<void>;
+    handleTurnAbort(payload: StreamAbortEvent, systemMessageTokens?: number): Promise<void>;
+    streamManager: {
+      getStreamInfo(
+        workspaceId: string
+      ): { initialMetadata?: { systemMessageTokens?: number } } | undefined;
+    };
+  };
+  const systemMessageTokens = policy.streamManager.getStreamInfo(payload.workspaceId)
+    ?.initialMetadata?.systemMessageTokens;
+  emitter.emit(payload.type, payload);
+  return payload.type === "stream-end"
+    ? policy.handleTurnSuccess(payload)
+    : policy.handleTurnAbort(payload, systemMessageTokens);
 }
 
 function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
@@ -105,6 +136,7 @@ export interface AgentSessionHarnessOptions {
   config?: Config;
   historyService?: HistoryService;
   aiService?: AgentSessionAIService;
+  streamManager?: AgentSessionStreamManager;
   aiEmitter?: EventEmitter;
   aiServiceOverrides?: Partial<AgentSessionAIService>;
   initStateManager?: InitStateManager;
@@ -153,6 +185,7 @@ export async function createAgentSessionHarness(
     config,
     historyService,
     aiService,
+    streamManager: options.streamManager,
     mcpServerManager: options.mcpServerManager,
     initStateManager,
     workspaceGoalService: options.workspaceGoalService,

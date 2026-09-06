@@ -1,3 +1,8 @@
+import {
+  ClaudeDesignSettingsSchema,
+  ClaudeDesignStatusSchema,
+  ClaudeDesignExperimentSnapshotSchema,
+} from "./claudeDesign";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -144,10 +149,14 @@ import {
 import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
-import { ThinkingLevelSchema } from "../../types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 
 // Experiments
 export const experiments = {
+  onDesignChange: {
+    input: z.void(),
+    output: eventIterator(ClaudeDesignExperimentSnapshotSchema),
+  },
   getOverrides: {
     input: z.void(),
     output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
@@ -1001,6 +1010,13 @@ export const projects = {
  * Global config lives in <xumHome>/mcp.jsonc, with optional repo overrides in <projectPath>/.xum/mcp.jsonc.
  */
 export const mcp = {
+  designStatus: { input: z.void(), output: ClaudeDesignStatusSchema },
+  configureDesign: {
+    input: ClaudeDesignSettingsSchema.pick({ source: true, reuseEnabled: true }).partial({
+      source: true,
+    }),
+    output: ClaudeDesignStatusSchema,
+  },
   list: {
     input: MCPListParamsSchema,
     output: MCPServerMapSchema,
@@ -2527,6 +2543,7 @@ export const config = {
       defaultModel: z.string().optional(),
       advisorModelString: AdvisorModelStringSchema,
       advisorThinkingLevel: AdvisorThinkingLevelSchema,
+      advisorReasoningMode: OpenAIReasoningModeSchema.nullable(),
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.optional(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.optional(),
       hiddenModels: z.array(z.string()).optional(),
@@ -2551,6 +2568,7 @@ export const config = {
       taskSettings: ResolvedTaskSettingsSchema.nullish(),
       advisorModelString: AdvisorModelStringSchema.nullish(),
       advisorThinkingLevel: AdvisorThinkingLevelSchema.nullish(),
+      advisorReasoningMode: OpenAIReasoningModeSchema.nullish(),
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.nullish(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.nullish(),
       agentAiDefaults: AgentAiDefaultsSchema.optional(),

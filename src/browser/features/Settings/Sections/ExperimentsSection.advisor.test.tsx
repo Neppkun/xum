@@ -3,9 +3,14 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { DEFAULT_TASK_SETTINGS, type TaskSettings } from "@/common/types/tasks";
-import { THINKING_LEVEL_OFF, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  THINKING_LEVEL_OFF,
+  type ThinkingLevel,
+  type OpenAIReasoningMode,
+} from "@/common/types/thinking";
 import { installDom } from "../../../../../tests/ui/dom";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 
@@ -13,6 +18,7 @@ interface MockConfig {
   taskSettings: TaskSettings;
   advisorModelString: string | null;
   advisorThinkingLevel: ThinkingLevel | null | undefined;
+  advisorReasoningMode?: OpenAIReasoningMode | null;
   advisorMaxUsesPerTurn: number | null | undefined;
   advisorMaxOutputTokens: number | null | undefined;
 }
@@ -21,6 +27,7 @@ interface SaveConfigInput {
   taskSettings: TaskSettings;
   advisorModelString?: string | null;
   advisorThinkingLevel?: ThinkingLevel | null;
+  advisorReasoningMode?: OpenAIReasoningMode | null;
   advisorMaxUsesPerTurn?: number | null;
   advisorMaxOutputTokens?: number | null;
 }
@@ -33,6 +40,8 @@ interface MockAPIClient {
 }
 
 let mockApi: MockAPIClient;
+let providersConfig: ProvidersConfigMap | null = null;
+let minimumThinkingLevel: ThinkingLevel = THINKING_LEVEL_OFF;
 let experimentValues: Record<string, boolean>;
 
 void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
@@ -89,6 +98,16 @@ void mock.module("@/browser/hooks/useTelemetry", () => ({
   }),
 }));
 
+void mock.module("@/browser/hooks/useMinThinkingLevels", () => ({
+  useMinThinkingLevels: () => ({ getMinimum: () => minimumThinkingLevel }),
+}));
+void mock.module("@/browser/hooks/useProvidersConfig", () => ({
+  useProvidersConfig: () => ({ config: providersConfig }),
+}));
+void mock.module("@/browser/hooks/useRouting", () => ({
+  useRouting: () => ({ resolveRoute: () => ({ route: "direct" }) }),
+}));
+
 import { ExperimentsSection } from "./ExperimentsSection";
 
 function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
@@ -106,6 +125,7 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
       taskSettings: config.taskSettings,
       advisorModelString: config.advisorModelString,
       advisorThinkingLevel: config.advisorThinkingLevel,
+      advisorReasoningMode: config.advisorReasoningMode,
       advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
       advisorMaxOutputTokens: config.advisorMaxOutputTokens,
     })
@@ -117,6 +137,7 @@ function createMockAPI(configOverrides: Partial<MockConfig> = {}) {
       ? input.advisorModelString.trim()
       : null;
     config.advisorThinkingLevel = input.advisorThinkingLevel ?? null;
+    config.advisorReasoningMode = input.advisorReasoningMode;
     config.advisorMaxUsesPerTurn = input.advisorMaxUsesPerTurn ?? null;
     config.advisorMaxOutputTokens = input.advisorMaxOutputTokens ?? null;
     return Promise.resolve();
@@ -141,6 +162,8 @@ describe("ExperimentsSection advisor config", () => {
     cleanupDom = installDom();
     window.api = { platform: "linux", versions: {} };
     experimentValues = {};
+    providersConfig = null;
+    minimumThinkingLevel = THINKING_LEVEL_OFF;
   });
 
   afterEach(() => {
@@ -232,6 +255,98 @@ describe("ExperimentsSection advisor config", () => {
     });
   });
 
+  test("shows and saves advisor effort without applying the chat minimum", async () => {
+    minimumThinkingLevel = "high";
+    const { view, saveConfigMock } = renderExperimentsSection({
+      configOverrides: { advisorModelString: "openai:gpt-6-astra", advisorThinkingLevel: "low" },
+    });
+    const trigger = await view.findByRole("button", { name: "Reasoning" });
+    expect(trigger.textContent).toContain("Low");
+    fireEvent.click(trigger);
+    expect(view.getByRole("option", { name: "Low" }).getAttribute("aria-selected")).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: /Pro mode/ }));
+    await waitFor(() =>
+      expect(saveConfigMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        advisorThinkingLevel: "low",
+        advisorReasoningMode: "pro",
+      })
+    );
+    fireEvent.click(view.getByRole("option", { name: "Medium" }));
+    await waitFor(() =>
+      expect(saveConfigMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        advisorThinkingLevel: "medium",
+        advisorReasoningMode: "pro",
+      })
+    );
+  });
+
+  test.each(["openai:gpt-6-astra", "openai:team-astra"])(
+    "saves Pro independently of effort and restores it after remount for %s",
+    async (model) => {
+      providersConfig = {
+        openai: {
+          apiKeySet: true,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+        },
+      };
+      const { view, saveConfigMock } = renderExperimentsSection({
+        configOverrides: { advisorModelString: model, advisorThinkingLevel: "high" },
+      });
+      fireEvent.click(await view.findByRole("button", { name: "Reasoning" }));
+      const pro = view.getByRole("button", { name: /Pro mode/ });
+      expect(pro.getAttribute("aria-pressed")).toBe("false");
+      fireEvent.click(pro);
+      await waitFor(() => {
+        expect(saveConfigMock.mock.calls.at(-1)?.[0]).toMatchObject({
+          advisorReasoningMode: "pro",
+          advisorThinkingLevel: "high",
+        });
+      });
+      view.unmount();
+      const restored = render(
+        <ThemeProvider forcedTheme="dark">
+          <ExperimentsSection />
+        </ThemeProvider>
+      );
+      fireEvent.click(await restored.findByRole("button", { name: "Reasoning" }));
+      expect(restored.getByRole("button", { name: /Pro mode/ }).getAttribute("aria-pressed")).toBe(
+        "true"
+      );
+      fireEvent.click(restored.getByRole("option", { name: "Max" }));
+      await waitFor(() => {
+        expect(saveConfigMock.mock.calls.at(-1)?.[0]).toMatchObject({
+          advisorReasoningMode: "pro",
+          advisorThinkingLevel: "max",
+        });
+      });
+      fireEvent.click(restored.getByRole("button", { name: /Pro mode/ }));
+      await waitFor(() =>
+        expect(saveConfigMock.mock.calls.at(-1)?.[0].advisorReasoningMode).toBe("standard")
+      );
+    }
+  );
+
+  test("hides Pro for unsupported advisor models while preserving the saved preference", async () => {
+    const { view, saveConfigMock } = renderExperimentsSection({
+      configOverrides: {
+        advisorModelString: "openai:gpt-6-astra",
+        advisorThinkingLevel: "high",
+        advisorReasoningMode: "pro",
+      },
+    });
+    fireEvent.click(await view.findByRole("button", { name: "Advisor model selector" }));
+    fireEvent.click(view.getByRole("button", { name: "Reasoning" }));
+    expect(view.queryByRole("button", { name: /Pro mode/ })).toBeNull();
+    await waitFor(() =>
+      expect(saveConfigMock.mock.calls.at(-1)?.[0]).toMatchObject({
+        advisorModelString: "openai:gpt-4o",
+        advisorReasoningMode: "pro",
+      })
+    );
+  });
+
   test("seeds limited mode with 3 when switching from unlimited", async () => {
     const { view, saveConfigMock } = renderExperimentsSection();
 
@@ -248,6 +363,7 @@ describe("ExperimentsSection advisor config", () => {
         taskSettings: DEFAULT_TASK_SETTINGS,
         advisorModelString: null,
         advisorThinkingLevel: THINKING_LEVEL_OFF,
+        advisorReasoningMode: "standard",
         advisorMaxUsesPerTurn: null,
         advisorMaxOutputTokens: null,
       });
@@ -266,6 +382,7 @@ describe("ExperimentsSection advisor config", () => {
         taskSettings: DEFAULT_TASK_SETTINGS,
         advisorModelString: null,
         advisorThinkingLevel: THINKING_LEVEL_OFF,
+        advisorReasoningMode: "standard",
         advisorMaxUsesPerTurn: 3,
         advisorMaxOutputTokens: null,
       });
@@ -290,6 +407,7 @@ describe("ExperimentsSection advisor config", () => {
         taskSettings: DEFAULT_TASK_SETTINGS,
         advisorModelString: null,
         advisorThinkingLevel: THINKING_LEVEL_OFF,
+        advisorReasoningMode: "standard",
         advisorMaxUsesPerTurn: null,
         advisorMaxOutputTokens: null,
       });

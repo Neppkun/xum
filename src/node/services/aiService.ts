@@ -205,7 +205,8 @@ export class AIService extends EventEmitter {
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
       bindings: this.turnRequestBuilderBindings,
       emit: (event, ...args) => this.emit(event, ...args),
-      createAbortedTurnHandle: (messageId) => this.createAbortedTurnHandle(messageId),
+      createAbortedTurnHandle: (messageId, signal) =>
+        this.createAbortedTurnHandle(messageId, signal),
       createSettledTurnHandle: (messageId, completion) =>
         this.createSettledTurnHandle(messageId, completion),
       getWorkspaceMetadata: (workspaceId) => this.getWorkspaceMetadata(workspaceId),
@@ -385,8 +386,11 @@ export class AIService extends EventEmitter {
     return { messageId, completion: Promise.resolve(completion) };
   }
 
-  private createAbortedTurnHandle(messageId: string): TurnStreamHandle {
-    return this.createSettledTurnHandle(messageId, { status: "aborted", abortReason: "startup" });
+  private createAbortedTurnHandle(messageId: string, signal?: AbortSignal): TurnStreamHandle {
+    return this.createSettledTurnHandle(messageId, {
+      status: "aborted",
+      abortReason: this.streamManager.getStartupAbortReason(signal),
+    });
   }
 
   private trackPendingDevToolsRunMetadata(
@@ -863,6 +867,7 @@ export class AIService extends EventEmitter {
     });
     const startTime = Date.now();
     const syntheticMessageId = pendingStart.syntheticMessageId;
+    opts.onStreamStarting?.(syntheticMessageId);
     const combinedAbortSignal = pendingStart.abortSignal;
     const startupPhaseTimingsMs: Record<string, number> = {};
     const recordStartupPhaseTiming = (phase: string, phaseStartedAt: number): void => {
@@ -877,7 +882,7 @@ export class AIService extends EventEmitter {
       if (this.mockModeEnabled && this.mockAiStreamPlayer) {
         await this.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
         if (combinedAbortSignal.aborted) {
-          return Ok(this.createAbortedTurnHandle(syntheticMessageId));
+          return Ok(this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal));
         }
         const result = await this.mockAiStreamPlayer.play(messages, workspaceId, {
           model: modelString,
@@ -889,7 +894,9 @@ export class AIService extends EventEmitter {
         if (!result.success) {
           return result;
         }
-        return Ok(result.data ?? this.createAbortedTurnHandle(syntheticMessageId));
+        return Ok(
+          result.data ?? this.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal)
+        );
       }
 
       const lastMessage = messages[messages.length - 1];

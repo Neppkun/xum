@@ -153,14 +153,15 @@ describe("AgentSession token-budget lifecycle", () => {
     );
     h.session.setAutoCompactionThreshold(0.7);
     const finishAndDispatch = async () => {
-      h.aiEmitter.emit("stream-end", {
-        type: "stream-end",
-        workspaceId,
-        messageId: "assistant-1",
-        metadata: { model, agentId: "exec", finishReason: "tool-calls" },
-        parts: [],
+      completions[0].settle({
+        status: "completed",
+        streamEnd: {
+          type: "stream-end",
+          workspaceId,
+          metadata: { model, agentId: "exec", finishReason: "tool-calls" },
+          parts: [],
+        },
       });
-      completions[0].settle({ status: "completed" });
       await secondRequest.promise;
     };
     return { ...h, requests, completions, streamMessage, secondRequest, finishAndDispatch };
@@ -268,14 +269,15 @@ describe("AgentSession token-budget lifecycle", () => {
       expect((await h.session.sendMessage("Small fitting follow-up", options)).success).toBe(true);
       expect(h.requests).toHaveLength(1);
       expect(h.requests[0].messages.some((row) => row.id === previous.id)).toBe(true);
-      h.aiEmitter.emit("stream-end", {
-        type: "stream-end",
-        workspaceId,
-        messageId: "assistant-1",
-        metadata: { model, agentId: "exec", finishReason: "stop" },
-        parts: [],
+      h.completions[0].settle({
+        status: "completed",
+        streamEnd: {
+          type: "stream-end",
+          workspaceId,
+          metadata: { model, agentId: "exec", finishReason: "stop" },
+          parts: [],
+        },
       });
-      h.completions[0].settle({ status: "completed" });
       await h.session.waitForIdle();
       expect(await h.session.sendMessage("oversized ".repeat(60_000), options)).toMatchObject({
         success: false,
@@ -1311,6 +1313,11 @@ describe("AgentSession token-budget lifecycle", () => {
             abortReason: "user",
             metadata: { duration: 1 },
           });
+          h.completions[0].settle({
+            status: "aborted",
+            abortReason: "user",
+            streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+          });
           return Promise.resolve(Ok(undefined));
         });
         expect((await h.session.interruptStream()).success).toBe(true);
@@ -1447,14 +1454,15 @@ describe("AgentSession token-budget lifecycle", () => {
     const unsubscribe = h.session.onChatEvent(({ message }) => {
       if (message.type === "stream-error") blocked.resolve();
     });
-    h.aiEmitter.emit("stream-end", {
-      type: "stream-end",
-      workspaceId,
-      messageId: "assistant-1",
-      metadata: { model, agentId: "exec", finishReason: "tool-calls" },
-      parts: [],
+    h.completions[0].settle({
+      status: "completed",
+      streamEnd: {
+        type: "stream-end",
+        workspaceId,
+        metadata: { model, agentId: "exec", finishReason: "tool-calls" },
+        parts: [],
+      },
     });
-    h.completions[0].settle({ status: "completed" });
     await blocked.promise;
     await h.session.waitForIdle();
     unsubscribe();
@@ -1685,14 +1693,15 @@ describe("AgentSession token-budget lifecycle", () => {
         "off"
       ).providerRequestMessages;
       expect(providerRows.some((row) => preludeIds.has(row.id))).toBe(false);
-      resumed.aiEmitter.emit("stream-end", {
-        type: "stream-end",
-        workspaceId,
-        messageId: "assistant-1",
-        metadata: { model, agentId: "exec", finishReason: "stop" },
-        parts: [],
+      resumed.completions[0].settle({
+        status: "completed",
+        streamEnd: {
+          type: "stream-end",
+          workspaceId,
+          metadata: { model, agentId: "exec", finishReason: "stop" },
+          parts: [],
+        },
       });
-      resumed.completions[0].settle({ status: "completed" });
       await resumed.session.waitForIdle();
       // Re-invoking a rejected skill must materialize it, not dedupe against hidden instructions.
       expect(
@@ -1834,14 +1843,15 @@ describe("AgentSession token-budget lifecycle", () => {
     expect((await h.session.sendMessage("Inspect @mentioned.txt", options)).success).toBe(true);
     expect(h.session.getTrackedFilePaths()).toContain(mentioned);
     expect(rolloverRows(await allRows(h))).toHaveLength(1);
-    h.aiEmitter.emit("stream-end", {
-      type: "stream-end",
-      workspaceId,
-      messageId: "assistant-1",
-      metadata: { model, agentId: "exec", finishReason: "stop" },
-      parts: [],
+    h.completions[0].settle({
+      status: "completed",
+      streamEnd: {
+        type: "stream-end",
+        workspaceId,
+        metadata: { model, agentId: "exec", finishReason: "stop" },
+        parts: [],
+      },
     });
-    h.completions[0].settle({ status: "completed" });
     await h.session.waitForIdle();
     await fs.writeFile(mentioned, "changed content\n");
     expect((await h.session.sendMessage("Continue after edit", options)).success).toBe(true);
