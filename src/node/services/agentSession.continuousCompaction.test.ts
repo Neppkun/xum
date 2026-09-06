@@ -10,6 +10,8 @@ import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { SessionUsageService } from "./sessionUsageService";
 import { AIService } from "./aiService";
 import { ProviderService } from "./providerService";
+import { ProvidersConfigStore } from "@/node/config";
+import type { CompactionMonitor } from "./compactionMonitor";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import {
@@ -127,7 +129,7 @@ describe("AgentSession continuous compaction wiring", () => {
         })
       );
     }
-    return harness;
+    return { ...harness, routingService };
   }
 
   async function setWorkspaceAccountScope(
@@ -1147,6 +1149,112 @@ describe("AgentSession continuous compaction wiring", () => {
     });
     return streamMessage;
   }
+
+  test.each([
+    { outcome: "applied", change: "account" },
+    { outcome: "applied", change: "preference" },
+    { outcome: "failed", change: "account" },
+    { outcome: "failed", change: "preference" },
+    { outcome: "legacy-fallback", change: "account" },
+    { outcome: "legacy-fallback", change: "preference" },
+  ] as const)(
+    "$outcome compaction keeps accepted routing after changing $change",
+    async ({ outcome, change }) => {
+      const h = await setup();
+      // Exercise real capture and metadata projection for the continued turn.
+      spyOn(h.routingService, "getProvidersConfig").mockRestore();
+      spyOn(h.aiService, "getProvidersConfig").mockImplementation(() =>
+        h.routingService.getProvidersConfig()
+      );
+      const store = new ProvidersConfigStore(h.config.rootDir);
+      const providersConfig = {
+        openai: {
+          apiKey: "test-api-key",
+          codexOauthAccounts: {
+            work: {
+              label: "Work",
+              auth: {
+                type: "oauth" as const,
+                access: "work-access",
+                refresh: "work-refresh",
+                expires: Date.now() + 60_000,
+              },
+            },
+            personal: {
+              label: "Personal",
+              auth: {
+                type: "oauth" as const,
+                access: "personal-access",
+                refresh: "personal-refresh",
+                expires: Date.now() + 60_000,
+              },
+            },
+          },
+        },
+      };
+      store.saveProvidersConfig(providersConfig);
+      await h.config.editConfig((cfg) => {
+        cfg.projects.set(h.config.rootDir, {
+          codexOauthAccountId: "work",
+          workspaces: [{ id: workspaceId, name: workspaceId, path: h.config.rootDir }],
+        });
+        return cfg;
+      });
+      const options = { ...sendOptions, model: "openai:gpt-5.5" };
+      spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
+      const stream = mockAbortableStream(h);
+      expect((await h.session.sendMessage("Working", options)).success).toBe(true);
+      const original = stream.mock.calls[0]?.[0].modelRoutingSnapshot;
+      expect(original?.codexOauthSelection.accountId).toBe("work");
+      const monitor = Reflect.get(h.session, "compactionMonitor") as CompactionMonitor;
+      const checkBeforeSend = monitor.checkBeforeSend.bind(monitor);
+      const pressure = spyOn(monitor, "checkBeforeSend").mockImplementation((args) => ({
+        ...checkBeforeSend(args),
+        shouldForceCompact: outcome === "legacy-fallback",
+      }));
+      await applyThenFinish(h.session, async (followUp) => {
+        if (change === "account") {
+          await h.config.editConfig((cfg) => {
+            cfg.projects.get(h.config.rootDir)!.codexOauthAccountId = "personal";
+            return cfg;
+          });
+        } else {
+          store.saveProvidersConfig({
+            openai: { ...providersConfig.openai, codexOauthDefaultAuth: "apiKey" },
+          });
+        }
+        if (outcome === "applied") await appendBoundary(h, followUp);
+        return outcome === "applied";
+      });
+      expect(stream).toHaveBeenCalledTimes(2);
+      expect(stream.mock.calls[1]?.[0].modelRoutingSnapshot).toBe(original);
+      expect(
+        internals(h.session).getContinuousCompactionContext(options.model, options)
+          .contextWindowTokens
+      ).toBe(272_000);
+      const history = await rows(h);
+      expect(history.at(-1)?.metadata?.muxMetadata?.type === "compaction-request").toBe(
+        outcome === "legacy-fallback"
+      );
+      // Credentials remain transient even when compaction stores a durable follow-up.
+      expect(JSON.stringify(history)).not.toContain("work-access");
+      expect(JSON.stringify(history)).not.toContain("work-refresh");
+      pressure.mockRestore();
+      endStream(h);
+      await h.session.waitForIdle();
+      expect((await h.session.sendMessage("New user turn", options)).success).toBe(true);
+      const next = stream.mock.calls.at(-1)?.[0].modelRoutingSnapshot;
+      expect(next).not.toBe(original);
+      expect(next?.codexOauthSelection.accountId).toBe(change === "account" ? "personal" : "work");
+      expect(next?.providersConfig.openai?.codexOauthDefaultAuth).toBe(
+        change === "preference" ? "apiKey" : undefined
+      );
+      expect(
+        internals(h.session).getContinuousCompactionContext(options.model, options)
+          .contextWindowTokens
+      ).toBe(change === "preference" ? 1_050_000 : 272_000);
+    }
+  );
 
   test("abandon during fast apply cannot resume the abandoned turn", async () => {
     const h = await setup();

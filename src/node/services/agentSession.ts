@@ -3083,6 +3083,8 @@ export class AgentSession {
       /** A dequeued send keeps its admission owner through acceptance and startup failure. */
       turnReservation?: TurnId;
       synthetic?: boolean;
+      /** Same-session compaction continues accepted work without changing its billing identity. */
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
       agentInitiated?: boolean;
       goalContinuation?: boolean;
       goalKind?: GoalSyntheticMessageKind;
@@ -3700,7 +3702,8 @@ export class AgentSession {
     // small and bounded, so skip on-send compaction for them; mid-stream
     // forcing still protects the context limit.
     // Share this snapshot with model construction; settings changes apply to the next turn.
-    const modelRoutingSnapshot = this.captureModelRoutingSnapshot();
+    const modelRoutingSnapshot =
+      internal?.modelRoutingSnapshot ?? this.captureModelRoutingSnapshot();
     const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
     if (!isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
       // Seed usage state from persisted history on the first send after restart
@@ -5164,6 +5167,7 @@ export class AgentSession {
         {
           synthetic: true,
           agentInitiated: fallback?.agentInitiated ?? context.agentInitiated,
+          modelRoutingSnapshot: context.modelRoutingSnapshot,
           goalKind: fallback ? undefined : context.goalKind,
           goalId: fallback ? undefined : context.goalId,
           admissionStale: () => this.continuousCompactionAbandoned,
@@ -5178,7 +5182,8 @@ export class AgentSession {
     const summaryId = this.pendingCompactionFollowUpSummaryId;
     await this.dispatchPendingFollowUp(
       summaryId ?? undefined,
-      () => this.continuousCompactionAbandoned
+      () => this.continuousCompactionAbandoned,
+      context.modelRoutingSnapshot
     );
     if (this.pendingCompactionFollowUpSummaryId === summaryId)
       this.pendingCompactionFollowUpSummaryId = null;
@@ -5244,7 +5249,11 @@ export class AgentSession {
           ...autoCompactionRequest.sendOptions,
           muxMetadata: autoCompactionRequest.metadata,
         },
-        { synthetic: true, agentInitiated: autoCompactionRequest.agentInitiated }
+        {
+          synthetic: true,
+          agentInitiated: autoCompactionRequest.agentInitiated,
+          modelRoutingSnapshot: streamContext.modelRoutingSnapshot,
+        }
       );
       if (!sendResult.success) {
         log.warn("Failed to dispatch mid-stream compaction request", {
@@ -6515,7 +6524,11 @@ export class AgentSession {
         // not the last row, so target it by ID (stashed in onCompactionComplete).
         const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
         this.pendingCompactionFollowUpSummaryId = null;
-        continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
+        continuedAfterCompaction = await this.dispatchPendingFollowUp(
+          rlmSummaryId ?? undefined,
+          undefined,
+          activeRoutingSnapshot
+        );
         if (
           !this.coordinator.isCurrentTurn(turn) ||
           !this.coordinator.isCurrentOperation(operation)
@@ -7680,7 +7693,8 @@ export class AgentSession {
    */
   private async dispatchPendingFollowUp(
     summaryMessageId?: string,
-    cancelResume?: () => boolean
+    cancelResume?: () => boolean,
+    modelRoutingSnapshot?: ModelRoutingSnapshot
   ): Promise<boolean> {
     if (this.coordinator.disposed || this.coordinator.closing) {
       return false;
@@ -7989,7 +8003,8 @@ export class AgentSession {
       options,
       followUp.agentInitiated,
       persistedGoalKind,
-      persistedGoalId
+      persistedGoalId,
+      modelRoutingSnapshot
     );
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
@@ -7999,6 +8014,7 @@ export class AgentSession {
     // re-enable auto-retry after a user explicitly opted out.
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
+      modelRoutingSnapshot,
       agentInitiated: followUp.agentInitiated,
       goalKind: persistedGoalKind,
       // Keep the re-dispatched continuation row goal-scoped so a replaced

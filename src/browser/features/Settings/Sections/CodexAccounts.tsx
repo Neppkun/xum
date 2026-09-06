@@ -106,9 +106,8 @@ export function CodexAccounts() {
   const showBrowser =
     isDesktop || ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
   const disabled = !api || busy;
-  // Rejected credentials remain listed, but they cannot provide OAuth precedence.
-  const authEditable =
-    openai?.codexOauthSet === true && (openai.apiKeySet === true || !!openai.apiKeySource);
+  // Keep API-key recovery available after the selected OAuth account disconnects.
+  const authEditable = openai?.apiKeySet === true || !!openai?.apiKeySource;
 
   // StrictMode replays mount effects before a pending login start can return.
   // Keep that start valid. A real unmount cancels its result when it arrives.
@@ -543,7 +542,9 @@ export function CodexAccounts() {
             );
           }}
         >
-          <option value="oauth">Use ChatGPT OAuth by default</option>
+          <option value="oauth" disabled={!openai?.codexOauthSet}>
+            Use ChatGPT OAuth by default
+          </option>
           <option value="apiKey">Use OpenAI API key by default</option>
         </select>
       </label>
@@ -552,9 +553,7 @@ export function CodexAccounts() {
         credits. API keys use OpenAI platform billing.
       </p>
       {!authEditable && (
-        <p className="text-muted text-xs">
-          Connect ChatGPT OAuth and set an OpenAI API key to change this setting.
-        </p>
+        <p className="text-muted text-xs">Set an OpenAI API key to change this setting.</p>
       )}
     </section>
   );

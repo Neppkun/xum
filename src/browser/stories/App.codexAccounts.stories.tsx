@@ -433,7 +433,8 @@ export const ReconnectRestoresAccount: AppStory = {
   play: async ({ canvasElement }) => {
     const controls = await checkReconnectRequired(canvasElement);
     const preference = controls.getByRole("combobox", { name: "Default auth (when both are set)" });
-    await expect(preference).toBeDisabled();
+    await expect(preference).toBeEnabled();
+    await expect(within(preference).getByRole("option", { name: /ChatGPT OAuth/ })).toBeDisabled();
     await userEvent.click(
       within(controls.getByRole("listitem", { name: "Work" })).getByRole("button", {
         name: "Reconnect",
@@ -441,6 +442,7 @@ export const ReconnectRestoresAccount: AppStory = {
     );
     await controls.findByText("Connected", { exact: true });
     await expect(preference).toBeEnabled();
+    await expect(within(preference).getByRole("option", { name: /ChatGPT OAuth/ })).toBeEnabled();
     await expect(controls.queryByText("Reconnect required")).toBeNull();
     await expect(controls.getAllByRole("listitem")).toHaveLength(1);
     await expect(controls.getByRole("combobox", { name: "Global default account" })).toHaveValue(
@@ -448,6 +450,49 @@ export const ReconnectRestoresAccount: AppStory = {
     );
     await expect(startLogin).toHaveBeenLastCalledWith({ accountId: "work" });
   },
+};
+
+async function exerciseDisconnectedDefaultRecovery(canvasElement: HTMLElement) {
+  const section = await openAccounts(canvasElement);
+  const controls = within(section);
+  const global = controls.getByRole("combobox", { name: "Global default account" });
+  const preference = controls.getByRole("combobox", { name: "Default auth (when both are set)" });
+  await userEvent.selectOptions(global, "work");
+  await waitFor(() => expect(global).toHaveValue("work"));
+  for (const name of ["Personal", "Work"]) {
+    const account = controls.getByRole("listitem", { name });
+    const disconnect = within(account).getByRole("button", { name: "Disconnect" });
+    await waitFor(() => expect(disconnect).toBeEnabled());
+    await userEvent.click(disconnect);
+    await waitFor(() => expect(controls.queryByRole("listitem", { name })).toBeNull());
+  }
+  // Disconnect does not select another identity. Recovery requires an explicit auth choice.
+  await expect(global).toHaveValue("work");
+  await expect(global).toBeDisabled();
+  await expect(preference).toHaveValue("oauth");
+  await waitFor(() => expect(preference).toBeEnabled());
+  await userEvent.selectOptions(preference, "apiKey");
+  await waitFor(() => expect(preference).toHaveValue("apiKey"));
+  await waitFor(() => expect(preference).toBeEnabled());
+  await expect(within(preference).getByRole("option", { name: /ChatGPT OAuth/ })).toBeDisabled();
+  await userEvent.selectOptions(preference, "oauth");
+  await expect(preference).toHaveValue("apiKey");
+  await expect(global).toHaveValue("work");
+  section.scrollIntoView({ block: "start" });
+  if (window.innerWidth < 768) {
+    await expect(section.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+    await expect(section.scrollWidth).toBeLessThanOrEqual(section.clientWidth);
+  }
+}
+
+export const DisconnectedDefaultRecovery: AppStory = {
+  ...Desktop,
+  play: async ({ canvasElement }) => exerciseDisconnectedDefaultRecovery(canvasElement),
+};
+
+export const DisconnectedDefaultRecoveryPhone: AppStory = {
+  ...Phone,
+  play: DisconnectedDefaultRecovery.play,
 };
 
 function setupLoginFailure() {
