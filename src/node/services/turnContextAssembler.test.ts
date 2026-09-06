@@ -175,8 +175,8 @@ describe("prepareProviderRequestMessages", () => {
           path.join(sessionDir, "chat-archive.jsonl"),
           JSON.stringify(archived) + "\n"
         );
-        // External editors need not use the writer's compact JSON layout. Exercise
-        // the parsed reset when the disk reader's compact-needle fast path misses it.
+        // External editors need not use the writer's compact JSON layout. Both
+        // provider reads and replay assembly must still honor the parsed reset.
         const resetLine = JSON.stringify(reset).replace(
           '"contextBoundaryKind":"reset"',
           '"contextBoundaryKind" : "reset"'
@@ -188,13 +188,19 @@ describe("prepareProviderRequestMessages", () => {
         const loaded = await historyService.getHistoryFromLatestBoundary(workspaceId);
         expect(loaded.success).toBe(true);
         if (!loaded.success) throw new Error(loaded.error);
-        expect(loaded.data.map((row) => row.id)).toEqual([
-          archived.id,
-          oldActive.id,
-          reset.id,
-          current.id,
-        ]);
-        const prepared = prepareProviderRequestMessages(loaded.data, "openai", "off");
+        expect(loaded.data.map((row) => row.id)).toEqual([reset.id, current.id]);
+        expect(
+          prepareProviderRequestMessages(loaded.data, "openai", "off").providerRequestMessages.map(
+            (row) => row.id
+          )
+        ).toEqual([current.id]);
+        // The provider reader now clamps first; broader replay snapshots still
+        // need the assembler's independent boundary-before-filtering protection.
+        const prepared = prepareProviderRequestMessages(
+          [archived, oldActive, ...loaded.data],
+          "openai",
+          "off"
+        );
         expect(prepared.activeContextMessages.map((row) => row.id)).toEqual([current.id]);
         expect(prepared.providerRequestMessages.map((row) => row.id)).toEqual([current.id]);
         expect(prepared.contextBoundarySlicedCount).toBe(kind === "normal" ? 3 : 2);
