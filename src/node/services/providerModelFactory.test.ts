@@ -1065,56 +1065,104 @@ describe("ProviderModelFactory GitHub Copilot", () => {
   it.each(["preference", "wire-format"])(
     "uses pre-send routing config after a %s change",
     async (change) => {
-      await withTempConfig(async (config, factory, _oauth, store) => {
+      await withTempConfig(async (config, factory, oauth, store) => {
         const auth = {
           type: "oauth" as const,
           access: "access",
           refresh: "refresh",
           expires: Date.now() + 60_000,
         };
+        const requests: Array<{ url: string; authorization: string | null }> = [];
         const providersConfig = {
           openai: { apiKey: "test-api-key", codexOauthAccounts: { work: { label: "Work", auth } } },
         };
-        store.saveProvidersConfig(providersConfig);
-        await config.editConfig((cfg) => {
-          cfg.projects.set("/project", {
-            codexOauthAccountId: "work",
-            workspaces: [{ id: "snapshot-ws", name: "snapshot-ws", path: "/project/ws" }],
-          });
-          return cfg;
-        });
-        const options = {
-          workspaceId: "snapshot-ws",
-          providersConfig,
-          codexOauthSelection: { accountId: "work", explicit: true },
-        };
-        store.saveProvidersConfig({
-          openai: {
-            ...providersConfig.openai,
-            ...(change === "preference"
-              ? { codexOauthDefaultAuth: "apiKey" }
-              : { wireFormat: "chatCompletions" }),
+        const fetchStub = Object.assign(
+          (input: RequestInfo | URL, init?: RequestInit) => {
+            requests.push({
+              url: input instanceof Request ? input.url : String(input),
+              authorization: new Headers(init?.headers).get("authorization"),
+            });
+            return Promise.reject(new Error("Request captured"));
           },
-        });
-        await config.editConfig((cfg) => {
-          delete cfg.projects.get("/project")!.codexOauthAccountId;
-          return cfg;
-        });
-        const pinned = await factory.resolveAndCreateModel(
-          "openai:gpt-5.5",
-          "off",
-          undefined,
-          options
+          { preconnect: () => undefined }
         );
-        expect(pinned.success).toBe(true);
-        if (!pinned.success) return;
-        expect(pinned.data.codexOauthAccountId).toBe("work");
-        expect(modelCostsIncluded(pinned.data.model)).toBe(true);
-        const next = await factory.resolveAndCreateModel("openai:gpt-5.5", "off", undefined, {
-          workspaceId: "snapshot-ws",
-        });
-        expect(next.success).toBe(true);
-        if (next.success) expect(modelCostsIncluded(next.data.model)).toBe(false);
+        const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fetchStub);
+        const codexOauthService = new CodexOauthService(
+          store,
+          new ProviderService(config, undefined, store)
+        );
+        oauth.codexOauthService = codexOauthService;
+        try {
+          store.saveProvidersConfig(providersConfig);
+          await config.editConfig((cfg) => {
+            cfg.projects.set("/project", {
+              codexOauthAccountId: "work",
+              workspaces: [{ id: "snapshot-ws", name: "snapshot-ws", path: "/project/ws" }],
+            });
+            return cfg;
+          });
+          const options = {
+            workspaceId: "snapshot-ws",
+            providersConfig,
+            codexOauthSelection: { accountId: "work", explicit: true },
+          };
+          store.saveProvidersConfig({
+            openai: {
+              ...providersConfig.openai,
+              ...(change === "preference"
+                ? { codexOauthDefaultAuth: "apiKey" }
+                : { wireFormat: "chatCompletions" }),
+            },
+          });
+          await config.editConfig((cfg) => {
+            delete cfg.projects.get("/project")!.codexOauthAccountId;
+            return cfg;
+          });
+          const pinned = await factory.resolveAndCreateModel(
+            "openai:gpt-5.5",
+            "off",
+            undefined,
+            options
+          );
+          expect(pinned.success).toBe(true);
+          if (!pinned.success) return;
+          expect(pinned.data.codexOauthAccountId).toBe("work");
+          expect(pinned.data.model).toMatchObject({ provider: "openai.responses" });
+          const next = await factory.resolveAndCreateModel("openai:gpt-5.5", "off", undefined, {
+            workspaceId: "snapshot-ws",
+          });
+          expect(next.success).toBe(true);
+          if (!next.success) return;
+          // Verify authentication at the request boundary, not through cost markers.
+          const cases = [
+            {
+              model: pinned.data.model,
+              expected: {
+                url: "https://chatgpt.com/backend-api/codex/responses",
+                authorization: "Bearer access",
+              },
+            },
+            {
+              model: next.data.model,
+              expected: {
+                url: `https://api.openai.com/v1/${change === "wire-format" ? "chat/completions" : "responses"}`,
+                authorization: "Bearer test-api-key",
+              },
+            },
+          ];
+          for (const { model, expected } of cases) {
+            requests.length = 0;
+            // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void.
+            await expect(generateText({ model, prompt: "Hello", maxRetries: 0 })).rejects.toThrow(
+              "Request captured"
+            );
+            expect(requests.length).toBeGreaterThan(0);
+            for (const request of requests) expect(request).toEqual(expected);
+          }
+        } finally {
+          fetchSpy.mockRestore();
+          await codexOauthService.dispose();
+        }
       });
     }
   );
@@ -1212,7 +1260,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         });
         expect(result.success).toBe(true);
         if (!result.success || !capturedFetch) throw new Error("Expected an OAuth model");
-        expect(modelCostsIncluded(result.data)).toBe(true);
+        expect(result.data).toMatchObject({ provider: "openai.responses" });
         return capturedFetch;
       };
       const send = (providerFetch: typeof fetch) =>
@@ -1414,7 +1462,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
           selection
         );
         expect(chat.success).toBe(true);
-        if (chat.success) expect(modelCostsIncluded(chat.data)).toBe(false);
+        if (chat.success) expect(chat.data).toMatchObject({ provider: "openai.chat" });
       }
       providersConfigStore.saveProvidersConfig({
         openai: { apiKey: "test-key", codexOauthDefaultAuth: "apiKey" },
@@ -1423,7 +1471,7 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         projectPath: "/missing",
       });
       expect(api.success).toBe(true);
-      if (api.success) expect(modelCostsIncluded(api.data)).toBe(false);
+      if (api.success) expect(api.data).toMatchObject({ provider: "openai.responses" });
       providersConfigStore.saveProvidersConfig({
         openai: { codexOauthDefaultAccountId: "deleted" },
         openrouter: { apiKey: "gateway-key" },
