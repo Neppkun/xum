@@ -63,7 +63,7 @@ import {
   isProviderAutoRouteEligible,
   resolveProviderCredentials,
 } from "@/node/utils/providerRequirements";
-import { getCodexOauthAccounts, getCodexOauthAccountId } from "@/node/utils/codexOauthAuth";
+import { getCodexOauthAccounts } from "@/node/utils/codexOauthAuth";
 import {
   normalizeCoderDeploymentUrl,
   parseCoderGatewayProviders,
@@ -510,7 +510,13 @@ export class ProviderService {
           id,
           label,
         }));
-        providerInfo.codexOauthDefaultAccountId = getCodexOauthAccountId(config);
+        // Preserve an unset selection. A synthetic default would block API-key-only routing in the renderer.
+        if (
+          "codexOauthDefaultAccountId" in config &&
+          typeof config.codexOauthDefaultAccountId === "string"
+        ) {
+          providerInfo.codexOauthDefaultAccountId = config.codexOauthDefaultAccountId;
+        }
 
         const codexOauthDefaultAuth = config.codexOauthDefaultAuth;
         if (codexOauthDefaultAuth === "oauth" || codexOauthDefaultAuth === "apiKey") {

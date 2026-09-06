@@ -154,6 +154,37 @@ describe("xum trust CLI", () => {
   });
 
   test.each(["work", undefined])(
+    "uses the deepest registered account scope: %s",
+    async (accountId) => {
+      using tmp = new DisposableTempDir("codex-nested-account");
+      const real = new Config(path.join(tmp.path, "real"));
+      const target = new Config(path.join(tmp.path, "target"));
+      const root = path.join(tmp.path, "project");
+      const subproject = path.join(root, "packages", "api");
+      const targetProject = path.join(tmp.path, "cli-project");
+      await real.editConfig((config) => {
+        config.projects.set(subproject, { workspaces: [], codexOauthAccountId: accountId });
+        config.projects.set(root, { workspaces: [], codexOauthAccountId: "personal" });
+        return config;
+      });
+      await materializeCodexOauthAccount(real, target, path.join(subproject, "src"), targetProject);
+      expect(target.loadConfigOrDefault().projects.get(targetProject)?.codexOauthAccountId).toBe(
+        accountId
+      );
+
+      await materializeCodexOauthAccount(
+        real,
+        target,
+        path.join(root, "packages", "api-other", "src"),
+        targetProject
+      );
+      expect(target.loadConfigOrDefault().projects.get(targetProject)?.codexOauthAccountId).toBe(
+        "personal"
+      );
+    }
+  );
+
+  test.each(["work", undefined])(
     "rejects a lost account selection write: %s",
     async (accountId) => {
       using tmp = new DisposableTempDir("codex-account-write-failure");

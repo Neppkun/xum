@@ -63,6 +63,7 @@ export interface CodexOauthLoginOptions {
 interface AccountSelection {
   accountId: string;
   revision: number;
+  credentialId?: string;
   auth: CodexOauthAuth | null;
   label?: string;
   selectAsDefault: boolean;
@@ -151,7 +152,8 @@ function matchesAuth(actual: CodexOauthAuth | null, expected: CodexOauthAuth | n
     actual.access === expected.access &&
     actual.refresh === expected.refresh &&
     actual.expires === expected.expires &&
-    actual.accountId === expected.accountId
+    actual.accountId === expected.accountId &&
+    actual.credentialId === expected.credentialId
   );
 }
 
@@ -288,6 +290,8 @@ export class CodexOauthService {
           );
         }, DEFAULT_DESKTOP_TIMEOUT_MS),
       });
+
+      self.loginSelections.set(destination.accountId, destination);
 
       const authorizeUrl = buildCodexAuthorizeUrl({
         redirectUri,
@@ -477,6 +481,8 @@ export class CodexOauthService {
             resolveResult,
             settled: false,
           });
+
+          self.loginSelections.set(destination.accountId, destination);
 
           log.debug(`[Codex OAuth] Device flow started (flowId=${flowId})`);
 
@@ -719,43 +725,96 @@ export class CodexOauthService {
     );
   }
 
+  private initializeCredentialId(
+    accountId: string
+  ): Effect.Effect<CodexOauthAuth, CodexOauthError> {
+    return Effect.tryPromise({
+      try: () =>
+        this.fileLeaseManager.withCodexOauthRefreshLock(accountId, async () => {
+          let selected: CodexOauthAuth | null = null;
+          const result = await this.providerService.updateProviderSection(
+            "openai",
+            (section) => {
+              const current = getCodexOauthAuth(section, accountId);
+              if (!current) return null;
+              selected = current;
+              if (current.credentialId) return null;
+              selected = { ...current, credentialId: crypto.randomUUID() };
+              const next = { ...section };
+              if (accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID) {
+                next.codexOauth = selected;
+              } else {
+                const accounts = isPlainObject(section?.codexOauthAccounts)
+                  ? section.codexOauthAccounts
+                  : {};
+                const entry = accounts[accountId];
+                next.codexOauthAccounts = {
+                  ...accounts,
+                  [accountId]: { ...(isPlainObject(entry) ? entry : {}), auth: selected },
+                };
+              }
+              return { value: next };
+            },
+            { enforcePolicy: true }
+          );
+          if (!result.success) throw new Error(result.error);
+          if (!selected) throw new Error("Codex OAuth account is not configured");
+          return selected;
+        }),
+      catch: (error) => new CodexOauthError({ reason: getErrorMessage(error) }),
+    });
+  }
+
   private selectLoginDestination(
     options?: CodexOauthLoginOptions
   ): Effect.Effect<AccountSelection, CodexOauthError> {
-    return Effect.suspend(() => {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect generators do not inherit this.
+    const self = this;
+    return Effect.gen(function* () {
       if (options?.accountId !== undefined && options.label !== undefined) {
-        return Effect.fail(
+        return yield* Effect.fail(
           new CodexOauthError({ reason: "Specify an account ID or a label, not both" })
         );
       }
       if (options?.label !== undefined && !isValidLabel(options.label)) {
-        return Effect.fail(new CodexOauthError({ reason: "Invalid Codex OAuth account label" }));
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Invalid Codex OAuth account label" })
+        );
       }
       const accountId =
         options?.accountId ??
         (options?.label !== undefined ? crypto.randomUUID() : CODEX_OAUTH_DEFAULT_ACCOUNT_ID);
       if (!isValidCodexOauthAccountId(accountId)) {
-        return Effect.fail(new CodexOauthError({ reason: "Invalid Codex OAuth account ID" }));
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Invalid Codex OAuth account ID" })
+        );
       }
-      const auth = this.readStoredAuth(accountId);
+      let auth = self.readStoredAuth(accountId);
       if (options?.accountId !== undefined && !auth) {
-        return Effect.fail(
+        return yield* Effect.fail(
           new CodexOauthError({ reason: "Codex OAuth account is not configured" })
         );
       }
-      // A failed or cancelled login must not discard a pending token rotation.
-      const revision = this.getAccountRevision(accountId);
-      const selection: AccountSelection = {
+      const revision = self.getAccountRevision(accountId);
+      if (auth && !auth.credentialId) {
+        // Stamp old credentials under the refresh lease. Stamping during rotation can discard the rotated token.
+        auth = yield* self.initializeCredentialId(accountId);
+      }
+      if (self.getAccountRevision(accountId) !== revision) {
+        return yield* Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth account changed during login startup" })
+        );
+      }
+      return {
         accountId,
         revision,
+        credentialId: auth?.credentialId,
         auth,
         label: options?.label?.trim(),
         selectAsDefault:
           options?.label !== undefined &&
-          getCodexOauthAccounts(this.readOpenaiConfig()).length === 0,
+          getCodexOauthAccounts(self.readOpenaiConfig()).length === 0,
       };
-      this.loginSelections.set(accountId, selection);
-      return Effect.succeed(selection);
     });
   }
 
@@ -778,21 +837,7 @@ export class CodexOauthService {
           return null;
         if (legacy || auth === undefined) return { value: auth };
         return { value: { ...(isPlainObject(current) ? current : {}), auth } };
-      }).pipe(
-        Effect.map((result) => {
-          const login = this.loginSelections.get(selection.accountId);
-          // A local refresh changes tokens, not the identity of an in-progress interactive login.
-          if (
-            result.success &&
-            auth &&
-            login?.revision === selection.revision &&
-            matchesAuth(login.auth, selection.auth)
-          ) {
-            login.auth = auth;
-          }
-          return result;
-        })
-      )
+      })
     );
   }
 
@@ -801,6 +846,7 @@ export class CodexOauthService {
     auth: CodexOauthAuth,
     isActive: () => boolean
   ): Effect.Effect<Result<void, string>> {
+    const nextAuth = { ...auth, credentialId: crypto.randomUUID() };
     return this.withAccountMutationEffect(
       selection.accountId,
       this.configMutationEffect(() =>
@@ -823,10 +869,16 @@ export class CodexOauthService {
             const stored = parseCodexOauthAuth(
               legacy ? current.codexOauth : isPlainObject(entry) ? entry.auth : undefined
             );
-            if (!matchesAuth(stored, selection.auth)) return null;
+            // Token rotation preserves the login ID. Deletion, replacement, or an older writer cannot match it.
+            if (
+              selection.credentialId === undefined
+                ? stored !== null
+                : stored?.credentialId !== selection.credentialId
+            )
+              return null;
             const next = { ...current };
             if (legacy) {
-              next.codexOauth = auth;
+              next.codexOauth = nextAuth;
             } else {
               // Do not mirror named credentials into the legacy slot.
               // Older versions refresh that slot independently and cannot honor project selection.
@@ -836,7 +888,7 @@ export class CodexOauthService {
                 [selection.accountId]: {
                   ...(isPlainObject(entry) ? entry : {}),
                   label: isPlainObject(entry) ? entry.label : selection.label,
-                  auth,
+                  auth: nextAuth,
                 },
               };
               // Commit the first slot and its selection together. A failed write must leave neither field.
@@ -1072,6 +1124,7 @@ export class CodexOauthService {
 
       const next: CodexOauthAuth = {
         type: "oauth",
+        credentialId: current.credentialId,
         access: accessToken,
         refresh: refreshToken ?? current.refresh,
         expires: Date.now() + Math.max(0, Math.floor(expiresIn * 1000)),

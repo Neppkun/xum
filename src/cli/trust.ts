@@ -208,6 +208,18 @@ export async function materializeCodexOauthAccount(
       }
     }
   }
+  if (sourcePath === undefined) {
+    // An explicit directory can sit below a registered subproject. Keep its account scope.
+    for (const projectPath of projects.keys()) {
+      const relative = path.relative(projectPath, projectDir);
+      if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        continue;
+      }
+      if (sourcePath === undefined || projectPath.length > sourcePath.length) {
+        sourcePath = projectPath;
+      }
+    }
+  }
   sourcePath ??=
     (await findMainRepoDir(projectDir)) ?? (await findGitRoot(projectDir)) ?? projectDir;
   const accountId = projects.get(sourcePath)?.codexOauthAccountId;

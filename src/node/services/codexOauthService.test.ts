@@ -1,5 +1,6 @@
 import { Config, FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import * as fs from "fs";
+import http from "node:http";
 import * as os from "os";
 import * as path from "path";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
@@ -38,6 +39,7 @@ function fakeJwt(claims: Record<string, unknown>): string {
 function validAuth(overrides?: Partial<CodexOauthAuth>): CodexOauthAuth {
   return {
     type: "oauth",
+    credentialId: "1c9c50b0-d777-4dd2-998c-09c156ba9754",
     access: fakeJwt({ sub: "user" }),
     refresh: "rt_test",
     expires: Date.now() + 3_600_000, // 1h from now
@@ -1000,6 +1002,198 @@ describe("CodexOauthService", () => {
       expect((await service.waitForDeviceFlow(first.data.flowId)).success).toBe(false);
       expect(await service.waitForDeviceFlow(second.data.flowId)).toEqual(Ok(undefined));
       expect(getCodexOauthAuth(deps.providersConfig.openai)?.access).toBe("access-device-2");
+    });
+
+    function sharedServices(auth: CodexOauthAuth) {
+      const provider = new ProviderService(new Config(deps.rootDir));
+      const store = provider.providersConfigStore;
+      store.saveProvidersConfig({
+        openai: { codexOauthAccounts: { work: { label: "Work", auth } } },
+      });
+      return {
+        provider,
+        store,
+        first: new CodexOauthService(store, provider),
+        second: new CodexOauthService(
+          new ProvidersConfigStore(deps.rootDir),
+          new ProviderService(new Config(deps.rootDir))
+        ),
+      };
+    }
+
+    it("completes reconnect after another service refreshes the same credential", async () => {
+      const initial = expiredAuth();
+      const { store, first, second } = sharedServices(initial);
+      deviceFetch((init) =>
+        Promise.resolve(
+          mockRefreshResponse({
+            access_token:
+              new URLSearchParams(requestBody(init)).get("grant_type") === "refresh_token"
+                ? "rotated-access"
+                : "login-access",
+            refresh_token: "new-refresh",
+            expires_in: 3600,
+          })
+        )
+      );
+      try {
+        const flow = await first.startDeviceFlow({ accountId: "work" });
+        if (!flow.success) throw new Error(flow.error);
+        const refreshed = await second.getValidAuth("work");
+        expect(refreshed.success).toBe(true);
+        expect(getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")?.credentialId).toBe(
+          initial.credentialId
+        );
+        expect(await first.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+        const reconnected = getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work");
+        expect(reconnected?.access).toBe("login-access");
+        expect(reconnected?.credentialId).toBeDefined();
+        expect(reconnected?.credentialId).not.toBe(initial.credentialId);
+      } finally {
+        await first.dispose();
+        await second.dispose();
+      }
+    });
+
+    it("lets the first completed cross-process reconnect invalidate the other login", async () => {
+      const { store, first, second } = sharedServices(validAuth());
+      deviceFetch();
+      try {
+        const older = await first.startDeviceFlow({ accountId: "work" });
+        const newer = await second.startDeviceFlow({ accountId: "work" });
+        if (!older.success || !newer.success) throw new Error("Login start failed");
+        expect(await first.waitForDeviceFlow(older.data.flowId)).toEqual(Ok(undefined));
+        const winner = getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work");
+        expect((await second.waitForDeviceFlow(newer.data.flowId)).success).toBe(false);
+        expect(getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")).toEqual(winner);
+      } finally {
+        await first.dispose();
+        await second.dispose();
+      }
+    });
+
+    it.each(["removed", "recreated", "older-client"])(
+      "rejects stale login after external %s credentials",
+      async (change) => {
+        const initial = validAuth();
+        const { provider, store, first, second } = sharedServices(initial);
+        deviceFetch();
+        try {
+          const flow = await first.startDeviceFlow({ accountId: "work" });
+          if (!flow.success) throw new Error(flow.error);
+          if (change !== "older-client") {
+            await provider.setConfigValue("openai", ["codexOauthAccounts", "work"], undefined);
+          }
+          if (change !== "removed") {
+            await provider.setConfigValue("openai", ["codexOauthAccounts", "work"], {
+              label: "Work",
+              auth: {
+                ...initial,
+                credentialId:
+                  change === "recreated" ? "50e00a32-b964-4ce2-b131-6b53356ce2db" : undefined,
+              },
+            });
+          }
+          const current = store.loadProvidersConfig()?.openai;
+          expect((await first.waitForDeviceFlow(flow.data.flowId)).success).toBe(false);
+          expect(store.loadProvidersConfig()?.openai).toEqual(current);
+        } finally {
+          await first.dispose();
+          await second.dispose();
+        }
+      }
+    );
+
+    it("waits for an old credential refresh before assigning its durable login ID", async () => {
+      const initial = expiredAuth({ credentialId: undefined });
+      const { store, provider, first, second } = sharedServices(initial);
+      const leaseAttempt = createDeferred<void>();
+      class ObservedLeaseManager extends FileLeaseManager {
+        override withCodexOauthRefreshLock<T>(
+          accountId: string,
+          fn: () => Promise<T> | T
+        ): Promise<T> {
+          leaseAttempt.resolve(undefined);
+          return super.withCodexOauthRefreshLock(accountId, fn);
+        }
+      }
+      const reconnectService = new CodexOauthService(
+        store,
+        provider,
+        undefined,
+        new ObservedLeaseManager(deps.rootDir)
+      );
+      const refreshStarted = createDeferred<void>();
+      const response = createDeferred<Response>();
+      deviceFetch(() => {
+        refreshStarted.resolve(undefined);
+        return response.promise;
+      });
+      try {
+        const refresh = second.getValidAuth("work");
+        await refreshStarted.promise;
+        const startup = reconnectService.startDeviceFlow({ accountId: "work" });
+        await leaseAttempt.promise;
+        expect(
+          getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")?.credentialId
+        ).toBeUndefined();
+        response.resolve(
+          mockRefreshResponse({
+            access_token: "rotated-access",
+            refresh_token: "rotated-refresh",
+            expires_in: 3600,
+          })
+        );
+        expect((await refresh).success).toBe(true);
+        const flow = await startup;
+        if (!flow.success) throw new Error(flow.error);
+        const stamped = getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work");
+        expect(stamped?.access).toBe("rotated-access");
+        expect(stamped?.refresh).toBe("rotated-refresh");
+        expect(stamped?.credentialId).toBeDefined();
+        await reconnectService.cancelDeviceFlow(flow.data.flowId);
+        expect(await first.getValidAuth("work")).toEqual(Ok(stamped!));
+      } finally {
+        await reconnectService.dispose();
+        await first.dispose();
+        await second.dispose();
+      }
+    });
+
+    it("keeps the active device login when a newer device startup fails", async () => {
+      deps.providersConfig = { openai: { codexOauth: validAuth() } };
+      deviceFetch();
+      const first = await service.startDeviceFlow({ accountId: "default" });
+      if (!first.success) throw new Error(first.error);
+      const workingFetch = globalThis.fetch;
+      mockFetch((input, init) =>
+        input === CODEX_OAUTH_DEVICE_USERCODE_URL
+          ? Promise.reject(new Error("Device startup failed"))
+          : workingFetch(input, init)
+      );
+      expect((await service.startDeviceFlow({ accountId: "default" })).success).toBe(false);
+      expect(await service.waitForDeviceFlow(first.data.flowId)).toEqual(Ok(undefined));
+    });
+
+    it("keeps the active desktop login when the new listener cannot start", async () => {
+      deps.providersConfig = { openai: { codexOauth: validAuth() } };
+      deviceFetch();
+      const first = await service.startDesktopFlow({ accountId: "default" });
+      if (!first.success) throw new Error(first.error);
+      const createServer = spyOn(http, "createServer").mockImplementationOnce(() => {
+        throw new Error("Callback listener unavailable");
+      });
+      try {
+        expect((await service.startDesktopFlow({ accountId: "default" })).success).toBe(false);
+      } finally {
+        createServer.mockRestore();
+      }
+      const response = await originalFetch(
+        "http://localhost:1455/auth/callback?code=code&state=" + first.data.flowId
+      );
+      await response.text();
+      expect(response.ok).toBe(true);
+      expect(await service.waitForDesktopFlow(first.data.flowId)).toEqual(Ok(undefined));
     });
 
     it("completes a reconnect after a concurrent refresh persists first", async () => {

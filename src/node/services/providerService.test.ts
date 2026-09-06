@@ -7,6 +7,8 @@ import { writeFile } from "node:fs/promises";
 import * as os from "os";
 import * as path from "path";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { resolveCodexOauthRouting } from "@/common/utils/providers/codexOauthRouting";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Config } from "@/node/config";
@@ -342,6 +344,18 @@ describe("ProviderService.getConfig", () => {
       expect(result.codexOauthDefaultAccountId).toBe("work");
       expect(JSON.stringify(result)).not.toContain("secret-access");
       expect(JSON.stringify(result)).not.toContain("secret-refresh");
+    });
+  });
+
+  it("preserves implicit and explicit account selections for browser routing", () => {
+    withTempConfig((config, service) => {
+      saveOpenAIConfig(config);
+      expect(resolveCodexOauthRouting(KNOWN_MODELS.GPT.id, service.getConfig())).toBe("other");
+
+      saveOpenAIConfig(config, { codexOauthDefaultAccountId: "default" });
+      expect(resolveCodexOauthRouting(KNOWN_MODELS.GPT.id, service.getConfig())).toBe(
+        "missing-account"
+      );
     });
   });
 

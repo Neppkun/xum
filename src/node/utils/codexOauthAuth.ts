@@ -5,6 +5,8 @@
  * extract non-sensitive claims (e.g. ChatGPT-Account-Id) from OAuth responses.
  */
 
+import { z } from "zod";
+
 import {
   CODEX_OAUTH_DEFAULT_ACCOUNT_ID,
   CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH,
@@ -12,8 +14,12 @@ import {
   CODEX_OAUTH_RESERVED_ACCOUNT_IDS,
 } from "@/common/constants/codexOauthAccounts";
 
+const credentialIdSchema = z.string().uuid().optional();
+
 export interface CodexOauthAuth {
   type: "oauth";
+  /** Identifies this login across token rotations and processes. */
+  credentialId?: string;
   /** OAuth access token (JWT). */
   access: string;
   /** OAuth refresh token. */
@@ -42,6 +48,7 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
   const refresh = value.refresh;
   const expires = value.expires;
   const accountId = value.accountId;
+  const credentialId = credentialIdSchema.safeParse(value.credentialId);
 
   if (type !== "oauth") return null;
   if (typeof access !== "string" || !access) return null;
@@ -52,7 +59,16 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
     if (typeof accountId !== "string" || !accountId) return null;
   }
 
-  return { type: "oauth", access, refresh, expires, accountId };
+  if (!credentialId.success) return null;
+
+  return {
+    type: "oauth",
+    access,
+    refresh,
+    expires,
+    accountId,
+    credentialId: credentialId.data,
+  };
 }
 
 /** Validate local slot IDs at input and storage boundaries. */
