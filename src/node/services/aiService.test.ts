@@ -32,6 +32,8 @@ import { XUM_APP_ATTRIBUTION_TITLE, XUM_APP_ATTRIBUTION_URL } from "@/constants/
 import type { ProviderName } from "@/common/constants/providers";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
+import type { TaskService } from "./taskService";
+import type { WorkflowServiceOptions } from "./workflows/WorkflowService";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
@@ -3098,6 +3100,184 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
     expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
   });
+
+  it.each(["project-account", "default-account", "priority", "override"] as const)(
+    "background workflow continuations retain accepted routing after a %s update",
+    async (change) => {
+      using xumHome = new DisposableTempDir("workflow-routing-snapshot");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "workflow-routing";
+      const store = new ProvidersConfigStore(xumHome.path);
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        {
+          providersConfigStore: store,
+          useRequestedModelString: true,
+        }
+      );
+      await harness.config.editConfig((cfg) => ({
+        ...cfg,
+        routePriority: ["direct"],
+        routeOverrides: {},
+        projects: new Map([
+          [
+            projectPath,
+            {
+              workspaces: [],
+              ...(change === "project-account" ? { codexOauthAccountId: "work" } : {}),
+            },
+          ],
+        ]),
+      }));
+      const requests: RecordedFetchRequest[] = [];
+      const auth: Record<string, typeof TEST_CODEX_OAUTH> = {
+        work: { ...TEST_CODEX_OAUTH, access: "workflow-work-access", accountId: "work-id" },
+        personal: {
+          ...TEST_CODEX_OAUTH,
+          access: "workflow-personal-access",
+          accountId: "personal-id",
+        },
+      };
+      const providersConfig = {
+        openai: {
+          apiKey: "openai-key",
+          codexOauthDefaultAccountId: "work",
+          codexOauthAccounts: {
+            work: { label: "Work", auth: auth.work },
+            personal: { label: "Personal", auth: auth.personal },
+          },
+          fetch: createRecordingOpenAIFetch(requests, "gpt-5.5"),
+        },
+        openrouter: { apiKey: "openrouter-key" },
+      };
+      const read = spyOn(store, "loadProvidersConfig").mockReturnValue(providersConfig);
+      harness.service.turnRequestBuilderBindings.codexOauthService = {
+        getValidAuth: (accountId: string) => Promise.resolve(Ok(auth[accountId])),
+      } as unknown as CodexOauthService;
+      const bindings = harness.service.turnRequestBuilderBindings;
+      bindings.taskService = {} as unknown as TaskService;
+      type Sender = NonNullable<typeof bindings.workflowResultContinuationSender>;
+      const sendMessage = mock<Sender["sendMessage"]>(() => Promise.resolve(Ok(undefined)));
+      bindings.workflowResultContinuationSender = {
+        isWorkflowInvocationCurrent: () => Promise.resolve(true),
+        sendMessage,
+      };
+      const snapshot = harness.service.captureModelRoutingSnapshot(workspaceId);
+      expect(
+        (
+          await harness.service.streamMessage({
+            messages: [createMuxMessage("user", "user", "Start the workflow")],
+            workspaceId,
+            modelString: "openai:gpt-5.5",
+            thinkingLevel: "off",
+            experiments: { dynamicWorkflows: true },
+            modelRoutingSnapshot: snapshot,
+          })
+        ).success
+      ).toBe(true);
+      const workflowService = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1].workflowService;
+      if (!workflowService) throw new Error("Expected workflow service");
+      const onTerminal = Reflect.get(workflowService, "onBackgroundRunTerminal") as NonNullable<
+        WorkflowServiceOptions["onBackgroundRunTerminal"]
+      >;
+      // Exercise the sender fallback when the live task-attention binding is unavailable.
+      bindings.taskService = undefined;
+      if (change === "default-account") {
+        read.mockReturnValue({
+          ...providersConfig,
+          openai: { ...providersConfig.openai, codexOauthDefaultAccountId: "personal" },
+        });
+      } else {
+        await harness.config.editConfig((cfg) => {
+          if (change === "project-account")
+            cfg.projects.get(projectPath)!.codexOauthAccountId = "personal";
+          else if (change === "priority") cfg.routePriority = ["openrouter", "direct"];
+          else cfg.routeOverrides = { "openai:gpt-5.5": "openrouter" };
+          return cfg;
+        });
+      }
+      const terminalEvent: Parameters<typeof onTerminal>[0] = {
+        runId: "wfr_routing",
+        status: "completed",
+        result: { reportMarkdown: "Done" },
+        run: {
+          id: "wfr_routing",
+          workspaceId,
+          status: "completed",
+          workflow: {
+            name: "routing",
+            description: "Test routing",
+            scope: "project",
+            executable: true,
+          },
+          source: "return {}",
+          sourceHash: "test-hash",
+          args: {},
+          events: [],
+          steps: [],
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+        },
+      };
+      const noteWorkflowRunTerminalAttention = mock(() => undefined);
+      bindings.taskService = { noteWorkflowRunTerminalAttention } as unknown as TaskService;
+      await onTerminal(terminalEvent);
+      expect(noteWorkflowRunTerminalAttention).toHaveBeenCalledWith({
+        ownerWorkspaceId: workspaceId,
+        runId: "wfr_routing",
+        status: "completed",
+      });
+      expect(sendMessage).not.toHaveBeenCalled();
+      bindings.taskService = undefined;
+      await onTerminal(terminalEvent);
+      expect(sendMessage).toHaveBeenCalledTimes(1);
+      const [, message, options, internal] = sendMessage.mock.calls[0];
+      expect(internal?.modelRoutingSnapshot).toBe(snapshot);
+      expect(internal?.requireIdle).toBe(true);
+      expect(JSON.stringify({ message, options })).not.toContain("workflow-work-access");
+      const continued = await harness.service.createModel(
+        options.model,
+        options.providerOptions,
+        internal
+      );
+      if (!continued.success || typeof continued.data === "string")
+        throw new Error("Expected continued SDK model");
+      await continued.data.doGenerate({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+      });
+      expect(getFetchUrl(requests[0].input)).toBe(CODEX_ENDPOINT);
+      expect(new Headers(requests[0].init?.headers).get("authorization")).toBe(
+        "Bearer workflow-work-access"
+      );
+      const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+      spyOn(factory, "resolveAndCreateModel").mockRestore();
+      expect(
+        (
+          await harness.service.streamMessage({
+            messages: [createMuxMessage("next-user", "user", "New user turn")],
+            workspaceId,
+            modelString: options.model,
+            thinkingLevel: "off",
+            modelRoutingSnapshot: harness.service.captureModelRoutingSnapshot(workspaceId),
+          })
+        ).success
+      ).toBe(true);
+      const nextModel = harness.startStreamCalls.at(-1)?.model;
+      if (!nextModel || typeof nextModel === "string") throw new Error("Expected new SDK model");
+      if (change === "priority" || change === "override") {
+        expect(nextModel.modelId).toBe("openai/gpt-5.5");
+      } else {
+        await nextModel.doGenerate({
+          prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+        });
+        expect(new Headers(requests[1].init?.headers).get("authorization")).toBe(
+          "Bearer workflow-personal-access"
+        );
+      }
+    }
+  );
 
   it.each([
     { toolName: "advisor", change: "priority" },

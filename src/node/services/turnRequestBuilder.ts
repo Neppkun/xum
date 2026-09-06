@@ -93,8 +93,8 @@ import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
 import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
 import {
+  ANTHROPIC_1M_CONTEXT_HEADER,
   buildProviderOptions,
-  isAnthropic1MEffectivelyEnabled,
   buildRequestHeaders,
   resolveProviderOptionsNamespaceKey,
 } from "@/common/utils/ai/providerOptions";
@@ -429,6 +429,7 @@ interface WorkflowResultContinuationSender {
     options: SendMessageOptions,
     internal?: {
       skipAutoResumeReset?: boolean;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
       synthetic?: boolean;
       agentInitiated?: boolean;
       /** When true, reject instead of queueing if the workspace is busy. */
@@ -717,14 +718,10 @@ export class TurnRequestBuilder {
     };
     options.recordStartupPhaseTiming?.("buildRequestConfigMs", buildRequestConfigStartedAt);
     return {
-      // Match compaction using this request's accepted metadata and provider options.
+      // Use the resolved route and emitted beta header, not the requested direct-provider identity.
       effectiveContextLimit: getEffectiveContextLimit(
-        options.rawModelString,
-        isAnthropic1MEffectivelyEnabled(
-          options.rawModelString,
-          options.muxProviderOptions,
-          options.providersConfigSnapshot
-        ),
+        options.effectiveModelString,
+        requestHeaders?.["anthropic-beta"] === ANTHROPIC_1M_CONTEXT_HEADER,
         options.providersConfigSnapshot,
         { openaiWireFormat: options.muxProviderOptions.openai?.wireFormat }
       ),
@@ -1819,6 +1816,8 @@ export class TurnRequestBuilder {
                 return;
               }
               if (this.dependencies.bindings.taskService != null) {
+                // Durable attention can combine multiple origins and recover after restart.
+                // It starts a new turn with current routing; only the one-origin fallback keeps this snapshot.
                 this.dependencies.bindings.taskService.noteWorkflowRunTerminalAttention({
                   ownerWorkspaceId: workspaceId,
                   runId,
@@ -1891,6 +1890,8 @@ export class TurnRequestBuilder {
                   },
                   {
                     skipAutoResumeReset: true,
+                    // Only this live callback retains credentials. Restart recovery captures current routing.
+                    modelRoutingSnapshot: opts.modelRoutingSnapshot,
                     synthetic: true,
                     agentInitiated: true,
                     requireIdle: true,

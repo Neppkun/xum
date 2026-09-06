@@ -8830,6 +8830,41 @@ describe("WorkspaceService sendMessage status clearing", () => {
     await cleanupHistory();
   });
 
+  test("forwards workflow routing only through internal idle-send options", async () => {
+    fakeSession.isBusy.mockReturnValue(false);
+    const modelRoutingSnapshot: ReturnType<AIService["captureModelRoutingSnapshot"]> = {
+      providersConfig: { openai: { apiKey: "snapshot-secret" } },
+      metadata: null,
+      codexOauthSelection: { accountId: "work", explicit: true },
+      routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+    };
+    const options = { model: "openai:gpt-5.5", agentId: "exec", skipAiSettingsPersistence: true };
+    expect(
+      (
+        await workspaceService.sendMessage("test-workspace", "Workflow completed", options, {
+          synthetic: true,
+          agentInitiated: true,
+          requireIdle: true,
+          modelRoutingSnapshot,
+        })
+      ).success
+    ).toBe(true);
+    expect(fakeSession.sendMessage).toHaveBeenCalledWith(
+      "Workflow completed",
+      options,
+      expect.objectContaining({ modelRoutingSnapshot })
+    );
+    expect(JSON.stringify(fakeSession.sendMessage.mock.calls[0]?.[1])).not.toContain(
+      "snapshot-secret"
+    );
+    expect(
+      (await workspaceService.sendMessage("test-workspace", "New user turn", options)).success
+    ).toBe(true);
+    expect(fakeSession.sendMessage.mock.calls[1]?.[2]).toEqual(
+      expect.objectContaining({ modelRoutingSnapshot: undefined })
+    );
+  });
+
   test("delegates manual pricing rejections to AgentSession so user input is preserved", async () => {
     fakeSession.isBusy.mockReturnValue(false);
     const pricingError: SendMessageError = { type: "unknown", raw: "unpriced model" };

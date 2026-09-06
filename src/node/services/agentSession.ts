@@ -3083,7 +3083,7 @@ export class AgentSession {
       /** A dequeued send keeps its admission owner through acceptance and startup failure. */
       turnReservation?: TurnId;
       synthetic?: boolean;
-      /** Same-session compaction continues accepted work without changing its billing identity. */
+      /** Same-session continuations keep accepted routing. Restart recovery captures current settings. */
       modelRoutingSnapshot?: ModelRoutingSnapshot;
       agentInitiated?: boolean;
       goalContinuation?: boolean;
