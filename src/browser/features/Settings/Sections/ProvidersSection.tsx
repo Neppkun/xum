@@ -449,6 +449,8 @@ export function ProvidersSection() {
   const {
     providersExpandedProvider,
     setProvidersExpandedProvider,
+    codexAccountAction,
+    setCodexAccountAction,
     providersStartCoderLogin,
     setProvidersStartCoderLogin,
   } = useSettings();
@@ -460,6 +462,17 @@ export function ProvidersSection() {
     () => getAllowedProvidersForUi(effectivePolicy, config),
     [effectivePolicy, config]
   );
+  // Hidden providers never mount their account controls. Do not retain commands for a later policy change.
+  useEffect(() => {
+    if (
+      codexAccountAction &&
+      !configLoading &&
+      (!visibleProviders.includes("openai") || isCustomProviderInfo(config?.openai))
+    ) {
+      setCodexAccountAction((current) => (current === codexAccountAction ? null : current));
+    }
+  }, [codexAccountAction, configLoading, visibleProviders, config, setCodexAccountAction]);
+
   const {
     data: muxGatewayAccountStatus,
     error: muxGatewayAccountError,

@@ -60,6 +60,11 @@ export interface CodexOauthLoginOptions {
   accountId?: string;
 }
 
+interface CodexOauthCredentialSnapshot {
+  // An undefined ID pins a legacy credential. An omitted snapshot does not constrain the ID.
+  credentialId: string | undefined;
+}
+
 interface AccountSelection {
   accountId: string;
   revision: number;
@@ -282,7 +287,13 @@ export class CodexOauthService {
 
       self.desktopFlows.register(flowId, {
         server: loopback.server,
-        resultDeferred,
+        resultDeferred: {
+          ...resultDeferred,
+          resolve: (result) => {
+            self.clearLoginSelection(destination);
+            resultDeferred.resolve(result);
+          },
+        },
         // Keep server-side timeout tied to flow lifetime so abandoned flows
         // (e.g. callers that never invoke waitForDesktopFlow) still self-clean.
         timeoutHandle: setTimeout(() => {
@@ -586,11 +597,17 @@ export class CodexOauthService {
     );
   }
 
-  async getValidAuth(accountId?: string): Promise<Result<CodexOauthAuth, string>> {
-    return Effect.runPromise(this.getValidAuthEffect(accountId));
+  async getValidAuth(
+    accountId?: string,
+    expectedCredential?: CodexOauthCredentialSnapshot
+  ): Promise<Result<CodexOauthAuth, string>> {
+    return Effect.runPromise(this.getValidAuthEffect(accountId, expectedCredential));
   }
 
-  getValidAuthEffect(accountId?: string): Effect.Effect<Result<CodexOauthAuth, string>> {
+  getValidAuthEffect(
+    accountId?: string,
+    expectedCredential?: CodexOauthCredentialSnapshot
+  ): Effect.Effect<Result<CodexOauthAuth, string>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect generators do not inherit this.
     const self = this;
     return Effect.gen(function* () {
@@ -601,7 +618,7 @@ export class CodexOauthService {
       const selection = {
         accountId: selectedId,
         revision: self.getAccountRevision(selectedId),
-        credentialId: stored?.credentialId,
+        credentialId: expectedCredential ? expectedCredential.credentialId : stored?.credentialId,
       };
       const initial = self.validateRequestAuth(stored, selection);
       if (!initial.success || !isCodexOauthAuthExpired(initial.data)) return initial;
@@ -936,8 +953,7 @@ export class CodexOauthService {
               selection.accountId,
               this.getAccountRevision(selection.accountId) + 1
             );
-            if (this.loginSelections.get(selection.accountId) === selection)
-              this.loginSelections.delete(selection.accountId);
+            this.clearLoginSelection(selection);
           }
           return result;
         })
@@ -1389,6 +1405,13 @@ export class CodexOauthService {
     );
   }
 
+  private clearLoginSelection(destination: AccountSelection): void {
+    // An older flow must not release a newer login for the same slot.
+    if (this.loginSelections.get(destination.accountId) === destination) {
+      this.loginSelections.delete(destination.accountId);
+    }
+  }
+
   /** Idempotent device-flow finish: all-sync bookkeeping + deferred resolve. */
   private finishDeviceFlowEffect(
     flowId: string,
@@ -1401,6 +1424,7 @@ export class CodexOauthService {
       }
 
       flow.settled = true;
+      this.clearLoginSelection(flow.destination);
       clearTimeout(flow.timeout);
       flow.abortController.abort();
 

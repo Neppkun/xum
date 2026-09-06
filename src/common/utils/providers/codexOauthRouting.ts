@@ -62,9 +62,10 @@ export function hasCodexOauthTokens(config: unknown, accountId?: string): boolea
   const selectedId =
     accountId ?? record.codexOauthDefaultAccountId ?? CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
   if (Array.isArray(record.codexOauthAccounts)) {
-    return record.codexOauthAccounts.some(
-      (account: unknown) => asRecord(account)?.id === selectedId
-    );
+    return record.codexOauthAccounts.some((account: unknown) => {
+      const entry = asRecord(account);
+      return entry?.id === selectedId && entry.reconnectRequired !== true;
+    });
   }
 
   // Old metadata contains only the legacy connection flag.
@@ -83,6 +84,7 @@ export function hasCodexOauthTokens(config: unknown, accountId?: string): boolea
   );
   return (
     oauth?.type === "oauth" &&
+    oauth.invalidReason === undefined &&
     hasNonEmptyString(oauth.access) &&
     hasNonEmptyString(oauth.refresh) &&
     typeof oauth.expires === "number" &&
@@ -139,13 +141,19 @@ export function resolveCodexOauthRouting(
   const hasExplicitSelection =
     options?.codexOauthAccountId !== undefined || record?.codexOauthDefaultAccountId !== undefined;
   const accounts = record?.codexOauthAccounts;
-  const hasConnectedAccount = Array.isArray(accounts)
+  const hasInvalidStoredAccount =
+    asRecord(record?.codexOauth)?.invalidReason === "invalid_grant" ||
+    Object.values(asRecord(accounts) ?? {}).some(
+      (account) => asRecord(asRecord(account)?.auth)?.invalidReason === "invalid_grant"
+    );
+  const hasAccountSlots = Array.isArray(accounts)
     ? accounts.length > 0
     : record?.codexOauthSet === true ||
+      hasInvalidStoredAccount ||
       hasCodexOauthTokens(openAIConfig, CODEX_OAUTH_DEFAULT_ACCOUNT_ID) ||
       Object.keys(asRecord(accounts) ?? {}).some((id) => hasCodexOauthTokens(openAIConfig, id));
   // Missing slots must not enable API-only controls or remove the OAuth context cap.
-  return hasExplicitSelection || hasConnectedAccount ? "missing-account" : "other";
+  return hasExplicitSelection || hasAccountSlots ? "missing-account" : "other";
 }
 
 /** Return true only when the selected OAuth account can serve the request. */

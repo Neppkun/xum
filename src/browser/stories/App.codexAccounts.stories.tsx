@@ -1,4 +1,5 @@
 import { expect, fn, userEvent, waitFor, within } from "@storybook/test";
+import { StrictMode } from "react";
 import { appMeta, AppWithMocks, type AppStory } from "./meta";
 import {
   collapseLeftSidebar,
@@ -207,6 +208,179 @@ export const Phone: AppStory = {
   globals: { viewport: { value: "mobile1", isRotated: false } },
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
   play: async ({ canvasElement }) => exerciseAccounts(canvasElement),
+};
+
+async function runAccountCommand(canvasElement: HTMLElement, title: string, choice?: string) {
+  const canvas = within(canvasElement);
+  await userEvent.keyboard("{F4}");
+  const search = await canvas.findByPlaceholderText(/Switch workspaces or type/);
+  await userEvent.clear(search);
+  await userEvent.keyboard(">Codex: " + title);
+  await canvas.findByRole("option", { name: new RegExp("Codex: " + title) });
+  await userEvent.keyboard("{Enter}");
+  if (choice) {
+    const options = await canvas.findByPlaceholderText("Search options…");
+    await userEvent.clear(options);
+    await userEvent.keyboard(choice);
+    await within(canvas.getByRole("listbox")).findByRole("option", { name: choice });
+    await userEvent.keyboard("{Enter}");
+  }
+  await waitFor(() => expect(canvas.queryByPlaceholderText("Search options…")).toBeNull());
+}
+
+async function exerciseKeyboardAccounts(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
+  // Reconnect must survive StrictMode when the command first mounts Settings.
+  await runAccountCommand(canvasElement, "Reconnect account", "Work");
+  const section = await canvas.findByRole("region", { name: "ChatGPT (Codex) accounts" });
+  const controls = within(section);
+  const newName = controls.getByRole("textbox", { name: "New account name" });
+  await waitFor(() => expect(startLogin).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(newName).toBeEnabled());
+  await runAccountCommand(canvasElement, "Add account");
+  await waitFor(() => expect(newName).toHaveFocus());
+  await userEvent.keyboard("Lab{Enter}");
+  await controls.findByRole("listitem", { name: "Lab" });
+  await runAccountCommand(canvasElement, "Add account");
+  await waitFor(() => expect(newName).toHaveFocus());
+  await userEvent.keyboard("Second{Enter}");
+  await controls.findByRole("listitem", { name: "Second" });
+
+  await runAccountCommand(canvasElement, "Rename account", "Work");
+  const name = await controls.findByRole("textbox", { name: "Account name" });
+  await waitFor(() => expect(name).toHaveFocus());
+  await userEvent.clear(name);
+  await userEvent.keyboard("Team");
+  await runAccountCommand(canvasElement, "Rename account", "Work");
+  await waitFor(() => expect(name).toHaveFocus());
+  await expect(name).toHaveValue("Team");
+  await userEvent.keyboard("{Enter}");
+  await controls.findByRole("listitem", { name: "Team" });
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await runAccountCommand(canvasElement, "Reconnect account", "Team");
+    await waitFor(() => expect(startLogin).toHaveBeenCalledTimes(4 + attempt));
+    await expect(startLogin).toHaveBeenLastCalledWith({ accountId: "work" });
+    await waitFor(() => expect(newName).toBeEnabled());
+  }
+  await expect(controls.getAllByRole("listitem")).toHaveLength(4);
+
+  const global = controls.getByRole("combobox", { name: "Global default account" });
+  const project = controls.getByRole("combobox", { name: "/projects/my-app" });
+  for (const accountId of ["work", "default"]) {
+    await runAccountCommand(canvasElement, "Change default account");
+    await waitFor(() => expect(global).toHaveFocus());
+    // userEvent does not implement native select keyboard actions.
+    await userEvent.selectOptions(global, accountId);
+    await waitFor(() => expect(global).toHaveValue(accountId));
+    await runAccountCommand(canvasElement, "Change project account", "my-app");
+    await waitFor(() => expect(project).toHaveFocus());
+    await userEvent.selectOptions(project, accountId);
+    await waitFor(() => expect(project).toHaveValue(accountId));
+  }
+  for (const account of ["Team", "Lab"]) {
+    await runAccountCommand(canvasElement, "Disconnect account", account);
+    await waitFor(() => expect(controls.queryByRole("listitem", { name: account })).toBeNull());
+  }
+  await expect(controls.getAllByRole("listitem")).toHaveLength(2);
+  section.scrollIntoView({ block: "start" });
+  if (window.innerWidth < 768) {
+    await expect(section.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+    await expect(section.scrollWidth).toBeLessThanOrEqual(section.clientWidth);
+  }
+}
+
+export const KeyboardCommands: AppStory = {
+  ...Desktop,
+  render: () => (
+    <StrictMode>
+      <AppWithMocks setup={setupAccounts} />
+    </StrictMode>
+  ),
+  play: async ({ canvasElement }) => exerciseKeyboardAccounts(canvasElement),
+};
+
+export const KeyboardCommandsPhone: AppStory = {
+  ...Phone,
+  render: KeyboardCommands.render,
+  play: KeyboardCommands.play,
+};
+
+function setupReconnectRequired() {
+  const client = setupAccounts();
+  const providers: ProvidersConfigMap = {
+    openai: {
+      apiKeySet: false,
+      isConfigured: false,
+      isEnabled: true,
+      codexOauthSet: false,
+      codexOauthDefaultAccountId: "work",
+      codexOauthAccounts: [{ id: "work", label: "Work", reconnectRequired: true }],
+    },
+  };
+  client.providers.getConfig = () => Promise.resolve(structuredClone(providers));
+  const finishReconnect = () => {
+    providers.openai.codexOauthAccounts = [{ id: "work", label: "Work" }];
+    providers.openai.codexOauthSet = true;
+    providers.openai.isConfigured = true;
+    return Promise.resolve(Ok(undefined));
+  };
+  client.codexOauth.waitForDesktopFlow = finishReconnect;
+  client.codexOauth.waitForDeviceFlow = finishReconnect;
+  return client;
+}
+
+async function checkReconnectRequired(canvasElement: HTMLElement) {
+  const section = await openAccounts(canvasElement);
+  const controls = within(section);
+  const work = within(controls.getByRole("listitem", { name: "Work" }));
+  await expect(work.getByText("Reconnect required")).toBeVisible();
+  await expect(controls.queryByText("Connected", { exact: true })).toBeNull();
+  await expect(controls.getByRole("combobox", { name: "Global default account" })).toHaveValue(
+    "work"
+  );
+  await expect(work.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+  section.scrollIntoView({ block: "start" });
+  if (window.innerWidth < 768) {
+    await expect(section.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+    await expect(section.scrollWidth).toBeLessThanOrEqual(section.clientWidth);
+  }
+  return controls;
+}
+
+export const ReconnectRequired: AppStory = {
+  globals: { viewport: { value: "desktop", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["desktop"] } } },
+  render: () => <AppWithMocks setup={setupReconnectRequired} />,
+  play: async ({ canvasElement }) => {
+    await checkReconnectRequired(canvasElement);
+  },
+};
+
+export const ReconnectRequiredPhone: AppStory = {
+  ...ReconnectRequired,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+};
+
+export const ReconnectRestoresAccount: AppStory = {
+  render: () => <AppWithMocks setup={setupReconnectRequired} />,
+  play: async ({ canvasElement }) => {
+    const controls = await checkReconnectRequired(canvasElement);
+    await userEvent.click(
+      within(controls.getByRole("listitem", { name: "Work" })).getByRole("button", {
+        name: "Reconnect",
+      })
+    );
+    await controls.findByText("Connected", { exact: true });
+    await expect(controls.queryByText("Reconnect required")).toBeNull();
+    await expect(controls.getAllByRole("listitem")).toHaveLength(1);
+    await expect(controls.getByRole("combobox", { name: "Global default account" })).toHaveValue(
+      "work"
+    );
+    await expect(startLogin).toHaveBeenLastCalledWith({ accountId: "work" });
+  },
 };
 
 function setupLoginFailure() {

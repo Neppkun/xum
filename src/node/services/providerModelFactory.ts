@@ -1596,6 +1596,8 @@ export class ProviderModelFactory {
           const selection = self.resolveCodexOauthSelection(providerConfig, opts);
           const codexOauthAccountId = selection.accountId;
           const storedCodexOauth = getCodexOauthAuth(providerConfig, codexOauthAccountId);
+          // Pin the credential before the first fetch. Retries and tool steps must reject replacement logins.
+          const codexOauthCredential = { credentialId: storedCodexOauth?.credentialId };
 
           // Resolve credentials from config + env so we can decide whether to
           // route through Codex OAuth or fall back to API key auth.
@@ -1745,7 +1747,10 @@ export class ProviderModelFactory {
                     throw new Error("Codex OAuth service not initialized");
                   }
 
-                  const authResult = await codexOauthService.getValidAuth(codexOauthAccountId);
+                  const authResult = await codexOauthService.getValidAuth(
+                    codexOauthAccountId,
+                    codexOauthCredential
+                  );
                   if (!authResult.success) {
                     throw new Error(authResult.error);
                   }

@@ -1071,7 +1071,12 @@ describe("ProviderModelFactory GitHub Copilot", () => {
         expires: Date.now() + 3_600_000,
         accountId: "chatgpt-personal",
       };
-      const work = { ...personal, access: "work-access", accountId: "chatgpt-work" };
+      const work = {
+        ...personal,
+        credentialId: "1c9c50b0-d777-4dd2-998c-09c156ba9754",
+        access: "work-access",
+        accountId: "chatgpt-work",
+      };
       providersConfigStore.saveProvidersConfig({
         openai: {
           apiKey: "api-key-must-not-win",
@@ -1243,6 +1248,86 @@ describe("ProviderModelFactory GitHub Copilot", () => {
       }
     });
   });
+
+  for (const credentialId of [undefined, "1c9c50b0-d777-4dd2-998c-09c156ba9754"]) {
+    for (const beforeFirstFetch of [true, false]) {
+      it(
+        "rejects replaced " +
+          (credentialId ? "identified" : "legacy") +
+          " Codex credentials " +
+          (beforeFirstFetch ? "before first fetch" : "between fetches"),
+        async () => {
+          await withTempConfig(async (config, factory, oauth, store) => {
+            const auth = {
+              type: "oauth" as const,
+              credentialId,
+              access: "original-access",
+              refresh: "original-refresh",
+              expires: Date.now() + 3_600_000,
+            };
+            const saveAuth = (next: typeof auth) =>
+              store.saveProvidersConfig({
+                openai: { codexOauth: next },
+              });
+            saveAuth(auth);
+            oauth.codexOauthService = new CodexOauthService(
+              store,
+              new ProviderService(config, undefined, store)
+            );
+            const originalRegistry = PROVIDER_REGISTRY.openai;
+            let providerFetch: typeof fetch | undefined;
+            const sentTokens: Array<string | null> = [];
+            PROVIDER_REGISTRY.openai = async () => {
+              const module = await originalRegistry();
+              return {
+                ...module,
+                createOpenAI: (options) => {
+                  providerFetch = options?.fetch;
+                  return module.createOpenAI(options);
+                },
+              };
+            };
+            try {
+              const model = await factory.createModel("openai:gpt-5.3-codex", undefined, {
+                providersConfig: {
+                  openai: {
+                    codexOauth: auth,
+                    fetch: (_input: RequestInfo | URL, init?: RequestInit) => {
+                      sentTokens.push(new Headers(init?.headers).get("authorization"));
+                      return Promise.resolve(new Response("{}"));
+                    },
+                  },
+                },
+              });
+              expect(model.success).toBe(true);
+              if (!providerFetch) throw new Error("Expected an OAuth fetch wrapper");
+              const send = () =>
+                providerFetch!("https://api.openai.com/v1/responses", {
+                  method: "POST",
+                  body: JSON.stringify({ input: [] }),
+                });
+              if (!beforeFirstFetch) {
+                await send();
+                expect(sentTokens).toEqual(["Bearer original-access"]);
+              }
+              saveAuth({
+                ...auth,
+                credentialId: "6fb7157c-c5a4-4ea7-852f-c46d0b090ff5",
+                access: "replacement-access",
+              });
+              const count = sentTokens.length;
+              // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void.
+              await expect(send()).rejects.toThrow("account changed");
+              expect(sentTokens).toHaveLength(count);
+            } finally {
+              PROVIDER_REGISTRY.openai = originalRegistry;
+              await oauth.codexOauthService.dispose();
+            }
+          });
+        }
+      );
+    }
+  }
 
   it("rejects explicit missing Codex selections without changing API-key precedence", async () => {
     await withTempConfig(async (config, factory, _oauth, providersConfigStore) => {

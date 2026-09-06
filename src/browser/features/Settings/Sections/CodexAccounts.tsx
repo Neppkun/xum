@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type Ref } from "react";
+import { useSettings, type CodexAccountSettingsIntent } from "@/browser/contexts/SettingsContext";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
@@ -21,6 +22,9 @@ interface LoginFlow {
   cancel: () => Promise<void>;
 }
 
+const legacyAccounts: Account[] = [{ id: CODEX_OAUTH_DEFAULT_ACCOUNT_ID, label: "Default" }];
+const noAccounts: Account[] = [];
+
 const inputClassName =
   "bg-background border-border-light text-foreground w-full min-w-0 rounded border px-2 py-1.5 text-xs";
 
@@ -29,6 +33,7 @@ function AccountSelect(props: {
   value: string;
   accounts: Account[];
   defaultLabel?: string;
+  selectRef?: Ref<HTMLSelectElement>;
   disabled: boolean;
   onChange: (value: string) => void;
 }) {
@@ -39,6 +44,7 @@ function AccountSelect(props: {
     <label className="text-muted block min-w-0 space-y-1 text-xs">
       <span className="block break-words">{props.label}</span>
       <select
+        ref={props.selectRef}
         aria-label={props.label}
         className={inputClassName}
         value={props.value}
@@ -66,7 +72,8 @@ function AccountSelect(props: {
 
 export function CodexAccounts() {
   const { api } = useAPI();
-  const { config, refresh } = useProvidersConfig();
+  const { config, loading, refresh } = useProvidersConfig();
+  const { codexAccountAction, setCodexAccountAction } = useSettings();
   const { userProjects, refreshProjects } = useProjectContext();
   const [label, setLabel] = useState("");
   const [rename, setRename] = useState<Account | null>(null);
@@ -74,12 +81,17 @@ export function CodexAccounts() {
   const [loginInProgress, setLoginInProgress] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [flow, setFlow] = useState<LoginFlow | null>(null);
+  const newNameRef = useRef<HTMLInputElement>(null);
+  const renameRef = useRef<HTMLInputElement>(null);
+  const defaultSelectRef = useRef<HTMLSelectElement>(null);
+  const projectSelectRefs = useRef(new Map<string, HTMLSelectElement>());
+  const consumedActionRef = useRef<CodexAccountSettingsIntent | null>(null);
+  const mountedRef = useRef(false);
   const attemptRef = useRef(0);
   const flowRef = useRef<LoginFlow | null>(null);
   const openai = config?.openai;
-  const accounts =
-    openai?.codexOauthAccounts ??
-    (openai?.codexOauthSet ? [{ id: CODEX_OAUTH_DEFAULT_ACCOUNT_ID, label: "Default" }] : []);
+  const accounts: Account[] =
+    openai?.codexOauthAccounts ?? (openai?.codexOauthSet ? legacyAccounts : noAccounts);
   const defaultId = openai?.codexOauthDefaultAccountId ?? CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
   const defaultLabel =
     accounts.find((account) => account.id === defaultId)?.label ?? `Missing account (${defaultId})`;
@@ -90,18 +102,33 @@ export function CodexAccounts() {
   const authEditable =
     accounts.length > 0 && (openai?.apiKeySet === true || !!openai?.apiKeySource);
 
-  // Login owns its server flow. Unmount invalidates late results and cancels the current flow.
-  useEffect(
-    () => () => {
-      attemptRef.current++;
-      flowRef.current?.cancel().catch(() => undefined);
-    },
-    []
-  );
+  // StrictMode replays mount effects before a pending login start can return.
+  // Keep that start valid. A real unmount cancels its result when it arrives.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (flowRef.current) {
+        attemptRef.current += 1;
+        flowRef.current.cancel().catch(() => undefined);
+      }
+    };
+  }, []);
 
   function runAction(operation: Promise<unknown>): void {
     operation.catch((err: unknown) => setError(getErrorMessage(err)));
   }
+
+  const startRename = useCallback(
+    (account: Account) => {
+      if (rename?.id === account.id) {
+        renameRef.current?.focus();
+        return;
+      }
+      setRename(account);
+    },
+    [rename?.id]
+  );
 
   async function saveName() {
     if (!api || !rename) return;
@@ -109,82 +136,97 @@ export function CodexAccounts() {
     if (await mutate(() => api.codexOauth.renameAccount(input))) setRename(null);
   }
 
-  async function refreshState() {
+  const refreshState = useCallback(async () => {
     await Promise.all([refresh(), refreshProjects()]);
-  }
+  }, [refresh, refreshProjects]);
 
-  async function mutate(operation: () => Promise<Result<void, string>>) {
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await operation();
-      if (!result.success) {
-        setError(result.error);
+  const mutate = useCallback(
+    async (operation: () => Promise<Result<void, string>>) => {
+      setBusy(true);
+      setError(null);
+      try {
+        const result = await operation();
+        if (!result.success) {
+          setError(result.error);
+          return false;
+        }
+        await refreshState();
+        return true;
+      } catch (err) {
+        setError(getErrorMessage(err));
         return false;
-      }
-      await refreshState();
-      return true;
-    } catch (err) {
-      setError(getErrorMessage(err));
-      return false;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function connect(device: boolean, input: LoginInput) {
-    if (!api) return;
-    const attempt = ++attemptRef.current;
-    setLoginInProgress(true);
-    setBusy(true);
-    setError(null);
-    try {
-      let nextFlow: LoginFlow;
-      if (device || !showBrowser) {
-        const result = await api.codexOauth.startDeviceFlow(input);
-        if (!result.success) throw new Error(result.error);
-        const { flowId, userCode, verifyUrl } = result.data;
-        nextFlow = {
-          flowId,
-          userCode,
-          url: verifyUrl,
-          cancel: () => api.codexOauth.cancelDeviceFlow({ flowId }),
-        };
-      } else {
-        const result = await api.codexOauth.startDesktopFlow(input);
-        if (!result.success) throw new Error(result.error);
-        const { flowId, authorizeUrl } = result.data;
-        nextFlow = {
-          flowId,
-          url: authorizeUrl,
-          cancel: () => api.codexOauth.cancelDesktopFlow({ flowId }),
-        };
-      }
-      if (attempt !== attemptRef.current) {
-        await nextFlow.cancel();
-        return;
-      }
-      flowRef.current = nextFlow;
-      setFlow(nextFlow);
-      const result =
-        nextFlow.userCode != null
-          ? await api.codexOauth.waitForDeviceFlow({ flowId: nextFlow.flowId })
-          : await api.codexOauth.waitForDesktopFlow({ flowId: nextFlow.flowId });
-      if (attempt !== attemptRef.current) return;
-      if (!result.success) throw new Error(result.error);
-      setLabel("");
-      await refreshState();
-    } catch (err) {
-      if (attempt === attemptRef.current) setError(getErrorMessage(err));
-    } finally {
-      if (attempt === attemptRef.current) {
-        flowRef.current = null;
-        setFlow(null);
-        setLoginInProgress(false);
+      } finally {
         setBusy(false);
       }
-    }
-  }
+    },
+    [refreshState]
+  );
+
+  const disconnect = useCallback(
+    (accountId: string) => {
+      if (!api) return;
+      runAction(mutate(() => api.codexOauth.disconnect({ accountId })));
+    },
+    [api, mutate]
+  );
+
+  const connect = useCallback(
+    async (device: boolean, input: LoginInput) => {
+      if (!api) return;
+      const attempt = ++attemptRef.current;
+      const isCurrent = () => mountedRef.current && attempt === attemptRef.current;
+      setLoginInProgress(true);
+      setBusy(true);
+      setError(null);
+      try {
+        let nextFlow: LoginFlow;
+        if (device || !showBrowser) {
+          const result = await api.codexOauth.startDeviceFlow(input);
+          if (!result.success) throw new Error(result.error);
+          const { flowId, userCode, verifyUrl } = result.data;
+          nextFlow = {
+            flowId,
+            userCode,
+            url: verifyUrl,
+            cancel: () => api.codexOauth.cancelDeviceFlow({ flowId }),
+          };
+        } else {
+          const result = await api.codexOauth.startDesktopFlow(input);
+          if (!result.success) throw new Error(result.error);
+          const { flowId, authorizeUrl } = result.data;
+          nextFlow = {
+            flowId,
+            url: authorizeUrl,
+            cancel: () => api.codexOauth.cancelDesktopFlow({ flowId }),
+          };
+        }
+        if (!isCurrent()) {
+          await nextFlow.cancel();
+          return;
+        }
+        flowRef.current = nextFlow;
+        setFlow(nextFlow);
+        const result =
+          nextFlow.userCode != null
+            ? await api.codexOauth.waitForDeviceFlow({ flowId: nextFlow.flowId })
+            : await api.codexOauth.waitForDesktopFlow({ flowId: nextFlow.flowId });
+        if (!isCurrent()) return;
+        if (!result.success) throw new Error(result.error);
+        setLabel("");
+        await refreshState();
+      } catch (err) {
+        if (isCurrent()) setError(getErrorMessage(err));
+      } finally {
+        if (isCurrent()) {
+          flowRef.current = null;
+          setFlow(null);
+          setLoginInProgress(false);
+          setBusy(false);
+        }
+      }
+    },
+    [api, showBrowser, refreshState]
+  );
 
   async function cancel() {
     attemptRef.current++;
@@ -201,12 +243,73 @@ export function CodexAccounts() {
     }
   }
 
+  // Commands must reach the same controls and handlers after Settings mounts.
+  // Consume each intent before starting work. Busy commands must not run later.
+  useEffect(() => {
+    const action = codexAccountAction;
+    if (!action || loading || consumedActionRef.current === action) return;
+    consumedActionRef.current = action;
+    setCodexAccountAction((current) => (current === action ? null : current));
+    if (disabled) {
+      setError(busy ? "An account operation is in progress. Try again." : "API unavailable.");
+      return;
+    }
+    setError(null);
+    switch (action.type) {
+      case "add":
+        newNameRef.current?.focus();
+        break;
+      case "default":
+        if (accounts.length === 0) {
+          setError("No Codex accounts are available. Add an account first.");
+          return;
+        }
+        defaultSelectRef.current?.focus();
+        break;
+      case "project": {
+        const select = projectSelectRefs.current.get(action.projectPath);
+        if (!select) {
+          setError("The project is no longer available. Select another project.");
+          return;
+        }
+        select.focus();
+        break;
+      }
+      default: {
+        const account = accounts.find((item) => item.id === action.accountId);
+        if (!account) {
+          setError("The account is no longer available. Select another account.");
+          return;
+        }
+        if (action.type === "rename") startRename(account);
+        else if (action.type === "reconnect") runAction(connect(false, { accountId: account.id }));
+        else disconnect(account.id);
+      }
+    }
+  }, [
+    codexAccountAction,
+    loading,
+    setCodexAccountAction,
+    disabled,
+    busy,
+    accounts,
+    startRename,
+    connect,
+    disconnect,
+  ]);
+
   const loginInput = label.trim() ? { label: label.trim() } : undefined;
   return (
     <section aria-label="ChatGPT (Codex) accounts" className="min-w-0 space-y-3">
       <div>
         <h4 className="text-foreground text-xs font-medium">ChatGPT (Codex) OAuth</h4>
-        <p className="text-muted text-xs">{accounts.length > 0 ? "Connected" : "Not connected"}</p>
+        <p className="text-muted text-xs">
+          {accounts.some((account) => account.reconnectRequired)
+            ? "Reconnect required"
+            : openai?.codexOauthSet
+              ? "Connected"
+              : "Not connected"}
+        </p>
       </div>
       <ul className="space-y-2">
         {accounts.map((account) => (
@@ -225,6 +328,7 @@ export function CodexAccounts() {
               >
                 <input
                   autoFocus
+                  ref={renameRef}
                   aria-label="Account name"
                   maxLength={CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH}
                   className={inputClassName}
@@ -252,6 +356,9 @@ export function CodexAccounts() {
                     <span className="text-muted font-normal"> · Global default</span>
                   )}
                 </p>
+                {account.reconnectRequired && (
+                  <p className="text-warning text-xs">Reconnect required</p>
+                )}
                 <div className="flex flex-wrap gap-2">
                   <Button
                     size="sm"
@@ -275,7 +382,7 @@ export function CodexAccounts() {
                     size="sm"
                     variant="ghost"
                     disabled={disabled}
-                    onClick={() => setRename(account)}
+                    onClick={() => startRename(account)}
                   >
                     Rename
                   </Button>
@@ -283,10 +390,7 @@ export function CodexAccounts() {
                     size="sm"
                     variant="ghost"
                     disabled={disabled}
-                    onClick={() =>
-                      api &&
-                      runAction(mutate(() => api.codexOauth.disconnect({ accountId: account.id })))
-                    }
+                    onClick={() => disconnect(account.id)}
                   >
                     Disconnect
                   </Button>
@@ -306,6 +410,7 @@ export function CodexAccounts() {
         <label className="text-muted block space-y-1 text-xs">
           <span>Add account</span>
           <input
+            ref={newNameRef}
             aria-label="New account name"
             maxLength={CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH}
             className={inputClassName}
@@ -379,9 +484,10 @@ export function CodexAccounts() {
       )}
       <AccountSelect
         label="Global default account"
+        selectRef={defaultSelectRef}
         value={defaultId}
         accounts={accounts}
-        disabled={disabled}
+        disabled={disabled || accounts.length === 0}
         onChange={(accountId) =>
           api && runAction(mutate(() => api.codexOauth.setDefaultAccount({ accountId })))
         }
@@ -395,6 +501,10 @@ export function CodexAccounts() {
         {Array.from(userProjects, ([projectPath, project]) => (
           <AccountSelect
             key={projectPath}
+            selectRef={(select) => {
+              if (select) projectSelectRefs.current.set(projectPath, select);
+              else projectSelectRefs.current.delete(projectPath);
+            }}
             label={project.displayName ?? projectPath}
             value={project.codexOauthAccountId ?? ""}
             accounts={accounts}

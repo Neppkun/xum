@@ -8,7 +8,12 @@ import * as os from "os";
 import * as path from "path";
 import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { resolveCodexOauthRouting } from "@/common/utils/providers/codexOauthRouting";
+import {
+  hasCodexOauthTokens,
+  resolveCodexOauthRouting,
+} from "@/common/utils/providers/codexOauthRouting";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { openaiProModeAvailable } from "@/common/utils/ai/proMode";
 import type { ProviderModelEntry } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { Config } from "@/node/config";
@@ -357,6 +362,88 @@ describe("ProviderService.getConfig", () => {
         "missing-account"
       );
     });
+  });
+
+  it.each(["default", "work"])(
+    "retains invalid %s credentials without reporting usable OAuth",
+    (accountId) => {
+      withProviderEnv({}, () =>
+        withTempConfig((config, service) => {
+          const store = new ProvidersConfigStore(config.rootDir);
+          const auth = {
+            type: "oauth",
+            access: "private-access",
+            refresh: "private-refresh",
+            expires: 12345,
+            invalidReason: "invalid_grant",
+          };
+          const accountConfig =
+            accountId === "default"
+              ? { codexOauth: auth }
+              : { codexOauthAccounts: { work: { label: "Work", auth } } };
+          store.saveProvidersConfig({
+            openai: { ...accountConfig, codexOauthDefaultAccountId: accountId },
+          });
+          const view = service.getConfig();
+          expect(view.openai.codexOauthSet).toBe(false);
+          expect(view.openai.isConfigured).toBe(false);
+          expect(view.openai.codexOauthAccounts).toEqual([
+            {
+              id: accountId,
+              label: accountId === "default" ? "Default" : "Work",
+              reconnectRequired: true,
+            },
+          ]);
+          expect(view.openai.codexOauthDefaultAccountId).toBe(accountId);
+          expect(JSON.stringify(view)).not.toContain("private-access");
+          expect(JSON.stringify(view)).not.toContain("private-refresh");
+          expect(JSON.stringify(view)).not.toContain("invalid_grant");
+          expect(hasCodexOauthTokens(view.openai)).toBe(false);
+          expect(hasCodexOauthTokens(accountConfig, accountId)).toBe(false);
+          expect(resolveCodexOauthRouting("openai:gpt-5.6-sol", view)).toBe("missing-account");
+          expect(getEffectiveContextLimit("openai:gpt-5.6-sol", false, view)).toBe(372_000);
+          expect(openaiProModeAvailable("openai:gpt-5.6-sol", { providersConfig: view })).toBe(
+            false
+          );
+
+          store.saveProvidersConfig({
+            openai: {
+              ...accountConfig,
+              codexOauthDefaultAccountId: accountId,
+              apiKey: "api-key",
+              codexOauthDefaultAuth: "apiKey",
+            },
+          });
+          const apiView = service.getConfig();
+          expect(apiView.openai.codexOauthSet).toBe(false);
+          expect(apiView.openai.isConfigured).toBe(true);
+          expect(resolveCodexOauthRouting("openai:gpt-5.6-sol", apiView)).toBe("other");
+        })
+      );
+    }
+  );
+
+  it("keeps other accounts available without substituting them for an invalid selection", () => {
+    withProviderEnv({}, () =>
+      withTempConfig((config, service) => {
+        const auth = { type: "oauth", access: "access", refresh: "refresh", expires: 12345 };
+        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+          openai: {
+            codexOauth: { ...auth, invalidReason: "invalid_grant" },
+            codexOauthAccounts: { work: { label: "Work", auth } },
+          },
+        });
+        const view = service.getConfig();
+        expect(view.openai.codexOauthSet).toBe(true);
+        expect(view.openai.isConfigured).toBe(true);
+        expect(hasCodexOauthTokens(view.openai)).toBe(false);
+        expect(hasCodexOauthTokens(view.openai, "work")).toBe(true);
+        expect(resolveCodexOauthRouting("openai:gpt-5.6-sol", view)).toBe("missing-account");
+        expect(
+          resolveCodexOauthRouting("openai:gpt-5.6-sol", view, { codexOauthAccountId: "work" })
+        ).toBe("oauth");
+      })
+    );
   });
 
   it("reports named accounts as connected without legacy credentials", () => {

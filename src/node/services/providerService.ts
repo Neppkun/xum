@@ -426,7 +426,7 @@ export class ProviderService {
       const filteredModels = filterProviderModelsByPolicy(normalizedModels, allowedModels);
 
       const codexOauthAccounts = provider === "openai" ? getCodexOauthAccounts(config) : [];
-      const codexOauthSet = codexOauthAccounts.length > 0;
+      const codexOauthSet = codexOauthAccounts.some(({ auth }) => auth.invalidReason === undefined);
       let isEnabled = !isProviderDisabledInConfig(config);
       if (provider === "mux-gateway" && mainConfig.muxGatewayEnabled === false) {
         isEnabled = false;
@@ -506,9 +506,11 @@ export class ProviderService {
 
       if (provider === "openai") {
         providerInfo.codexOauthSet = codexOauthSet;
-        providerInfo.codexOauthAccounts = codexOauthAccounts.map(({ id, label }) => ({
+        providerInfo.codexOauthAccounts = codexOauthAccounts.map(({ id, label, auth }) => ({
           id,
           label,
+          // Keep invalid slot identities without exposing credentials or provider error details.
+          ...(auth.invalidReason !== undefined ? { reconnectRequired: true } : {}),
         }));
         // Preserve an unset selection. A synthetic default would block API-key-only routing in the renderer.
         if (

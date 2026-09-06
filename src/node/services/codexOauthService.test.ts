@@ -202,6 +202,32 @@ describe("CodexOauthService", () => {
       }
     });
 
+    for (const credentialId of [undefined, "1c9c50b0-d777-4dd2-998c-09c156ba9754"]) {
+      it(
+        "refreshes a pinned " + (credentialId ? "identified" : "legacy") + " credential",
+        async () => {
+          const auth = expiredAuth({ credentialId });
+          deps.providersConfig = { openai: { codexOauth: auth } };
+          mockFetch(() =>
+            Promise.resolve(
+              mockRefreshResponse({
+                access_token: "rotated-access",
+                refresh_token: "rotated-refresh",
+                expires_in: 3600,
+              })
+            )
+          );
+          const result = await service.getValidAuth("default", { credentialId });
+          expect(result.success).toBe(true);
+          if (result.success) {
+            expect(result.data.access).toBe("rotated-access");
+            expect(result.data.refresh).toBe("rotated-refresh");
+            expect(result.data.credentialId).toBe(credentialId);
+          }
+        }
+      );
+    }
+
     it("returns stored auth when token is not expired", async () => {
       const auth = validAuth();
       deps.providersConfig = { openai: { codexOauth: auth } };
@@ -867,6 +893,12 @@ describe("CodexOauthService", () => {
   });
 
   describe("login destinations", () => {
+    function activeLoginSelectionCount(): number {
+      // Inspect retained credentials without exposing internal state through the service API.
+      // eslint-disable-next-line @typescript-eslint/dot-notation -- Bracket access permits private state checks in tests.
+      return service["loginSelections"].size;
+    }
+
     function deviceFetch(exchange?: (init?: RequestInit) => Promise<Response>): void {
       let nextCode = 0;
       mockFetch(async (input, init) => {
@@ -895,6 +927,76 @@ describe("CodexOauthService", () => {
           });
         }
         throw new Error("Unexpected fetch URL");
+      });
+    }
+
+    for (const kind of ["desktop", "device"] as const) {
+      for (const terminal of ["cancelled", "expired", "failed"] as const) {
+        it("releases " + terminal + " named " + kind + " login selections", async () => {
+          deviceFetch(() => Promise.resolve(mockRefreshResponse({ error: "access_denied" }, 400)));
+          const flow =
+            kind === "desktop"
+              ? await service.startDesktopFlow({ label: "Work" })
+              : await service.startDeviceFlow({ label: "Work" });
+          if (!flow.success) throw new Error(flow.error);
+          // Terminal flows must release selections because they retain credentials.
+          expect(activeLoginSelectionCount()).toBe(1);
+          const flowId = flow.data.flowId;
+          if (kind === "desktop") {
+            // eslint-disable-next-line @typescript-eslint/dot-notation -- Await the private cleanup signal without timing assumptions.
+            const completion = service["desktopFlows"].get(flowId)!.resultDeferred.promise;
+            if (terminal === "cancelled") await service.cancelDesktopFlow(flowId);
+            if (terminal === "failed") {
+              const response = await originalFetch(
+                "http://localhost:1455/auth/callback?error=access_denied&state=" + flowId
+              );
+              await response.text();
+            }
+            const result = await service.waitForDesktopFlow(flowId, { timeoutMs: 0 });
+            expect(result.success).toBe(false);
+            // The flow manager releases resources in a detached fiber after a waiter timeout.
+            await completion;
+          } else {
+            if (terminal === "cancelled") await service.cancelDeviceFlow(flowId);
+            const clock =
+              terminal === "expired"
+                ? spyOn(Date, "now").mockReturnValue(Date.now() + 120_000)
+                : undefined;
+            try {
+              const result = await service.waitForDeviceFlow(flowId);
+              expect(result.success).toBe(false);
+              if (terminal === "expired" && !result.success)
+                expect(result.error).toContain("expired");
+            } finally {
+              clock?.mockRestore();
+            }
+          }
+          expect(activeLoginSelectionCount()).toBe(0);
+          expect(getCodexOauthAccounts(deps.providersConfig.openai)).toEqual([]);
+        });
+      }
+
+      it("keeps the newer selection when a superseded " + kind + " flow terminates", async () => {
+        deps.providersConfig = {
+          openai: { codexOauthAccounts: { work: { label: "Work", auth: validAuth() } } },
+        };
+        deviceFetch();
+        const first =
+          kind === "desktop"
+            ? await service.startDesktopFlow({ accountId: "work" })
+            : await service.startDeviceFlow({ accountId: "work" });
+        if (!first.success) throw new Error(first.error);
+        const second = await service.startDeviceFlow({ accountId: "work" });
+        if (!second.success) throw new Error(second.error);
+        if (kind === "desktop") await service.cancelDesktopFlow(first.data.flowId);
+        else await service.cancelDeviceFlow(first.data.flowId);
+        expect(activeLoginSelectionCount()).toBe(1);
+        expect(await service.waitForDeviceFlow(second.data.flowId)).toEqual(Ok(undefined));
+        expect(activeLoginSelectionCount()).toBe(0);
+        const auth = await service.getValidAuth("work");
+        expect(auth.success).toBe(true);
+        if (auth.success)
+          expect(auth.data.access).toBe(kind === "desktop" ? "access-device-1" : "access-device-2");
       });
     }
 

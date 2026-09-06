@@ -117,6 +117,23 @@ describe("Codex OAuth account routing", () => {
     }
   });
 
+  it("keeps an invalid implicit raw slot on the reconnect path", () => {
+    const providersConfig = {
+      openai: {
+        apiKeySet: true,
+        isConfigured: true,
+        isEnabled: true,
+        codexOauth: { ...auth, invalidReason: "invalid_grant" },
+      },
+    };
+    const model = "openai:gpt-5.6-sol";
+    expect(hasCodexOauthTokens(providersConfig.openai)).toBe(false);
+    expect(resolveCodexOauthRouting(model, providersConfig)).toBe("missing-account");
+    expect(getEffectiveContextLimit(model, false, providersConfig)).toBe(372_000);
+    const restoredConfig = { openai: { ...providersConfig.openai, codexOauth: auth } };
+    expect(resolveCodexOauthRouting(model, restoredConfig)).toBe("oauth");
+  });
+
   it("uses metadata account IDs instead of the aggregate connection flag", () => {
     const config = {
       codexOauthSet: true,

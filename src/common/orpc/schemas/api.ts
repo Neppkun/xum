@@ -294,10 +294,14 @@ export const ProviderConfigInfoSchema = z.object({
   /** Anthropic-specific fields */
   cacheTtl: CacheTtlSchema.optional(),
   disableBetaFeatures: z.boolean().optional(),
-  /** OpenAI-only: whether Codex OAuth tokens are present in providers.jsonc */
+  /** OpenAI-only: whether usable Codex OAuth credentials exist. */
   codexOauthSet: z.boolean().optional(),
-  /** Connected account labels. Credentials stay in the backend. */
-  codexOauthAccounts: z.array(z.object({ id: z.string(), label: z.string() })).optional(),
+  /** Account identities remain available for reconnect. Credentials stay in the backend. */
+  codexOauthAccounts: z
+    .array(
+      z.object({ id: z.string(), label: z.string(), reconnectRequired: z.boolean().optional() })
+    )
+    .optional(),
   codexOauthDefaultAccountId: z.string().optional(),
   /**
    * OpenAI-only: default auth precedence to use for Codex-OAuth-allowed models when BOTH
