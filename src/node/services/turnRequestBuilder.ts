@@ -520,7 +520,12 @@ interface TurnRequestBuilderDependencies {
   createModel: (
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string; providersConfig?: ProvidersConfig }
+    opts?: {
+      agentInitiated?: boolean;
+      workspaceId?: string;
+      providersConfig?: ProvidersConfig;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
+    }
   ) => Promise<Result<LanguageModel, SendMessageError>>;
   isStreaming: (workspaceId: string) => boolean;
   trackPendingDevToolsRunMetadata: (
@@ -1903,7 +1908,7 @@ export class TurnRequestBuilder {
     const assistantMessageId = createAssistantMessageId();
     const allowLegacyInvalidWorkflowAgentOutputSchema =
       await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
-    // Share creation-time provider/pricing snapshots for both headless tools.
+    // Headless tools retain accepted turn routing, but use their own model options.
     const createToolModel = async (ms: string) => {
       const toolModelString = ms.trim();
       assert(
@@ -1915,11 +1920,13 @@ export class TurnRequestBuilder {
       // a catalog refresh land between them, running the request
       // on one wire while recording usage under another type.
       const toolProvidersConfig =
-        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
-      // View snapshot captured at creation time for option
-      // building (buildProviderOptions takes the oRPC view, not
-      // the raw config shape).
-      const toolOptionsProvidersConfig = this.dependencies.providerService.getConfig();
+        opts.modelRoutingSnapshot?.providersConfig ??
+        this.dependencies.providersConfigStore.loadProvidersConfig() ??
+        {};
+      // Option building uses the public provider view from the same snapshot.
+      const toolOptionsProvidersConfig =
+        opts.modelRoutingSnapshot?.metadata ??
+        this.dependencies.providerService.getConfig(toolProvidersConfig);
       // Let the factory pin provider-level defaults (especially the OpenAI wire
       // format) without inheriting any options from the parent chat.
       const toolMuxProviderOptions: MuxProviderOptions = {};
@@ -1929,6 +1936,7 @@ export class TurnRequestBuilder {
         {
           workspaceId,
           providersConfig: toolProvidersConfig,
+          modelRoutingSnapshot: opts.modelRoutingSnapshot,
           agentInitiated: true,
         }
       );

@@ -37,6 +37,7 @@ import { CODEX_ENDPOINT } from "@/common/constants/codexOAuth";
 
 import { jsonSchema, tool, type LanguageModel, type Tool } from "ai";
 import { createMuxMessage } from "@/common/types/message";
+import { Ok } from "@/common/types/result";
 import type { ModelMessage } from "@/common/types/message";
 import type { XumToolScope } from "@/common/types/toolScope";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -3040,6 +3041,154 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     });
     expect(typeof sessionUsageDeltaRecord.timestamp).toBe("number");
   });
+
+  it.each([
+    { toolName: "advisor", change: "project-account" },
+    { toolName: "advisor", change: "default-account" },
+    { toolName: "advisor", change: "preference" },
+    { toolName: "intuition", change: "project-account" },
+    { toolName: "intuition", change: "default-account" },
+    { toolName: "intuition", change: "preference" },
+  ] as const)(
+    "$toolName keeps accepted routing after a $change update",
+    async ({ toolName, change }) => {
+      using xumHome = new DisposableTempDir("nested-tool-routing-snapshot");
+      const projectPath = path.join(xumHome.path, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      const workspaceId = "nested-tool-routing";
+      const providersStore = new ProvidersConfigStore(xumHome.path);
+      const experimentsService = new ExperimentsService({
+        telemetryService: new TelemetryService(xumHome.path),
+        xumHome: xumHome.path,
+      });
+      spyOn(experimentsService, "isExperimentEnabled").mockImplementation(
+        (id) => id === EXPERIMENT_IDS.MEMORY_INTUITION
+      );
+      const harness = createHarness(
+        xumHome.path,
+        createLocalWorkspaceMetadata(workspaceId, projectPath),
+        {
+          providersConfigStore: providersStore,
+          experimentsService,
+          useRequestedModelString: true,
+          codexOauthAccountId: "work",
+        }
+      );
+      harness.service.turnRequestBuilderBindings.memoryService = new MemoryService(
+        harness.config,
+        new MemoryMetaService(xumHome.path)
+      );
+      await enableAdvisorForHarness(harness, "openai:gpt-5.5");
+      await harness.config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [],
+          ...(change !== "default-account" ? { codexOauthAccountId: "work" } : {}),
+        });
+        return cfg;
+      });
+      const requests: RecordedFetchRequest[] = [];
+      const auth: Record<string, typeof TEST_CODEX_OAUTH> = {
+        work: { ...TEST_CODEX_OAUTH, access: "work-access", accountId: "work-provider-id" },
+        personal: {
+          ...TEST_CODEX_OAUTH,
+          access: "personal-access",
+          accountId: "personal-provider-id",
+        },
+      };
+      const providersConfig = {
+        openai: {
+          apiKey: "test-api-key",
+          wireFormat: "responses" as const,
+          codexOauthDefaultAccountId: "work",
+          codexOauthAccounts: {
+            work: { label: "Work", auth: auth.work },
+            personal: { label: "Personal", auth: auth.personal },
+          },
+          fetch: createRecordingOpenAIFetch(requests, "gpt-5.5"),
+        },
+      };
+      const read = spyOn(providersStore, "loadProvidersConfig").mockReturnValue(providersConfig);
+      const getValidAuth = mock((accountId: string) => Promise.resolve(Ok(auth[accountId])));
+      harness.service.turnRequestBuilderBindings.codexOauthService = {
+        getValidAuth,
+      } as unknown as CodexOauthService;
+      const startTurn = () =>
+        harness.service.streamMessage({
+          messages: [createMuxMessage("user", "user", "Continue")],
+          workspaceId,
+          modelString: "openai:gpt-5.5",
+          thinkingLevel: "off",
+          // Nested tools use their own options, not the parent chat's settings.
+          muxProviderOptions: {
+            openai: { wireFormat: "chatCompletions", serviceTier: "priority" },
+          },
+          experiments: { advisorTool: true, memory: true },
+          modelRoutingSnapshot: harness.service.captureModelRoutingSnapshot(workspaceId),
+        });
+      expect((await startTurn()).success).toBe(true);
+      const snapshot = harness.startStreamCalls[0]?.providersConfigSnapshot;
+      const getRuntime = () => {
+        const toolConfig = harness.getToolsForModelSpy.mock.calls.at(-1)?.[1];
+        const runtime =
+          toolName === "advisor" ? toolConfig?.advisorRuntime : toolConfig?.intuitionRuntime;
+        if (!runtime) throw new Error("Expected " + toolName + " runtime");
+        return runtime;
+      };
+      const runtime = getRuntime();
+      if (change === "project-account") {
+        await harness.config.editConfig((cfg) => {
+          cfg.projects.get(projectPath)!.codexOauthAccountId = "personal";
+          return cfg;
+        });
+      } else {
+        read.mockReturnValue({
+          openai: {
+            ...providersConfig.openai,
+            ...(change === "default-account"
+              ? { codexOauthDefaultAccountId: "personal" }
+              : { codexOauthDefaultAuth: "apiKey" }),
+          },
+        });
+      }
+      const createModel = spyOn(harness.service, "createModel");
+      const created = await runtime.createModel("openai:gpt-5.5");
+      if (typeof created.model === "string") throw new Error("Expected an SDK model");
+      await created.model.doGenerate({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+      });
+      expect(getFetchUrl(requests[0].input)).toBe(CODEX_ENDPOINT);
+      expect(new Headers(requests[0].init?.headers).get("authorization")).toBe(
+        "Bearer work-access"
+      );
+      expect(new Headers(requests[0].init?.headers).get("chatgpt-account-id")).toBe(
+        "work-provider-id"
+      );
+      expect(created.optionsProvidersConfig?.openai).toEqual(snapshot?.openai);
+      expect(created.optionsMuxProviderOptions?.openai?.wireFormat).toBe("responses");
+      expect(created.optionsMuxProviderOptions?.openai?.serviceTier).toBeUndefined();
+      expect(
+        createModel.mock.calls[0]?.[2]?.modelRoutingSnapshot?.codexOauthSelection.accountId
+      ).toBe("work");
+
+      expect((await startTurn()).success).toBe(true);
+      const next = await getRuntime().createModel("openai:gpt-5.5");
+      if (typeof next.model === "string") throw new Error("Expected an SDK model");
+      await next.model.doGenerate({
+        prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+      });
+      expect(requests).toHaveLength(2);
+      expect(new Headers(requests[1].init?.headers).get("authorization")).toBe(
+        change === "preference" ? "Bearer test-api-key" : "Bearer personal-access"
+      );
+      expect(getFetchUrl(requests[1].input) === CODEX_ENDPOINT).toBe(change !== "preference");
+      expect(next.optionsProvidersConfig?.openai?.codexOauthDefaultAuth).toBe(
+        change === "preference" ? "apiKey" : undefined
+      );
+      expect(
+        createModel.mock.calls[1]?.[2]?.modelRoutingSnapshot?.codexOauthSelection.accountId
+      ).toBe(change === "preference" ? "work" : "personal");
+    }
+  );
 
   it.each(["advisor", "intuition"] as const)(
     "records API-equivalent costs for %s tool usage through Codex OAuth",
