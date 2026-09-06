@@ -333,6 +333,8 @@ export async function readProviderHistoryFromLatestBoundary(
 
 export interface BoundedHistoryRow {
   message: MuxMessage;
+  /** Exact physical row, stable under prefix-preserving appends, not rewrites/rotation. */
+  itemId: string;
   windowId: string;
   startsWindow: boolean;
 }
@@ -497,7 +499,8 @@ export async function scanHistoryFilesBounded(
         start: number,
         finish: number,
         oversized: boolean,
-        possibleReset: boolean
+        possibleReset: boolean,
+        raw: Buffer | null
       ) => boolean
     ) => {
       let cursor = position.byteOffset;
@@ -520,15 +523,14 @@ export async function scanHistoryFilesBounded(
         }
         result.rowsScanned++;
         let message: MuxMessage | null = null;
+        let raw: Buffer | null = null;
         if (skipping) result.oversizedLines++;
         else {
-          message = classifyHistoryScanRow(
-            Buffer.concat(reverse ? parts.reverse() : parts).toString("utf8"),
-            probe
-          );
+          raw = Buffer.concat(reverse ? parts.reverse() : parts);
+          message = classifyHistoryScanRow(raw.toString("utf8"), probe);
           if (!message) result.malformedLines++;
         }
-        if (!visit(message, start, finish, skipping, probe.possibleReset)) return false;
+        if (!visit(message, start, finish, skipping, probe.possibleReset, raw)) return false;
         parts = [];
         size = 0;
         skipping = false;
@@ -667,7 +669,7 @@ export async function scanHistoryFilesBounded(
         reverse,
         end,
         0,
-        (message, _start, finish, _oversized, possibleReset) => {
+        (message, start, finish, _oversized, possibleReset, raw) => {
           if (reverse) {
             // Keep the legacy cursor field, but sequence coverage is not replay proof.
             const sequence = message?.metadata?.historySequence;
@@ -682,6 +684,7 @@ export async function scanHistoryFilesBounded(
             return true;
           }
           if (!message) return true;
+          assert(raw, "readable browse rows retain their bounded raw bytes");
           const sequence = message.metadata?.historySequence;
           const anchorSequence =
             Number.isSafeInteger(sequence) && sequence! >= 0 ? sequence! : null;
@@ -696,6 +699,7 @@ export async function scanHistoryFilesBounded(
             windowId !== null &&
             !options.visit({
               message,
+              itemId: `r:${artifact}:${start}:${createHash("sha256").update(raw).digest("hex")}`,
               windowId,
               startsWindow: state.windowPending || isDurableContextBoundaryMarker(message),
             })

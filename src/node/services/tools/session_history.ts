@@ -131,9 +131,15 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
           : SESSION_HISTORY_RESULT_ENVELOPE_BYTES);
       const byteLength = () => Buffer.byteLength(JSON.stringify(result));
       try {
+        // Match in the original string: lowercasing can expand Unicode characters
+        // and shift snippet offsets. Escape the query so matching stays literal.
+        const search =
+          args.action === "search"
+            ? new RegExp(args.query!.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "iu")
+            : null;
         const scan = await history.scanHistoryBounded(workspaceId, {
           cursor: args.cursor != null ? decodeHistoryCursor(args.cursor, binding) : undefined,
-          visit: ({ message, windowId, startsWindow }) => {
+          visit: ({ message, itemId, windowId, startsWindow }) => {
             if (args.action === "list_windows") {
               if (!startsWindow) return true;
               if (args.window_id != null && args.window_id !== windowId) return true;
@@ -148,18 +154,24 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             }
             if (foundItem) return false;
             if (args.window_id != null && args.window_id !== windowId) return true;
-            const itemId = getHistoryItemId(message);
+            const legacyItemId = getHistoryItemId(message);
             // Corrupt legacy IDs cannot be supplied back through the tool input
             // or encoded safely. Consume them instead of retrying the same row.
-            if (!isHistoryIdentifierRepresentable(itemId)) {
+            if (!isHistoryIdentifierRepresentable(legacyItemId)) {
               result.truncated = true;
               return true;
             }
-            if (args.action === "read_item" && args.item_id !== itemId) return true;
+            // Keep sequence and m:id inputs working, but return the exact row ID
+            // so character paging never resolves a duplicate identity to another row.
+            if (
+              args.action === "read_item" &&
+              args.item_id !== itemId &&
+              args.item_id !== legacyItemId
+            )
+              return true;
             const text = historicalText(message);
             if (!text) return true;
-            const match =
-              args.action === "search" ? text.toLowerCase().indexOf(args.query!.toLowerCase()) : 0;
+            const match = search ? (search.exec(text)?.index ?? -1) : 0;
             if (match < 0) return true;
             if (items.length >= limit) return false;
             const start =

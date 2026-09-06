@@ -2435,7 +2435,8 @@ export const TOOL_DEFINITIONS = {
       "Pass a returned itemId as item_id and windowId as window_id; read_item accepts offset_chars (zero-based) and limit_chars. " +
       "Bounded scans may return empty progress pages: while exhausted is false, repeat the same action/query with nextCursor as cursor. " +
       "exhausted describes scan completion; continue character paging with nextCharOffset as offset_chars. skipped_oversized_rows counts oversized rows encountered in this scan page. " +
-      "On stale_cursor restart without a cursor. Window IDs are w:<sequence>, w:0 (root), or w:m:<legacy message id>; item IDs are sequences or m:<legacy message id>.",
+      "On stale_cursor restart without a cursor. Window IDs are w:<sequence>, w:0 (root), or w:m:<legacy message id>. " +
+      "Item IDs are opaque exact-row references; sequence or m:<legacy message id> inputs remain legacy aliases. Search again if a rewrite or rotation invalidates a row reference.",
     schema: z
       .object({
         action: z.enum(["list_windows", "search", "read_item"]),

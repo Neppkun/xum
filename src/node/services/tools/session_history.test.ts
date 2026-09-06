@@ -762,11 +762,17 @@ describe("session_history real disk recovery", () => {
         .map((message) => JSON.stringify(message))
         .join("\n") + "\n"
     );
-    expect(
-      (await pages({ action: "search", query: "match", limit: 1 }))
-        .flatMap((page) => page.items ?? [])
-        .map((item) => item.itemId)
-    ).toEqual(["m:negative-sequence", "m:after-negative"]);
+    const found = (await pages({ action: "search", query: "match", limit: 1 })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(found.map((item) => item.text)).toEqual(["match negative", "match after"]);
+    expect(found[0].itemId).not.toBe(found[1].itemId);
+    for (const [id, text] of [
+      ["negative-sequence", "match negative"],
+      ["after-negative", "match after"],
+    ]) {
+      expect((await call({ action: "read_item", item_id: `m:${id}` })).items?.[0]?.text).toBe(text);
+    }
   });
 
   test("oversized persisted IDs remain addressable through safe sequences", async () => {
@@ -792,7 +798,7 @@ describe("session_history real disk recovery", () => {
     ).toEqual(["w:0", "w:42"]);
     expect(
       (await pages({ action: "read_item", item_id: "43" })).flatMap((page) => page.items ?? [])
-    ).toEqual([{ itemId: "43", windowId: "w:42", role: "assistant", text: "sequenced facts" }]);
+    ).toMatchObject([{ windowId: "w:42", role: "assistant", text: "sequenced facts" }]);
   });
 
   test("scanner fails closed when a reset races a page or a truncate is unresolved", async () => {
@@ -862,9 +868,11 @@ describe("session_history real disk recovery", () => {
     );
     const result = await call({ action: "search", query: "recoverable" });
     expect(result.items?.[0]).toMatchObject({
-      itemId: "m:after-legacy-reset",
       windowId: "w:m:legacy-reset",
     });
+    expect(
+      (await call({ action: "read_item", item_id: "m:after-legacy-reset" })).items?.[0]?.text
+    ).toBe("recoverable");
     expect(result.malformedLines).toBeGreaterThan(0);
     expect((await call({ action: "read_item", item_id: "0" })).error).toBe("item_not_found");
   });
@@ -1221,6 +1229,95 @@ describe("session_history real disk recovery", () => {
     });
     expect(read.items?.[0]?.text).toBe("[x].*");
     expect(read.items?.[0]?.nextCharOffset).toBe(7);
+  });
+
+  test.each([false, true])(
+    "same-window duplicate sequences expose exact row IDs (same message ID: %s)",
+    async (sameId) => {
+      const first = createMuxMessage("duplicate-first", "assistant", "needle first payload", {
+        historySequence: 7,
+      });
+      const text = "needle second payload " + "distinct second-row content ".repeat(400);
+      const second = createMuxMessage(sameId ? first.id : "duplicate-second", "assistant", text, {
+        historySequence: 7,
+      });
+      await appendTrackedHistory(
+        chatPath,
+        [first, second].map((row) => JSON.stringify(row)).join("\n") + "\n"
+      );
+      const found = (await pages({ action: "search", query: "needle", limit: 1 })).flatMap(
+        (page) => page.items ?? []
+      );
+      expect(found).toHaveLength(2);
+      expect(found[0].windowId).toBe(found[1].windowId);
+      expect(found[0].itemId).not.toBe(found[1].itemId);
+      const chunks: string[] = [];
+      let offset: number | undefined = 0;
+      while (offset !== undefined) {
+        const result = await call({
+          action: "read_item",
+          item_id: found[1].itemId,
+          window_id: found[1].windowId,
+          offset_chars: offset,
+          limit_chars: 4000,
+        });
+        expect(result.success).toBe(true);
+        expect(result.items).toHaveLength(1);
+        expect(result.items![0].itemId).toBe(found[1].itemId);
+        chunks.push(result.items![0].text);
+        const previousOffset = offset;
+        offset = result.items![0].nextCharOffset;
+        if (offset !== undefined) {
+          expect(offset).toBeGreaterThan(previousOffset);
+          expect(chunks.length).toBeLessThan(10);
+          // An ordinary append must not move the physical identity between read pages.
+          await append(`after-page-${chunks.length}`, "later unrelated row");
+        }
+      }
+      expect(chunks.join("")).toBe(text);
+      const legacy = await call({ action: "read_item", item_id: "7" });
+      expect(legacy.items?.[0]?.text).toBe("needle first payload");
+    }
+  );
+
+  test("an exact row ID does not resolve to a rewritten payload or cross a later reset", async () => {
+    const original = createMuxMessage("original", "assistant", "needle before rewrite", {
+      historySequence: 8,
+    });
+    await appendTrackedHistory(chatPath, JSON.stringify(original) + "\n");
+    const found = (await pages({ action: "search", query: "needle" })).flatMap(
+      (page) => page.items ?? []
+    )[0];
+    const raw = await fs.readFile(chatPath, "utf8");
+    await fs.writeFile(chatPath, raw.replace("needle before rewrite", "needle after rewriting"));
+    expect((await pages({ action: "read_item", item_id: found.itemId })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+    const current = (await pages({ action: "search", query: "needle" })).flatMap(
+      (page) => page.items ?? []
+    )[0];
+    await appendTrackedHistory(
+      chatPath,
+      JSON.stringify(
+        createMuxMessage("manual-reset", "assistant", "", { contextBoundaryKind: "reset" })
+      ) + "\n"
+    );
+    expect((await pages({ action: "read_item", item_id: current.itemId })).at(-1)?.error).toBe(
+      "item_not_found"
+    );
+  });
+
+  test("literal case-insensitive snippets use original offsets after expanding Unicode lowercases", async () => {
+    const query = "[NeEdLe].*\\(x)?";
+    const text = "İ".repeat(300) + query + " trailing context";
+    await append("unicode-prefix", text);
+    await append("regex-decoy", "İ".repeat(300) + "needleZZZx");
+    const found = (await pages({ action: "search", query: query.toLowerCase() })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0].text).toContain(query);
+    expect(found[0].text).toBe(text.slice(180));
   });
 
   test("default read returns 8000 fitting ASCII characters and snake-case inputs resume the remainder", async () => {
