@@ -4157,10 +4157,12 @@ export class AgentSession {
       // before clearing context state or publishing a reset. Reuse these rows below:
       // skill directives and MCP prompt expansion must not execute a second time.
       if (requestPrelude.length > 0) {
-        const freshBudget = await this.checkFreshContextBudget(userMessage, optionsForStream, [
-          ...contextBudgetPrefix,
-          ...requestPrelude,
-        ]);
+        const freshBudget = await this.checkFreshContextBudget(
+          userMessage,
+          optionsForStream.model,
+          optionsForStream,
+          [...contextBudgetPrefix, ...requestPrelude]
+        );
         if (await cancelBeforeAcceptance()) return Ok(undefined);
         if (isAdmissionStale() || this.turnAdmissionBlocks > 0 || this.shuttingDown) {
           return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
@@ -5006,22 +5008,6 @@ export class AgentSession {
           },
         };
       });
-      if (
-        !this.isCurrentTurnOperation(operation) ||
-        this.activeStreamContext !== context ||
-        this.contextBudgetGeneration !== generation
-      )
-        return Ok(undefined);
-      await this.applyContextResetSideEffects();
-      if (
-        !this.isCurrentTurnOperation(operation) ||
-        this.activeStreamContext !== context ||
-        this.contextBudgetGeneration !== generation ||
-        this.turnAdmissionBlocks > 0 ||
-        this.disposed ||
-        this.shuttingDown
-      )
-        return Ok(undefined);
       // Retry the accepted skill instructions, not their dynamic commands. They
       // may have been deduped against a snapshot elsewhere in the sealed window.
       const skillSnapshots = extractAgentSkillRefs(user.metadata?.muxMetadata).flatMap((ref) => {
@@ -5040,12 +5026,43 @@ export class AgentSession {
       continuation.metadata!.requestPreludeMessageIds = [...skillSnapshots, ...requestPrelude].map(
         (row) => row.id
       );
-      const rows = [
+      const retryPrelude = [
         ...createRolloverPrefix(rollover),
         ...skillSnapshots,
         ...requestPrelude,
-        continuation,
       ];
+      // A smaller fallback can reject snapshots that fit the primary. Admit the
+      // complete copied payload before clearing state or sealing the old window;
+      // neither dynamic skill commands nor other accepted inputs may be rerun.
+      const freshBudget = await this.checkFreshContextBudget(
+        continuation,
+        model,
+        context.options,
+        retryPrelude,
+        context.providersConfig
+      );
+      if (
+        !this.isCurrentTurnOperation(operation) ||
+        this.activeStreamContext !== context ||
+        this.contextBudgetGeneration !== generation ||
+        this.turnAdmissionBlocks > 0 ||
+        this.deferQueuedFlushUntilAfterEdit ||
+        this.disposed ||
+        this.shuttingDown
+      )
+        return Ok(undefined);
+      if (!freshBudget.success) return freshBudget;
+      await this.applyContextResetSideEffects();
+      if (
+        !this.isCurrentTurnOperation(operation) ||
+        this.activeStreamContext !== context ||
+        this.contextBudgetGeneration !== generation ||
+        this.turnAdmissionBlocks > 0 ||
+        this.disposed ||
+        this.shuttingDown
+      )
+        return Ok(undefined);
+      const rows = [...retryPrelude, continuation];
       const appended = await this.historyService.appendManyToHistory(this.workspaceId, rows);
       if (!this.isCurrentTurnOperation(operation)) return Ok(undefined);
       if (!appended.success) return Err(createUnknownSendMessageError(appended.error));
@@ -5062,15 +5079,16 @@ export class AgentSession {
 
   private async checkFreshContextBudget(
     userMessage: MuxMessage,
-    options: SendMessageOptions,
-    prelude: readonly MuxMessage[]
+    model: string,
+    options: SendMessageOptions | undefined,
+    prelude: readonly MuxMessage[],
+    providersConfig: ProvidersConfigMap | null = this.getProvidersConfigSafe()
   ): Promise<Result<void, SendMessageError>> {
-    const providersConfig = this.getProvidersConfigSafe();
     const maxTokens = getEffectiveContextLimit(
-      options.model,
-      this.is1MContextEnabledForModel(options.model, options, providersConfig),
+      model,
+      this.is1MContextEnabledForModel(model, options, providersConfig),
       providersConfig,
-      { openaiWireFormat: options.providerOptions?.openai?.wireFormat }
+      { openaiWireFormat: options?.providerOptions?.openai?.wireFormat }
     );
     if (maxTokens == null || maxTokens <= 0) return Ok(undefined);
     // Historical usage includes old user/history content, not just system/schema
@@ -5085,14 +5103,14 @@ export class AgentSession {
         modelContextLimit: maxTokens,
       },
       {
-        model: options.model,
-        metadataModel: resolveModelForMetadata(options.model, providersConfig),
+        model,
+        metadataModel: resolveModelForMetadata(model, providersConfig),
       }
     );
     return estimate >= getContextBudgetHardCeiling(maxTokens)
       ? Err({
           type: "context_budget_blocked",
-          message: `This message plus its snapshots and system context does not fit in a fresh context window for ${options.model}; shorten it, remove attachments, or use a larger model.`,
+          message: `This message plus its snapshots and system context does not fit in a fresh context window for ${model}; shorten it, remove attachments, or use a larger model.`,
         })
       : Ok(undefined);
   }
@@ -5213,6 +5231,7 @@ export class AgentSession {
     }
     const freshBudget = await this.checkFreshContextBudget(
       userMessage,
+      options.model,
       options,
       rollover ? createRolloverPrefix(rollover) : []
     );

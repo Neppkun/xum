@@ -1270,6 +1270,183 @@ describe("AgentSession token-budget lifecycle", () => {
     estimate: 127_000,
     hardCeiling: 119_808,
   };
+  test.each(
+    (["file", "skill", "deduped-skill", "family"] as const).flatMap((kind) =>
+      [false, true].flatMap((asyncFailure) =>
+        [false, true].map((fits) => ({ kind, asyncFailure, fits }))
+      )
+    )
+  )(
+    "emergency admission uses failing model for $kind (async=$asyncFailure, fits=$fits)",
+    async ({ kind, asyncFailure, fits }) => {
+      const fallbackModel = "openai:gpt-4o-mini";
+      const fallbackExceeded = {
+        type: "context_budget_exceeded" as const,
+        model: fallbackModel,
+        estimate: 11000,
+        hardCeiling: 7500,
+      };
+      const failure = (attempt: number) =>
+        !asyncFailure && attempt === 1 ? fallbackExceeded : undefined;
+      let h = await setup(kind === "deduped-skill" ? undefined : { failure });
+      const content = ("漢".repeat(100) + "\n").repeat(fits ? 1 : 40);
+      let message = "Use the accepted input";
+      let sendOptions = options;
+      const usesSkill = kind === "skill" || kind === "deduped-skill";
+      if (kind === "file") {
+        await fs.writeFile(path.join(h.config.rootDir, "fallback.txt"), content);
+        message = "Read @fallback.txt";
+      } else if (usesSkill) {
+        const skillDir = path.join(h.config.rootDir, ".xum", "skills", "fallback-skill");
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: fallback-skill\ndescription: Fallback admission\n---\n" +
+            "!`printf x >> fallback-materializations.marker`\n" +
+            content
+        );
+        sendOptions = {
+          ...options,
+          muxMetadata: {
+            type: "agent-skill",
+            rawCommand: "/fallback-skill",
+            skillName: "fallback-skill",
+            scope: "project",
+          },
+        };
+        spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
+          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+        );
+        if (kind === "deduped-skill") {
+          expect(
+            (await h.session.sendMessage("Earlier skill invocation", sendOptions)).success
+          ).toBe(true);
+          h.session.dispose();
+          h = await setup({ previous: h, failure });
+          spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
+            (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+          );
+        }
+      }
+      await seedHistory(h, 20000);
+      const original = await allRows(h);
+      spyOn(contextLimits, "getEffectiveContextLimit").mockImplementation((requestedModel) =>
+        requestedModel === fallbackModel ? 10000 : 128000
+      );
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
+      const payload = createMuxMessage("fallback-family", "assistant", content, {
+        synthetic: true,
+        muxMetadata: { type: "family-message" },
+      });
+      const sent = await h.session.sendMessage(
+        message,
+        sendOptions,
+        kind === "family"
+          ? { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+          : undefined
+      );
+      if (asyncFailure) {
+        expect(sent.success).toBe(true);
+        expect(cleanup).not.toHaveBeenCalled();
+        const streamError = {
+          workspaceId,
+          messageId: "assistant-1",
+          error: "Fallback request is too large",
+          errorType: "context_exceeded" as const,
+          contextBudgetExceeded: fallbackExceeded,
+        };
+        h.aiEmitter.emit("error", streamError);
+        h.completions[0].settle({ status: "failed", streamError });
+        expect(await h.session.waitForPendingStreamErrorRecoveryDecision("assistant-1")).toBe(
+          fits ? "retry-started" : "terminal"
+        );
+        if (!fits) await h.session.waitForIdle();
+      } else {
+        expect(sent.success).toBe(fits);
+        if (!fits) expect(sent).toMatchObject({ error: { type: "context_budget_blocked" } });
+      }
+      expect(cleanup).toHaveBeenCalledTimes(fits ? 1 : 0);
+      expect(h.requests).toHaveLength(fits ? 2 : 1);
+      const rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(fits ? 1 : 0);
+      expect(rows.filter((row) => original.some((old) => old.id === row.id))).toEqual(original);
+      if (fits) {
+        expect(h.requests[1].modelString).toBe(fallbackModel);
+        const active = sliceMessagesForProviderFromLatestContextBoundary(h.requests[1].messages);
+        expect(active.some((row) => text(row).includes(content.trim()))).toBe(true);
+        expect(active.some((row) => row.id === "old-answer")).toBe(false);
+      } else {
+        const rejected = rows.filter((row) => row.metadata?.contextBudgetRejected);
+        expect(rejected).toHaveLength(kind === "deduped-skill" ? 1 : 2);
+        expect(rejected.every((row) => row.role === "assistant" && row.parts.length === 0)).toBe(
+          true
+        );
+        expect(
+          rejected
+            .map(restoreContextBudgetRejectedMessageForDisplay)
+            .some((row) => text(row) === message)
+        ).toBe(true);
+        if (kind !== "deduped-skill")
+          expect(
+            rejected
+              .map(restoreContextBudgetRejectedMessageForDisplay)
+              .some((row) => text(row).includes(content.trim()))
+          ).toBe(true);
+      }
+      if (usesSkill)
+        expect(
+          await fs.readFile(path.join(h.config.rootDir, "fallback-materializations.marker"), "utf8")
+        ).toBe(kind === "deduped-skill" ? "xx" : "x");
+    }
+  );
+
+  test.each(["interrupt", "shutdown", "dispose"] as const)(
+    "%s while admitting an emergency retry cannot clear or publish a new window",
+    async (action) => {
+      const fallbackModel = "openai:gpt-4o-mini";
+      const h = await setup({
+        failure: (attempt) => (attempt === 1 ? { ...exceeded, model: fallbackModel } : undefined),
+      });
+      await seedHistory(h, 20000);
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const count = budgetCounting.estimateFreshRequestTokensForModel;
+      spyOn(budgetCounting, "estimateFreshRequestTokensForModel").mockImplementation(
+        async (input, model) => {
+          const estimate = await count(input, model);
+          if (model.model === fallbackModel) {
+            entered.resolve();
+            await release.promise;
+          }
+          return estimate;
+        }
+      );
+      const send = h.session.sendMessage("Accepted trigger", options, {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("cancel-family", "assistant", "Accepted payload", { synthetic: true }),
+        ],
+      });
+      await entered.promise;
+      const before = await allRows(h);
+      if (action === "interrupt") expect((await h.session.interruptStream()).success).toBe(true);
+      else if (action === "shutdown") h.session.beginShutdown();
+      else h.session.dispose();
+      release.resolve();
+      await send;
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(h.requests).toHaveLength(1);
+      const rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(
+        rows
+          .map(restoreContextBudgetRejectedMessageForDisplay)
+          .map((row) => ({ id: row.id, text: text(row) }))
+      ).toEqual(before.map((row) => ({ id: row.id, text: text(row) })));
+    }
+  );
+
   test.each([false, true])(
     "preflight retries once; fresh overflow blocked=%s",
     async (alwaysFail) => {
