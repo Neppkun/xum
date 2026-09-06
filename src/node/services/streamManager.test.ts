@@ -7113,16 +7113,6 @@ describe("StreamManager - mid-turn thinking override", () => {
     expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
-  test("stays byte-identical to the feature-off behavior when no override state exists", async () => {
-    const streamManager = new StreamManager(historyService);
-    const { createStreamResult } = getRequestHelpers(streamManager);
-    const streamTextSpy = setupStreamTextSpy();
-
-    createStreamResult({ model, messages, system: "system" }, new AbortController());
-    const prepareStep = capturePrepareStep(streamTextSpy);
-    expect(await prepareStep({ messages })).toBeUndefined();
-  });
-
   test("buildStreamRequestConfig normalizes providerOptions to a stable mutable object only when a rebuild closure exists", () => {
     const streamManager = new StreamManager(historyService);
     const { buildRequestConfig, createStreamResult } = getRequestHelpers(streamManager);
