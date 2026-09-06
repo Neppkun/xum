@@ -2811,7 +2811,6 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         });
       }
 
-      // Dispose of the handle
       await proc.handle.dispose();
 
       log.debug(`Process ${processId} terminated successfully`);

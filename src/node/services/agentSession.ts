@@ -7678,7 +7678,6 @@ export class AgentSession {
     const lastMessage = summaryMessage;
     const muxMeta = lastMessage.metadata?.muxMetadata;
 
-    // Check if it's a compaction summary with a pending follow-up
     if (!isCompactionSummaryMetadata(muxMeta) || !muxMeta.pendingFollowUp) {
       return false;
     }

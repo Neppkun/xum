@@ -4730,7 +4730,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Err(initialConflict);
     }
 
-    // Generate stable workspace ID
     const workspaceId = this.config.generateStableId();
 
     // Create runtime for workspace creation
@@ -6137,7 +6136,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         await this.mcpServerManager.stopServers(workspaceId);
       }
 
-      // Close any terminal sessions for this workspace
       this.terminalService?.closeWorkspaceSessions(workspaceId);
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
@@ -14442,7 +14440,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Create scoped temp directory for this IPC call
       using tempDir = new DisposableTempDir("mux-ipc-bash");
 
-      // Create bash tool
       const bashTool = createBashTool({
         cwd: cwdForExecution,
         runtime,
