@@ -45,7 +45,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
 
   // Token counts come from usage metadata, but context limits/1M eligibility should
   // follow the currently selected model unless a stream is actively running.
-  const contextDisplayModel = usage.liveUsage?.model ?? pendingSendOptions.baseModel;
+  const contextDisplayModel =
+    usage.liveModel ?? usage.liveUsage?.model ?? pendingSendOptions.baseModel;
   // Align warning with /compact model resolution so it matches actual compaction behavior.
   const effectiveCompactionModel =
     resolveCompactionModel(configuredCompactionModel) ?? contextDisplayModel;
@@ -55,7 +56,7 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     useAutoCompactionSettings(workspaceId, contextDisplayModel);
 
   const contextUsage = usage.liveUsage ?? usage.lastContextUsage;
-  if (!contextUsage) {
+  if (!contextUsage && !usage.liveModel) {
     return null;
   }
 
@@ -66,7 +67,7 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     false,
     providersConfig,
     { codexOauthAccountId },
-    usage.liveUsage?.effectiveContextLimit
+    usage.liveContextLimit
   );
 
   // Warn when the compaction model can't fit the auto-compact threshold to avoid failures.
@@ -95,6 +96,7 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     >
       <ContextUsageBar
         testId="context-usage"
+        showEmpty={usage.liveModel != null}
         data={contextUsageData}
         model={contextDisplayModel}
         autoCompaction={{

@@ -620,24 +620,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const lastUsage = usage?.liveUsage ?? usage?.lastContextUsage;
   // Token counts come from usage metadata, but context limits/1M eligibility should
   // follow the currently selected model unless a stream is actively running.
-  const activeUsageModel = usage?.liveUsage?.model ?? null;
+  const activeUsageModel = usage?.liveModel ?? usage?.liveUsage?.model ?? null;
   const contextDisplayModel = activeUsageModel ?? baseModel;
   const use1M = has1MContext(contextDisplayModel);
-  const liveContextLimit = usage?.liveUsage?.effectiveContextLimit;
+  const liveContextLimit = usage?.liveContextLimit;
   const contextUsageData = useMemo(() => {
-    return lastUsage
-      ? calculateTokenMeterData(
-          lastUsage,
-          contextDisplayModel,
-          use1M,
-          false,
-          providersConfig,
-          {
-            codexOauthAccountId,
-          },
-          liveContextLimit
-        )
-      : { segments: [], totalTokens: 0, totalPercentage: 0 };
+    return calculateTokenMeterData(
+      lastUsage,
+      contextDisplayModel,
+      use1M,
+      false,
+      providersConfig,
+      {
+        codexOauthAccountId,
+      },
+      liveContextLimit
+    );
   }, [
     lastUsage,
     contextDisplayModel,

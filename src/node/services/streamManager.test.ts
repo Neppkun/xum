@@ -7,6 +7,7 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   StreamEndEventSchema,
+  StreamStartEventSchema,
   ToolCallStartEventSchema,
   UsageDeltaEventSchema,
 } from "@/common/orpc/schemas/stream";
@@ -3477,6 +3478,40 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
 });
 
 describe("StreamManager - exact step indices", () => {
+  test.each([272_000, null])(
+    "publishes the accepted limit when the stream starts: %s",
+    async (limit) => {
+      const streamManager = new StreamManager(historyService);
+      const workspaceId = "start-context-workspace";
+      const messageId = "start-context-message";
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      const starts: Array<Extract<TurnEngineEvent, { type: "stream-start" }>> = [];
+      onTurnEngineEvent(streamManager, "stream-start", (event) => starts.push(event));
+      const streamInfo = createStreamInfoForTests({
+        messageId,
+        effectiveContextLimit: limit,
+        streamResult: createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            yield { type: "finish", finishReason: "stop" };
+          })()
+        ),
+      });
+      await getProcessStreamWithCleanupForTests(streamManager).call(
+        streamManager,
+        workspaceId,
+        streamInfo,
+        1
+      );
+      expect(starts).toHaveLength(1);
+      expect(StreamStartEventSchema.parse(starts[0]).effectiveContextLimit).toBe(limit);
+    }
+  );
+
   test("persists exact tool-only step boundaries through successful completion", async () => {
     const streamManager = new StreamManager(historyService);
     const workspaceId = "step-indices-workspace";
@@ -6224,6 +6259,39 @@ describe("StreamManager - replayStream", () => {
       { toolCallId: "tool-started-after-cursor", executionStartedAt: 25 },
     ]);
   });
+
+  test.each([272_000, null])(
+    "replays the accepted limit before usage exists: %s",
+    async (limit) => {
+      const streamManager = createReplayStreamManager();
+      const workspaceId = "replay-context-before-usage";
+      const starts: Array<Extract<TurnEngineEvent, { type: "stream-start" }>> = [];
+      const usageEvents: unknown[] = [];
+      onTurnEngineEvent(streamManager, "stream-start", (event) => starts.push(event));
+      onTurnEngineEvent(streamManager, "usage-delta", (event) => usageEvents.push(event));
+      setReplayStreamInfo(streamManager, workspaceId, {
+        state: "streaming",
+        messageId: "replay-context-message",
+        model: "openai:gpt-5.5",
+        effectiveContextLimit: limit,
+        historySequence: 1,
+        startTime: 123,
+        initialMetadata: {},
+        toolCompletionTimestamps: new Map<string, number>(),
+        parts: [],
+      });
+      stubReplayTokenTracker(streamManager);
+      await streamManager.replayStream(workspaceId);
+      await streamManager.replayStream(workspaceId, { afterTimestamp: 123 });
+      expect(starts).toHaveLength(2);
+      for (const start of starts) {
+        const parsed = StreamStartEventSchema.parse(start);
+        expect(parsed.effectiveContextLimit).toBe(limit);
+        expect(parsed.replay).toBe(true);
+      }
+      expect(usageEvents).toHaveLength(0);
+    }
+  );
 
   test("replayStream emits replay usage-delta from tracked step/cumulative usage", async () => {
     const streamManager = createReplayStreamManager();

@@ -605,15 +605,16 @@ export class AIService extends EventEmitter {
       modelRoutingSnapshot?: ModelRoutingSnapshot;
     }
   ): Promise<Result<{ model: LanguageModel; metadataModel: string }, SendMessageError>> {
-    const providersConfig =
-      opts?.modelRoutingSnapshot?.providersConfig ??
-      this.providersConfigStore.loadProvidersConfig() ??
-      {};
+    // Keep model construction and metadata on one route, including callers without an outer snapshot.
+    const snapshot =
+      opts?.modelRoutingSnapshot ??
+      this.captureModelRoutingSnapshot(opts?.workspaceId, opts?.projectPath);
+    const providersConfig = snapshot.providersConfig;
     const result = await this.providerModelFactory.createModel(modelString, undefined, {
       ...opts,
       providersConfig,
-      codexOauthSelection: opts?.modelRoutingSnapshot?.codexOauthSelection,
-      routeConfig: opts?.modelRoutingSnapshot?.routeConfig,
+      codexOauthSelection: snapshot.codexOauthSelection,
+      routeConfig: snapshot.routeConfig,
     });
     if (!result.success) {
       return result;
@@ -628,7 +629,7 @@ export class AIService extends EventEmitter {
       modelString,
       undefined,
       providersConfig,
-      opts?.modelRoutingSnapshot?.routeConfig
+      snapshot.routeConfig
     );
     const metadataSeed = effectiveModelString.startsWith("coder:")
       ? modelString

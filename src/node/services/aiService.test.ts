@@ -1297,6 +1297,52 @@ describe("AIService.captureModelRoutingSnapshot", () => {
 });
 
 describe("AIService.createModelWithPinnedMetadata", () => {
+  it("keeps model and metadata routing together when settings change during construction", async () => {
+    using xumHome = new DisposableTempDir("metadata-route-snapshot");
+    const { config, service, providersConfigStore } = createBasicAIService(xumHome.path);
+    providersConfigStore.saveProvidersConfig({
+      openai: { apiKey: "openai-key" },
+      openrouter: { apiKey: "openrouter-key" },
+    });
+    await config.editConfig((cfg) => {
+      cfg.routePriority = ["direct"];
+      return cfg;
+    });
+    const factory = Reflect.get(service, "providerModelFactory") as ProviderModelFactory;
+    const createModel = factory.createModel.bind(factory);
+    const resolveRoute = factory.resolveEffectiveModelString.bind(factory);
+    const resolvedRoutes: string[] = [];
+    spyOn(factory, "resolveEffectiveModelString").mockImplementation((...args) => {
+      const route = resolveRoute(...args);
+      resolvedRoutes.push(route);
+      return route;
+    });
+    spyOn(factory, "createModel").mockImplementationOnce(async (...args) => {
+      const model = await createModel(...args);
+      await config.editConfig((cfg) => {
+        cfg.routePriority = ["openrouter", "direct"];
+        return cfg;
+      });
+      return model;
+    });
+
+    const first = await service.createModelWithPinnedMetadata("openai:gpt-5.5");
+    expect(first.success).toBe(true);
+    if (!first.success || typeof first.data.model === "string")
+      throw new Error("Expected model construction to succeed");
+    expect(first.data.model.modelId).toBe("gpt-5.5");
+    expect(resolvedRoutes.length).toBeGreaterThan(1);
+    expect(new Set(resolvedRoutes)).toEqual(new Set(["openai:gpt-5.5"]));
+
+    resolvedRoutes.length = 0;
+    const next = await service.createModelWithPinnedMetadata("openai:gpt-5.5");
+    expect(next.success).toBe(true);
+    if (!next.success || typeof next.data.model === "string")
+      throw new Error("Expected model construction to succeed");
+    expect(next.data.model.modelId).toBe("openai/gpt-5.5");
+    expect(new Set(resolvedRoutes)).toEqual(new Set(["openrouter:openai/gpt-5.5"]));
+  });
+
   it("uses the summary account snapshot after project selection changes", async () => {
     using xumHome = new DisposableTempDir("headless-account-snapshot");
     const { config, service, providersConfigStore } = createBasicAIService(xumHome.path);

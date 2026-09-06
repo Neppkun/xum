@@ -1324,7 +1324,7 @@ describe("WorkspaceStore", () => {
           workspaceId
         );
       const usage = { inputTokens: 1000, outputTokens: 100, totalTokens: 1100 };
-      for (const [index, effectiveContextLimit] of [272_000, 500_000].entries()) {
+      for (const [index, effectiveContextLimit] of [272_000, 500_000, null].entries()) {
         const messageId = "live-limit-" + index;
         aggregator.handleStreamStart({
           type: "stream-start",
@@ -1333,9 +1333,13 @@ describe("WorkspaceStore", () => {
           model: "openai:gpt-5.5",
           historySequence: index + 1,
           startTime: 1000 + index,
+          effectiveContextLimit,
         });
         bump();
-        expect(store.getWorkspaceUsage(workspaceId).liveUsage).toBeUndefined();
+        const starting = store.getWorkspaceUsage(workspaceId);
+        expect(starting.liveUsage).toBeUndefined();
+        expect(starting.liveModel).toBe("openai:gpt-5.5");
+        expect(starting.liveContextLimit).toBe(effectiveContextLimit);
         aggregator.handleUsageDelta({
           type: "usage-delta",
           workspaceId,
@@ -1358,6 +1362,8 @@ describe("WorkspaceStore", () => {
         bump();
         const idle = store.getWorkspaceUsage(workspaceId);
         expect(idle.liveUsage).toBeUndefined();
+        expect(idle.liveModel).toBeUndefined();
+        expect(idle.liveContextLimit).toBeUndefined();
         expect(idle.lastContextUsage?.input.tokens).toBe(1000);
         expect(idle.lastContextUsage?.effectiveContextLimit).toBeUndefined();
       }

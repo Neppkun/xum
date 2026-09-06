@@ -7392,6 +7392,12 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       }),
     ];
     const summaryAiService: BranchSummaryAiService = {
+      captureModelRoutingSnapshot: () => ({
+        providersConfig: {},
+        metadata: null,
+        routeConfig: { routePriority: ["direct"], routeOverrides: {} },
+        codexOauthSelection: { accountId: "default", explicit: false },
+      }),
       createModelWithPinnedMetadata: (modelString: string) =>
         Promise.resolve(
           Ok({

@@ -248,6 +248,7 @@ interface StreamingContext {
    * stream is active.
    */
   metadataModel?: string;
+  effectiveContextLimit?: number | null;
   routedThroughGateway?: boolean;
   routeProvider?: string;
 
@@ -537,7 +538,6 @@ export class StreamingMessageAggregator {
     string,
     {
       // Step-level: this step only (for context window display)
-      effectiveContextLimit?: number | null;
       step: { usage: LanguageModelV2Usage; providerMetadata?: Record<string, unknown> };
       // Cumulative: sum across all steps (for live cost display)
       cumulative: { usage: LanguageModelV2Usage; providerMetadata?: Record<string, unknown> };
@@ -2159,6 +2159,7 @@ export class StreamingMessageAggregator {
       this.getLatestUnresolvedCompactionRequest()?.parsed.followUpContent?.dispatchOptions
         ?.source === "internal-resume";
     const now = Date.now();
+    const existingContext = this.activeStreams.get(data.messageId);
     const context: StreamingContext = {
       serverStartTime: data.startTime,
       clockOffsetMs: now - data.startTime,
@@ -2170,6 +2171,12 @@ export class StreamingMessageAggregator {
       isReplay: data.replay === true,
       model: data.model,
       metadataModel: data.metadataModel,
+      effectiveContextLimit:
+        data.effectiveContextLimit !== undefined
+          ? data.effectiveContextLimit
+          : data.replay
+            ? existingContext?.effectiveContextLimit
+            : undefined,
       routedThroughGateway: data.routedThroughGateway,
       routeProvider,
       serverFirstTokenTime: null,
@@ -2183,7 +2190,6 @@ export class StreamingMessageAggregator {
     // For incremental replay: stream-start may be re-emitted to re-establish context.
     // If we already have this message with accumulated parts, don't wipe its content.
     const existingMessage = this.messages.get(data.messageId);
-    const existingContext = this.activeStreams.get(data.messageId);
     if (data.replay && existingMessage && existingMessage.parts.length > 0) {
       if (existingContext) {
         // Preserve the highest observed server timestamp across reconnect boundaries.
@@ -3966,8 +3972,11 @@ export class StreamingMessageAggregator {
    * Handle usage-delta event: update usage tracking for active stream
    */
   handleUsageDelta(data: UsageDeltaEvent): void {
+    const context = this.activeStreams.get(data.messageId);
+    if (context && data.effectiveContextLimit !== undefined) {
+      context.effectiveContextLimit = data.effectiveContextLimit;
+    }
     this.activeStreamUsage.set(data.messageId, {
-      effectiveContextLimit: data.effectiveContextLimit,
       step: { usage: data.usage, providerMetadata: data.providerMetadata },
       cumulative: {
         usage: data.cumulativeUsage,
@@ -3977,7 +3986,7 @@ export class StreamingMessageAggregator {
   }
 
   getActiveStreamContextLimit(messageId: string): number | null | undefined {
-    return this.activeStreamUsage.get(messageId)?.effectiveContextLimit;
+    return this.activeStreams.get(messageId)?.effectiveContextLimit;
   }
 
   /**

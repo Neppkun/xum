@@ -65,7 +65,14 @@ export function calculateTokenMeterData(
   routingOptions?: CodexOauthRoutingOptions,
   effectiveContextLimit?: number | null
 ): TokenMeterData {
-  if (!usage) return { segments: [], totalTokens: 0, totalPercentage: 0 };
+  if (!usage) {
+    return {
+      segments: [],
+      totalTokens: 0,
+      totalPercentage: 0,
+      maxTokens: effectiveContextLimit ?? undefined,
+    };
+  }
 
   // Live usage keeps the accepted request limit. Idle callers omit the override.
   const maxTokens =

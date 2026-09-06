@@ -3534,6 +3534,36 @@ describe("StreamingMessageAggregator", () => {
       });
     });
 
+    test.each([272_000, null])(
+      "keeps start-time limits across replay and missing usage fields: %s",
+      (limit) => {
+        const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
+        const start = {
+          type: "stream-start" as const,
+          workspaceId: "ws-1",
+          messageId: "msg-1",
+          model: "openai:gpt-5.5",
+          historySequence: 1,
+          startTime: 1000,
+        };
+        aggregator.handleStreamStart({ ...start, effectiveContextLimit: limit });
+        expect(aggregator.getActiveStreamUsage("msg-1")).toBeUndefined();
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBe(limit);
+        aggregator.handleStreamStart({ ...start, replay: true });
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBe(limit);
+        aggregator.handleUsageDelta({
+          type: "usage-delta",
+          workspaceId: "ws-1",
+          messageId: "msg-1",
+          usage: { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 },
+          cumulativeUsage: { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 },
+        });
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBe(limit);
+        aggregator.handleStreamStart({ ...start, replay: true, effectiveContextLimit: null });
+        expect(aggregator.getActiveStreamContextLimit("msg-1")).toBeNull();
+      }
+    );
+
     test("clearTokenState removes usage", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 

@@ -74,6 +74,21 @@ describe("calculateTokenMeterData", () => {
     expect(idle.totalPercentage).toBeCloseTo(2.2);
   });
 
+  test.each([272_000, null])("keeps the accepted limit before usage arrives: %s", (limit) => {
+    const result = calculateTokenMeterData(
+      undefined,
+      "anthropic:claude-sonnet-4-20250514",
+      true,
+      false,
+      providerConfigWithOverride,
+      undefined,
+      limit
+    );
+    expect(result.maxTokens).toBe(limit ?? undefined);
+    expect(result.totalTokens).toBe(0);
+    expect(result.totalPercentage).toBe(0);
+  });
+
   test("keeps an unknown accepted limit despite a current model override", () => {
     const result = calculateTokenMeterData(
       SAMPLE_USAGE,

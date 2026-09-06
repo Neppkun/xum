@@ -3003,6 +3003,7 @@ export class StreamManager {
       // diverge from the backend ledger when a Coder catalog refresh
       // removes/retags the instance mid-stream.
       metadataModel: streamInfo.metadataModel,
+      effectiveContextLimit: streamInfo.effectiveContextLimit,
       routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
       historySequence,

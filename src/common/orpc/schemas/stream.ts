@@ -166,6 +166,8 @@ export const StreamStartEventSchema = z.object({
     .optional()
     .meta({ description: "True when this event is emitted during stream replay" }),
   model: z.string(),
+  // Publish the accepted limit before usage arrives. Null means the limit is unknown.
+  effectiveContextLimit: z.number().positive().nullable().optional(),
   metadataModel: z
     .string()
     .optional()

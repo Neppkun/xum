@@ -568,7 +568,7 @@ export const DisconnectedDefaultRecoveryPhone: AppStory = {
   play: DisconnectedDefaultRecovery.play,
 };
 
-let contextStream: { finish: () => void; next: () => void } | undefined;
+let contextStream: { finish: () => void; next: () => void; reportUsage: () => void } | undefined;
 
 function setupLiveContextLimit(workspaceId = "codex-live-limit") {
   contextStream = undefined;
@@ -589,17 +589,18 @@ function setupLiveContextLimit(workspaceId = "codex-live-limit") {
           model,
           historySequence: turn,
           startTime: 1000 + turn,
-        });
-        emit({
-          type: "usage-delta",
-          workspaceId,
-          messageId,
-          usage,
-          cumulativeUsage: usage,
           effectiveContextLimit,
         });
       };
       contextStream = {
+        reportUsage: () =>
+          emit({
+            type: "usage-delta",
+            workspaceId,
+            messageId: "context-turn-" + turn,
+            usage,
+            cumulativeUsage: usage,
+          }),
         finish: () =>
           emit({
             type: "stream-end",
@@ -633,11 +634,13 @@ function setupLiveContextLimit(workspaceId = "codex-live-limit") {
 
 async function exerciseLiveContextLimit(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
-  const checkMeters = async (limit: string, percentage: string) => {
+  const checkMeters = async (limit: string, percentage: string, tokens = "100.0k") => {
     await waitFor(
       async () => {
         await expect(
-          canvas.getByRole("button", { name: new RegExp("Context usage: 100.0k / " + limit) })
+          canvas.getByRole("button", {
+            name: new RegExp("Context usage: " + tokens + " / " + limit),
+          })
         ).toHaveAccessibleName(expect.stringContaining(percentage));
         await expect(canvas.getByTestId("context-usage")).toHaveTextContent(limit);
         await expect(canvas.getByTestId("context-usage")).toHaveTextContent(percentage);
@@ -645,8 +648,8 @@ async function exerciseLiveContextLimit(canvasElement: HTMLElement) {
       { timeout: 10000 }
     );
   };
-  await checkMeters("272.0k", "36.8%");
-  // Settings changes must not alter the active request's denominator.
+  await checkMeters("272.0k", "0.0%", "0");
+  // Settings changes must not alter the accepted limit before the first usage event.
   const controls = within(await openAccounts(canvasElement));
   const global = controls.getByRole("combobox", { name: "Global default account" });
   const project = controls.getByRole("combobox", { name: "/projects/my-app" });
@@ -662,8 +665,10 @@ async function exerciseLiveContextLimit(canvasElement: HTMLElement) {
   await userEvent.click(
     canvas.getAllByRole("button", { name: /Close settings|Back to previous page/ })[0]
   );
-  await checkMeters("272.0k", "36.8%");
+  await checkMeters("272.0k", "0.0%", "0");
   if (!contextStream) throw new Error("The live context stream is missing");
+  contextStream.reportUsage();
+  await checkMeters("272.0k", "36.8%");
   contextStream.finish();
   await checkMeters("500.0k", "20.0%");
   contextStream.next();
