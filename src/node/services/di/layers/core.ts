@@ -1,3 +1,5 @@
+import { readPersistedExperimentEnabled } from "@/node/services/experimentsService";
+import { ClaudeDesignService } from "@/node/services/claudeDesignService";
 import * as os from "os";
 import * as path from "path";
 import { Context, Effect, Layer } from "effect";
@@ -35,6 +37,7 @@ import {
   SessionUsage,
   StreamManagerTag,
   Task,
+  DesktopInputCoordinatorTag,
   TerminalAttentionStoreTag,
   TurnRequestBuilderBindingsTag,
   Workspace,
@@ -58,6 +61,7 @@ import { MemoryService } from "@/node/services/memoryService";
 import { ProviderService } from "@/node/services/providerService";
 import { SessionUsageService } from "@/node/services/sessionUsageService";
 import { StreamManager } from "@/node/services/streamManager";
+import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
@@ -169,6 +173,11 @@ export const MemoryLive = Layer.effect(
   Effect.gen(function* () {
     return new MemoryService(yield* ConfigTag, yield* MemoryMeta);
   })
+);
+
+export const DesktopInputCoordinatorLive = Layer.effect(
+  DesktopInputCoordinatorTag,
+  Effect.map(ConfigTag, (config) => new DesktopInputCoordinator(config))
 );
 
 export const TerminalAttentionStoreLive = Layer.effect(
@@ -306,6 +315,15 @@ export const MCPConfigLive = Layer.effect(
     // Agent Plugins (agent-plugins experiment): read-only plugin MCP servers are
     // merged into listings; without an ExperimentsService the provider is inert.
     return new MCPConfigService(mcpConfig, {
+      claudeDesign: new ClaudeDesignService({
+        rootDir: mcpConfig.rootDir,
+        readEnabled: () =>
+          readPersistedExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, {
+            xumHome: mcpConfig.rootDir,
+          }),
+        isEnabled: () =>
+          opts.experimentsService?.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) === true,
+      }),
       agentPluginsMcpProvider: createAgentPluginsMcpProvider({
         xumHome: mcpConfig.rootDir,
         isEnabled: () =>
@@ -380,7 +398,8 @@ export const WorkspaceLive = Layer.effect(
       opts.sessionTimingService,
       yield* StreamManagerTag,
       yield* SecretsStoreTag,
-      yield* ProvidersConfigStoreTag
+      yield* ProvidersConfigStoreTag,
+      yield* DesktopInputCoordinatorTag
     );
   })
 );
@@ -403,7 +422,8 @@ export const TaskLive = Layer.effect(
       yield* SessionUsage,
       yield* WorkspaceGoal,
       yield* SecretsStoreTag,
-      yield* TerminalAttentionStoreTag
+      yield* TerminalAttentionStoreTag,
+      yield* DesktopInputCoordinatorTag
     );
   })
 );
@@ -423,7 +443,8 @@ export const WorkspaceTurnManagerLive = Layer.effect(
       yield* InitStateManagerTag,
       yield* Task,
       yield* TerminalAttentionStoreTag,
-      yield* StreamManagerTag
+      yield* StreamManagerTag,
+      yield* DesktopInputCoordinatorTag
     );
   })
 );
@@ -582,6 +603,7 @@ const S1 = Layer.mergeAll(
   ExtensionMetadataLive,
   MemoryLive,
   TerminalAttentionStoreLive,
+  DesktopInputCoordinatorLive,
   IdleDispatcherLive,
   TurnRequestBuilderBindingsLive
 );

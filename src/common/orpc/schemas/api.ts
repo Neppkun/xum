@@ -1,3 +1,8 @@
+import {
+  ClaudeDesignSettingsSchema,
+  ClaudeDesignStatusSchema,
+  ClaudeDesignExperimentSnapshotSchema,
+} from "./claudeDesign";
 import { eventIterator } from "@orpc/server";
 import { UIModeSchema } from "../../types/mode";
 import { z } from "zod";
@@ -144,10 +149,14 @@ import {
 import { ProviderModelEntrySchema } from "../../config/schemas/providerModelEntry";
 import { UserPreferencesSchema } from "../../config/schemas/userPreferences";
 import { TaskSettingsSchema } from "../../config/schemas/taskSettings";
-import { ThinkingLevelSchema } from "../../types/thinking";
+import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 
 // Experiments
 export const experiments = {
+  onDesignChange: {
+    input: z.void(),
+    output: eventIterator(ClaudeDesignExperimentSnapshotSchema),
+  },
   getOverrides: {
     input: z.void(),
     output: z.partialRecord(z.enum(EXPERIMENT_IDS), z.boolean()),
@@ -161,7 +170,7 @@ export const experiments = {
   },
 };
 // Re-export telemetry schemas
-export { telemetry, TelemetryEventSchema } from "./telemetry";
+export { telemetry } from "./telemetry";
 
 // Re-export analytics schemas
 export { analytics } from "./analytics";
@@ -1001,6 +1010,13 @@ export const projects = {
  * Global config lives in <xumHome>/mcp.jsonc, with optional repo overrides in <projectPath>/.xum/mcp.jsonc.
  */
 export const mcp = {
+  designStatus: { input: z.void(), output: ClaudeDesignStatusSchema },
+  configureDesign: {
+    input: ClaudeDesignSettingsSchema.pick({ source: true, reuseEnabled: true }).partial({
+      source: true,
+    }),
+    output: ClaudeDesignStatusSchema,
+  },
   list: {
     input: MCPListParamsSchema,
     output: MCPServerMapSchema,
@@ -1111,15 +1127,7 @@ export const secrets = {
 };
 
 // Re-export Coder schemas from dedicated file
-export {
-  coder,
-  CoderInfoSchema,
-  CoderPresetSchema,
-  CoderTemplateSchema,
-  CoderWorkspaceConfigSchema,
-  CoderWorkspaceSchema,
-  CoderWorkspaceStatusSchema,
-} from "./coder";
+export { coder } from "./coder";
 
 // Workspace
 const DebugLlmRequestSnapshotSchema = z
@@ -2076,6 +2084,7 @@ export const tasks = {
       .object({
         parentWorkspaceId: z.string(),
         kind: z.literal("agent"),
+        desktop: z.enum(["shared", "isolated"]).optional(),
         agentId: AgentIdSchema.optional(),
         /** @deprecated Legacy alias for agentId (kept for downgrade compatibility). */
         agentType: z.string().min(1).optional(),
@@ -2102,6 +2111,7 @@ export const tasks = {
         taskId: z.string(),
         kind: z.literal("agent"),
         status: z.enum(["queued", "starting", "running"]),
+        desktopOwnerWorkspaceId: z.string().optional(),
       }),
       z.string()
     ),
@@ -2185,7 +2195,6 @@ export const WorkflowActiveRunSummarySchema = z.object({
   /** Nested (workflow-in-workflow) runs are absent from workspace activity. */
   nested: z.boolean(),
 });
-export type WorkflowActiveRunSummary = z.infer<typeof WorkflowActiveRunSummarySchema>;
 
 export const workflows = {
   listRuns: {
@@ -2534,6 +2543,7 @@ export const config = {
       defaultModel: z.string().optional(),
       advisorModelString: AdvisorModelStringSchema,
       advisorThinkingLevel: AdvisorThinkingLevelSchema,
+      advisorReasoningMode: OpenAIReasoningModeSchema.nullable(),
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.optional(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.optional(),
       hiddenModels: z.array(z.string()).optional(),
@@ -2558,6 +2568,7 @@ export const config = {
       taskSettings: ResolvedTaskSettingsSchema.nullish(),
       advisorModelString: AdvisorModelStringSchema.nullish(),
       advisorThinkingLevel: AdvisorThinkingLevelSchema.nullish(),
+      advisorReasoningMode: OpenAIReasoningModeSchema.nullish(),
       advisorMaxUsesPerTurn: AdvisorMaxUsesPerTurnSchema.nullish(),
       advisorMaxOutputTokens: AdvisorMaxOutputTokensSchema.nullish(),
       agentAiDefaults: AgentAiDefaultsSchema.optional(),
@@ -3167,6 +3178,7 @@ const DesktopCapabilitySchema = z.discriminatedUnion("available", [
     width: z.number(),
     height: z.number(),
     sessionId: z.string(),
+    sharedDesktop: z.object({ ownerWorkspaceId: z.string(), ownerName: z.string() }).optional(),
   }),
   z.object({
     available: z.literal(false),
@@ -3180,7 +3192,38 @@ const DesktopCapabilitySchema = z.discriminatedUnion("available", [
   }),
 ]);
 
+const DesktopWindowInputSchema = z.object({
+  workspaceId: z.string().min(1),
+  instanceId: z.string().min(1),
+});
+const DesktopWindowStateSchema = z.object({ instanceId: z.string().min(1) });
+
+export const DesktopViewerEventSchema = z.object({
+  type: z.enum(["ready", "release"]),
+  viewerId: z.string().min(1),
+});
+
 export const desktop = {
+  watchViewer: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: eventIterator(DesktopViewerEventSchema),
+  },
+  acknowledgeViewerRelease: {
+    input: z.object({ viewerId: z.string().min(1) }),
+    output: z.void(),
+  },
+  openWindow: {
+    input: DesktopWindowInputSchema,
+    output: DesktopWindowStateSchema,
+  },
+  closeWindow: {
+    input: DesktopWindowInputSchema,
+    output: z.void(),
+  },
+  getWindow: {
+    input: z.object({ workspaceId: z.string().min(1) }),
+    output: DesktopWindowStateSchema.nullable(),
+  },
   getPrereqStatus: {
     input: z.void(),
     output: DesktopPrereqStatusSchema,

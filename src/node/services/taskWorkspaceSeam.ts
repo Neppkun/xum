@@ -90,6 +90,8 @@ export interface TaskCreateArgs {
    * "fork" (isolated copy) when omitted. Ignored (treated as "fork") on unsupported runtimes.
    */
   isolation?: TaskIsolation;
+  /** Desktop sharing is independent of checkout isolation. */
+  desktop?: "shared" | "isolated";
   parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
   /**
    * Model-refusal policy persisted on the child workspace. "fail" opts the task
@@ -353,6 +355,12 @@ export interface SendMessageInternalOptions {
   /** Keep this dedupe-keyed queue entry isolated so it can be selectively superseded. */
   removableQueueDedupeKey?: boolean;
   /**
+   * For queued tool-end sends: enqueue ahead of hidden (non-user-authored) turn-end entries so
+   * a background turn-end predecessor cannot hold this send until the turn ends naturally.
+   * Never overtakes a user-authored entry. See MessageQueue.promoteAheadOfHiddenTurnEnd.
+   */
+  promoteAheadOfHiddenTurnEnd?: boolean;
+  /**
    * For queued sends: quietly drop the message (success) when other messages are already
    * queued at enqueue time. Scheduled heartbeats use this so a user send racing the awaits
    * in this method keeps queue ownership — MessageQueue dispatches with the latest queued
@@ -413,7 +421,15 @@ export interface TurnAdmissionHost {
   removeQueuedMessagesByDedupeKeyPrefix(
     workspaceId: string,
     prefix: string,
-    options?: { cancelReason?: string }
+    options?: {
+      cancelReason?: string;
+      /**
+       * Drop the entries without invoking their onCanceled/onAcceptedPreStreamFailure callbacks.
+       * For supersession (the entry's source produced a later, authoritative message) rather than
+       * withdrawal: a workspace-turn continuation the entry carried must not be settled as failed.
+       */
+      skipCancelCallbacks?: boolean;
+    }
   ): Result<number>;
   getQueueCutCutter(workspaceId: string): QueueCutCutter | undefined;
   countQueuedAgentPeerMessages(workspaceId: string): number;
@@ -519,7 +535,10 @@ export interface AgentTaskIntegration {
   resetAutoResumeCount(workspaceId: string): void;
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number;
   markInterruptedTaskRunning(workspaceId: string): Promise<boolean>;
-  restoreInterruptedTaskAfterResumeFailure(workspaceId: string): Promise<void>;
+  restoreInterruptedTaskAfterResumeFailure(
+    workspaceId: string,
+    previousStatus?: AgentTaskStatus | null
+  ): Promise<void>;
   markParentWorkspaceInterrupted(workspaceId: string): void;
   latchHardInterruptCascade(workspaceId: string): (() => void) | undefined;
   terminateAllDescendantAgentTasks(
@@ -547,7 +566,10 @@ export interface WorkspaceTurnTaskHost {
   countActiveAgentTasks(config: ReturnType<Config["loadConfigOrDefault"]>): number;
   editWorkspaceEntry(
     workspaceId: string,
-    updater: (workspace: WorkspaceConfigEntry) => void,
+    updater: (
+      workspace: WorkspaceConfigEntry,
+      config: ReturnType<Config["loadConfigOrDefault"]>
+    ) => void,
     options?: { allowMissing?: boolean }
   ): Promise<boolean>;
   emitWorkspaceMetadata(workspaceId: string): Promise<void>;

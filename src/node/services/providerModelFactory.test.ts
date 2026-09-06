@@ -19,7 +19,6 @@ import {
   buildAIProviderRequestHeaders,
   classifyCopilotInitiator,
   countAnthropicCacheBreakpoints,
-  modelCostsIncluded,
   XUM_AI_PROVIDER_USER_AGENT,
   normalizeCodexResponsesBody,
   markCodexOauthRoutedResponse,
@@ -1333,7 +1332,7 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
         return;
       }
       expect(hasLanguageModelCleanup(result.data)).toBe(false);
-      expect(modelCostsIncluded(result.data)).toBe(true);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 
@@ -1433,8 +1432,8 @@ describe("ProviderModelFactory OpenAI WebSocket transport", () => {
   });
 });
 
-describe("ProviderModelFactory modelCostsIncluded", () => {
-  it("marks gpt-5.3-codex as subscription-covered when routed through Codex OAuth", async () => {
+describe("ProviderModelFactory Codex authentication", () => {
+  it("creates a Responses model with only Codex OAuth credentials", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
@@ -1454,7 +1453,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
         return;
       }
 
-      expect(modelCostsIncluded(result.data)).toBe(true);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 
@@ -1479,11 +1478,53 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
         return;
       }
 
-      expect(modelCostsIncluded(result.data)).toBe(true);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 
-  it("does not mark gpt-5.3-codex as subscription-covered when routed through API key", async () => {
+  it("uses the API key for Chat Completions even when Codex OAuth is preferred", async () => {
+    await withTempConfig(async (config, factory) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openai: {
+          apiKey: "sk-test",
+          wireFormat: "chatCompletions",
+          codexOauthDefaultAuth: "oauth",
+          codexOauth: {
+            type: "oauth",
+            access: "test-access-token",
+            refresh: "test-refresh-token",
+            expires: Date.now() + 60_000,
+            accountId: "test-account-id",
+          },
+        },
+      });
+
+      const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
+      let capturedApiKey: string | undefined;
+      PROVIDER_REGISTRY.openai = async () => {
+        const module = await originalOpenAIRegistry();
+        return {
+          ...module,
+          createOpenAI: (options) => {
+            capturedApiKey = options?.apiKey;
+            return module.createOpenAI(options);
+          },
+        };
+      };
+
+      try {
+        // Codex OAuth serves only the Responses API, so the factory must hand the
+        // SDK the real key instead of the "codex-oauth" placeholder.
+        const result = await factory.createModel(KNOWN_MODELS.GPT_53_CODEX.id);
+        expect(result.success).toBe(true);
+        expect(capturedApiKey).toBe("sk-test");
+      } finally {
+        PROVIDER_REGISTRY.openai = originalOpenAIRegistry;
+      }
+    });
+  });
+
+  it("creates a Responses model with only API key credentials", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
@@ -1497,7 +1538,7 @@ describe("ProviderModelFactory modelCostsIncluded", () => {
         return;
       }
 
-      expect(modelCostsIncluded(result.data)).toBe(false);
+      expect(result.data).toMatchObject({ provider: "openai.responses" });
     });
   });
 });

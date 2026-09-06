@@ -25,6 +25,10 @@ import type {
   FileReadToolResultSchema,
   HeartbeatToolResultSchema,
   MemoryToolResultSchema,
+  IntuitionToolResultSchema,
+  IntuitionMemorySchema,
+  IntuitionCandidateSchema,
+  IntuitionStatsSchema,
   AttachFileToolResultSchema,
   TaskToolResultSchema,
   TaskSendMessageToolResultSchema,
@@ -63,8 +67,6 @@ export type AgentSkillReadFileToolArgs = z.infer<
   typeof TOOL_DEFINITIONS.agent_skill_read_file.schema
 >;
 export type AgentSkillReadFileToolResult = z.infer<typeof AgentSkillReadFileToolResultSchema>;
-
-export type MCPPromptGetToolArgs = z.infer<typeof TOOL_DEFINITIONS.mcp_prompt_get.schema>;
 export type MCPPromptGetToolResult = z.infer<typeof MCPPromptGetToolResultSchema>;
 
 // agent_skill_list args + result
@@ -172,6 +174,13 @@ export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSche
 // Memory tool types, derived from schema (avoid drift)
 export type MemoryToolArgs = z.infer<typeof TOOL_DEFINITIONS.memory.schema>;
 export type MemoryToolResult = z.infer<typeof MemoryToolResultSchema>;
+
+export type IntuitionToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition.schema>;
+export type IntuitionToolResult = z.infer<typeof IntuitionToolResultSchema>;
+export type IntuitionMemory = z.infer<typeof IntuitionMemorySchema>;
+export type IntuitionCandidate = z.infer<typeof IntuitionCandidateSchema>;
+export type IntuitionStats = z.infer<typeof IntuitionStatsSchema>;
+export type IntuitionReportToolArgs = z.infer<typeof TOOL_DEFINITIONS.intuition_report.schema>;
 
 // AttachFileToolResult derived from Zod schema (single source of truth)
 export type AttachFileToolResult = z.infer<typeof AttachFileToolResultSchema>;
@@ -337,10 +346,6 @@ export type TaskWorkspaceLifecycleToolArgs = z.infer<typeof TaskWorkspaceLifecyc
 export type TaskWorkspaceLifecycleToolSuccessResult = z.infer<
   typeof TaskWorkspaceLifecycleToolResultSchema
 >;
-
-export type TaskWorkspaceLifecycleToolResult =
-  | TaskWorkspaceLifecycleToolSuccessResult
-  | ToolErrorResult;
 
 // One per-target outcome row, discriminated on `status` (12 lifecycle states).
 export type TaskWorkspaceLifecycleTargetResult =

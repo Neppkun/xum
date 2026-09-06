@@ -56,9 +56,6 @@ export const WorktreeArchiveSnapshotSchema = z.object({
   }),
 });
 
-// Shared with workspace metadata IPC; see src/common/orpc/schemas/workspace.ts.
-export { WorkflowTaskMetadataSchema };
-
 export const WorkspaceConfigSchema = z.object({
   path: z.string().meta({
     description: "Absolute path to workspace directory - REQUIRED for backward compatibility",
@@ -222,6 +219,11 @@ export const WorkspaceConfigSchema = z.object({
   taskTrunkBranch: z.string().optional().meta({
     description:
       "Trunk branch used to create/init this agent task workspace (used for restart-safe init on queued tasks).",
+  }),
+  // Delegation changes the operator, not the computer; checkout isolation is independent.
+  taskDesktopOwnerWorkspaceId: z.string().optional().meta({
+    description:
+      "Ancestor owning the shared desktop. Absent means this workspace owns its desktop.",
   }),
   taskIsolation: z
     .enum(["fork", "none"])

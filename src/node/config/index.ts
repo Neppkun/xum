@@ -91,7 +91,12 @@ import {
   tryProjectRegistrationFileLock,
   withProjectRegistrationFileLock,
 } from "@/node/config/projectRegistrationLock";
-import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking";
+import {
+  coerceOpenAIReasoningMode,
+  coerceThinkingLevel,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
 
 // Re-export project/provider types from dedicated schema/types files (for preload usage)
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig };
@@ -1681,6 +1686,7 @@ export class Config {
         const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
         const advisorModelString = parseOptionalNonEmptyString(parsed.advisorModelString);
         const advisorThinkingLevel = parseOptionalThinkingLevel(parsed.advisorThinkingLevel);
+        const advisorReasoningMode = coerceOpenAIReasoningMode(parsed.advisorReasoningMode);
         const advisorMaxUsesPerTurn =
           parsed.advisorMaxUsesPerTurn === null
             ? null
@@ -1806,6 +1812,7 @@ export class Config {
           defaultModel,
           advisorModelString,
           advisorThinkingLevel,
+          advisorReasoningMode,
           advisorMaxUsesPerTurn,
           advisorMaxOutputTokens,
           hiddenModels,
@@ -1960,6 +1967,11 @@ export class Config {
       const advisorModelString = parseOptionalNonEmptyString(config.advisorModelString);
       if (advisorModelString !== undefined) {
         data.advisorModelString = advisorModelString;
+      }
+
+      const advisorReasoningMode = coerceOpenAIReasoningMode(config.advisorReasoningMode);
+      if (advisorReasoningMode !== undefined) {
+        data.advisorReasoningMode = advisorReasoningMode;
       }
 
       const advisorThinkingLevel = parseOptionalThinkingLevel(config.advisorThinkingLevel);
@@ -2314,6 +2326,7 @@ export class Config {
       defaultModel: config.defaultModel,
       advisorModelString: config.advisorModelString ?? null,
       advisorThinkingLevel: config.advisorThinkingLevel ?? null,
+      advisorReasoningMode: config.advisorReasoningMode ?? null,
       advisorMaxUsesPerTurn: config.advisorMaxUsesPerTurn,
       advisorMaxOutputTokens: config.advisorMaxOutputTokens,
       hiddenModels: config.hiddenModels,
@@ -2537,6 +2550,7 @@ export class Config {
     userPreferences?: unknown;
     advisorModelString?: string | null;
     advisorThinkingLevel?: string | null;
+    advisorReasoningMode?: OpenAIReasoningMode | null;
     advisorMaxUsesPerTurn?: number | null;
     advisorMaxOutputTokens?: number | null;
     agentAiDefaults?: unknown;
@@ -2569,6 +2583,9 @@ export class Config {
 
       if (input.advisorModelString !== undefined) {
         result.advisorModelString = parseOptionalNonEmptyString(input.advisorModelString);
+      }
+      if (input.advisorReasoningMode !== undefined) {
+        result.advisorReasoningMode = coerceOpenAIReasoningMode(input.advisorReasoningMode);
       }
       if (input.advisorThinkingLevel !== undefined) {
         result.advisorThinkingLevel = parseOptionalThinkingLevel(input.advisorThinkingLevel);
@@ -3195,6 +3212,7 @@ export class Config {
               aiSettings: workspace.aiSettings,
               heartbeat: normalizeWorkspaceMetadataHeartbeat(workspace.heartbeat, config),
               goalDefaults: workspace.goalDefaults,
+              // Display defaults stay ephemeral: no raw Exec bucket means no saved Exec choice.
               aiSettingsByAgent:
                 workspace.aiSettingsByAgent ??
                 (workspace.aiSettings
@@ -3218,6 +3236,7 @@ export class Config {
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
               taskIsolation: workspace.taskIsolation,
+              taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
               taskSticky: workspace.taskSticky,
               taskExecutionId: workspace.taskExecutionId,
               taskExecutionStatus: workspace.taskExecutionStatus,
@@ -3234,22 +3253,6 @@ export class Config {
               recordWorkspaceMigration(projectPath, workspace.path, (entry) => {
                 entry.createdAt ??= metadata.createdAt;
               });
-            }
-
-            // Migrate missing runtimeConfig to config for next load
-            if (!workspace.aiSettingsByAgent) {
-              const derived = workspace.aiSettings
-                ? {
-                    plan: workspace.aiSettings,
-                    exec: workspace.aiSettings,
-                  }
-                : undefined;
-              if (derived) {
-                workspace.aiSettingsByAgent = derived;
-                recordWorkspaceMigration(projectPath, workspace.path, (entry) => {
-                  entry.aiSettingsByAgent ??= derived;
-                });
-              }
             }
 
             if (!workspace.runtimeConfig) {
@@ -3370,6 +3373,7 @@ export class Config {
           }
           if (legacyMetadataRaw !== undefined) {
             const metadata = JSON.parse(legacyMetadataRaw) as WorkspaceMetadata;
+            const persistedAgentSettings = metadata.aiSettingsByAgent;
             this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
 
             // Ensure required fields are present
@@ -3447,10 +3451,11 @@ export class Config {
             metadata.createdAt = workspace.createdAt ?? metadata.createdAt;
             metadata.runtimeConfig = workspace.runtimeConfig ?? metadata.runtimeConfig;
 
-            if (!workspace.aiSettingsByAgent && metadata.aiSettingsByAgent) {
-              workspace.aiSettingsByAgent = metadata.aiSettingsByAgent;
+            // Migrate genuine metadata buckets, never the display fallback above.
+            if (!workspace.aiSettingsByAgent && persistedAgentSettings) {
+              workspace.aiSettingsByAgent = persistedAgentSettings;
               recordWorkspaceMigration(projectPath, workspace.path, (entry) => {
-                entry.aiSettingsByAgent ??= metadata.aiSettingsByAgent;
+                entry.aiSettingsByAgent ??= persistedAgentSettings;
               });
             }
 
@@ -3531,6 +3536,7 @@ export class Config {
               taskPrompt: workspace.taskPrompt,
               taskTrunkBranch: workspace.taskTrunkBranch,
               taskIsolation: workspace.taskIsolation,
+              taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
               taskSticky: workspace.taskSticky,
               taskExecutionId: workspace.taskExecutionId,
               taskExecutionStatus: workspace.taskExecutionStatus,
@@ -3607,6 +3613,7 @@ export class Config {
             taskPrompt: workspace.taskPrompt,
             taskTrunkBranch: workspace.taskTrunkBranch,
             taskIsolation: workspace.taskIsolation,
+            taskDesktopOwnerWorkspaceId: workspace.taskDesktopOwnerWorkspaceId,
             taskSticky: workspace.taskSticky,
             taskExecutionId: workspace.taskExecutionId,
             taskExecutionStatus: workspace.taskExecutionStatus,
@@ -3704,6 +3711,7 @@ export class Config {
         taskPrompt: metadata.taskPrompt,
         taskTrunkBranch: metadata.taskTrunkBranch,
         taskIsolation: metadata.taskIsolation,
+        taskDesktopOwnerWorkspaceId: metadata.taskDesktopOwnerWorkspaceId,
         taskSticky: metadata.taskSticky,
         taskExecutionId: metadata.taskExecutionId,
         taskExecutionStatus: metadata.taskExecutionStatus,

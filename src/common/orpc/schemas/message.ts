@@ -85,12 +85,12 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 
-export const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
+const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
-export const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
+const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
   state: z.literal("output-redacted"),
   failed: z.boolean().optional(),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
@@ -111,7 +111,6 @@ export const MuxFilePartSchema = FilePartSchema.extend({
 
 // Export types inferred from schemas for reuse across app/test code.
 export type FilePart = z.infer<typeof FilePartSchema>;
-export type MuxFilePart = z.infer<typeof MuxFilePartSchema>;
 
 const CompactionEpochSchema = z.optional(
   z.preprocess(
@@ -153,6 +152,8 @@ export const MuxMessageSchema = z.object({
   metadata: z
     .object({
       historySequence: z.number().optional(),
+      // Step cuts are an optimization; malformed legacy metadata must not block chat replay.
+      stepStartPartIndices: z.array(z.number()).optional().catch(undefined),
       timestamp: z.number().optional(),
       model: z.string().optional(),
       metadataModel: z.string().optional(),

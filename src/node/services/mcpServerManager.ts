@@ -536,8 +536,6 @@ async function extractBearerOauthChallenge(options: {
   };
 }
 
-export type { MCPTestResult } from "@/common/types/mcp";
-
 /** Shell command + exec options composed for a stdio server launch. */
 interface StdioLaunch {
   command: string;
@@ -1633,6 +1631,9 @@ export class MCPServerManager {
 
     const result: MCPServerMap = {};
     for (const [name, info] of Object.entries(servers)) {
+      // Checkout-local overrides can be tracked by an untrusted contributor. They
+      // must not grant access to borrowed credentials without backend user enablement.
+      if (info.transport !== "stdio" && info.managed === "claude-design" && info.disabled) continue;
       // Workspace overrides take precedence
       if (enabledSet.has(name)) {
         // Explicitly enabled at workspace level (overrides project disabled)
@@ -1680,11 +1681,11 @@ export class MCPServerManager {
     // - If neither: no filtering
     let effectiveAllowlist: Set<string> | null = null;
 
-    if (projectAllowlist && projectAllowlist.length > 0 && workspaceAllowlist) {
+    if (projectAllowlist && workspaceAllowlist) {
       // Intersection of both allowlists
       const projectSet = new Set(projectAllowlist);
       effectiveAllowlist = new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
-    } else if (projectAllowlist && projectAllowlist.length > 0) {
+    } else if (projectAllowlist) {
       effectiveAllowlist = new Set(projectAllowlist);
     } else if (workspaceAllowlist) {
       effectiveAllowlist = new Set(workspaceAllowlist);
@@ -2578,6 +2579,14 @@ export class MCPServerManager {
         continue;
       }
 
+      if (info.managed === "claude-design") {
+        signatureEntries[name] = {
+          transport: "http",
+          managed: info.managed,
+          generation: this.configService.claudeDesign.generation,
+        };
+        continue;
+      }
       // OAuth status affects whether we can attach authProvider during server start.
       // Include this (redacted) information in the signature so we retry starting
       // remote servers after a user logs in/out.
@@ -3158,6 +3167,9 @@ export class MCPServerManager {
         return { success: false, error: "MCP transport is disabled by policy" };
       }
 
+      if (server.transport !== "stdio" && server.managed === "claude-design") {
+        return this.configService.claudeDesign.test();
+      }
       if (server.transport === "stdio") {
         const launch = await prepareStdioLaunch(server);
         return runServerTest(
@@ -3261,6 +3273,8 @@ export class MCPServerManager {
     const sortedInstances = [...instances.values()].sort((a, b) => a.name.localeCompare(b.name));
 
     for (const instance of sortedInstances) {
+      // A withdrawal can close an instance while the catalog is awaiting other servers.
+      if (instance.isClosed) continue;
       // Get project-level allowlist for this server
       const projectAllowlist = serverInfo[instance.name]?.toolAllowlist;
       // Apply tool allowlist filtering (project-level + workspace-level)
@@ -3827,14 +3841,18 @@ export class MCPServerManager {
     onAbortCleanup?: (cleanupPromise: Promise<void>) => void
   ): Promise<MCPServerInstance | null> {
     const { headers } = resolveHeaders(info.headers, projectSecrets);
+    const design = info.managed === "claude-design" ? this.configService.claudeDesign : undefined;
+    const designGeneration = design?.generation;
 
     // Only attach authProvider when we have stored OAuth tokens for this server.
     // Passing an authProvider with no tokens can trigger user-interactive auth flows
     // on background MCP calls (undesirable).
-    const authProvider = await this.mcpOauthService?.getAuthProviderForServer({
-      serverName: name,
-      serverUrl: info.url,
-    });
+    const authProvider = design
+      ? undefined
+      : await this.mcpOauthService?.getAuthProviderForServer({
+          serverName: name,
+          serverUrl: info.url,
+        });
 
     if (signal.aborted) {
       return null;
@@ -3856,14 +3874,16 @@ export class MCPServerManager {
       }
     };
 
-    const transportBase = {
-      url: info.url,
-      headers,
-      ...(authProvider ? { authProvider } : {}),
-    };
+    const transportBase = design
+      ? design.transport(headers)
+      : {
+          url: info.url,
+          headers,
+          ...(authProvider ? { authProvider } : {}),
+        };
 
     const verdictKey = JSON.stringify(["remote", name, info.transport, info.url, headers ?? null]);
-    let prior = this.getCachedEraVerdict(verdictKey);
+    let prior = design ? { kind: "legacy" as const } : this.getCachedEraVerdict(verdictKey);
 
     const tryHttp = async () =>
       createMCPClient({
@@ -3953,11 +3973,13 @@ export class MCPServerManager {
       }
     };
 
+    // Observe sibling shutdown throughout cold startup, including tools/list.
+    const unsubscribeStartupDesign = design?.onChange(cleanupStartupClient);
     try {
       try {
         client = await establishClient();
       } catch (error) {
-        if (prior === undefined) {
+        if (prior === undefined || design) {
           throw error;
         }
         // A cached verdict of either kind can go stale without a config
@@ -4015,6 +4037,7 @@ export class MCPServerManager {
         protocolVersion: activeClient.negotiatedProtocolVersion(),
       });
 
+      let unsubscribeDesign: (() => void) | undefined;
       const instance: MCPServerInstance = {
         name,
         resolvedTransport,
@@ -4033,6 +4056,7 @@ export class MCPServerManager {
             }
           : {}),
         close: async () => {
+          unsubscribeDesign?.();
           // Mark closed first to prevent any new tool calls from being treated as
           // valid by higher-level caching logic.
           if (!clientClosed) {
@@ -4050,6 +4074,16 @@ export class MCPServerManager {
       };
 
       instanceRef.current = instance;
+      if (design) {
+        // Revalidate before publication even when filesystem notifications are unavailable.
+        await design.getStatus();
+        if (designGeneration !== design.generation) {
+          await instance.close();
+          return null;
+        }
+        unsubscribeDesign = design.onChange(() => instance.close());
+        design.markConnected(design.generation);
+      }
       return instance;
     } catch (error) {
       await cleanupStartupClient();
@@ -4058,6 +4092,7 @@ export class MCPServerManager {
       }
       throw error;
     } finally {
+      unsubscribeStartupDesign?.();
       signal.removeEventListener("abort", onAbort);
     }
   }

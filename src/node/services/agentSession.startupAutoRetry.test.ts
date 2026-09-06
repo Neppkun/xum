@@ -1,3 +1,5 @@
+import type { TurnCoordinator } from "./turnCoordinator";
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import {
@@ -513,12 +515,12 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(appendResult.success).toBe(true);
 
     const privateSession = session as unknown as {
-      setTurnPhase: (phase: "idle" | "preparing" | "streaming" | "completing") => void;
+      coordinator: TurnCoordinator;
       startupAutoRetryCheckPromise: Promise<void> | null;
       startupAutoRetryCheckScheduled: boolean;
     };
 
-    privateSession.setTurnPhase("preparing");
+    privateSession.coordinator.prepare();
     session.ensureStartupAutoRetryCheck();
 
     const firstCheckPromise = privateSession.startupAutoRetryCheckPromise;
@@ -527,7 +529,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(privateSession.startupAutoRetryCheckScheduled).toBe(false);
     expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(false);
 
-    privateSession.setTurnPhase("idle");
+    privateSession.coordinator.finishTurn(privateSession.coordinator.turnId);
 
     const deadline = Date.now() + 1500;
     while (
@@ -719,7 +721,7 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(scheduleCalls).toBe(1);
 
     aiStreaming = false;
-    aiEmitter.emit("stream-abort", {
+    void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-abort",
       workspaceId,
       messageId: "assistant-1",
@@ -1748,16 +1750,16 @@ describe("AgentSession startup auto-retry recovery", () => {
     });
 
     const privateSession = session as unknown as {
-      setTurnPhase: (phase: "idle" | "preparing" | "streaming" | "completing") => void;
+      coordinator: TurnCoordinator;
       activeStreamUserMessageId?: string;
       getAutoRetryPreferencePath: () => string;
       startupAutoRetryAbandon: { reason: string; userMessageId?: string } | null;
     };
 
     privateSession.activeStreamUserMessageId = "user-1";
-    privateSession.setTurnPhase("preparing");
+    privateSession.coordinator.prepare();
 
-    aiEmitter.emit("stream-abort", {
+    void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-abort",
       workspaceId,
       messageId: "assistant-1",

@@ -1,3 +1,10 @@
+import {
+  applyCacheControl,
+  getAnthropicCacheTtl,
+  supportsAnthropicCache,
+} from "@/common/utils/ai/cacheStrategy";
+import { stripMessageCacheControl, type ContinuousPrefixSwap } from "./continuousCompactionJournal";
+import type { PrefixSwapInvalidatedEvent } from "@/common/types/stream";
 import * as path from "path";
 import { Duration, Effect, Exit, Fiber, Scope } from "effect";
 import { PlatformPaths } from "@/common/utils/paths";
@@ -47,7 +54,7 @@ import {
   reasoningProviderOptionsFromMetadata,
   type ReasoningProviderMetadata,
 } from "@/node/utils/messages/reasoningProviderOptions";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import { ThinkingLevelSchema, type ThinkingLevel } from "@/common/types/thinking";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
@@ -196,14 +203,21 @@ export type TurnEngineEvent =
   | ToolCallEndEvent
   | ReasoningDeltaEvent
   | ReasoningEndEvent
-  | WorkflowRunAttachedEvent;
+  | WorkflowRunAttachedEvent
+  | PrefixSwapInvalidatedEvent;
 
 export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<void>;
 
 // Turn identity lives on TurnStreamHandle.messageId; completions cannot diverge from it.
 export type TurnCompletion =
-  | { status: "completed" }
-  | { status: "aborted"; abortReason: StreamAbortReason }
+  | { status: "completed"; streamEnd: Omit<StreamEndEvent, "messageId"> }
+  | {
+      status: "aborted";
+      abortReason: StreamAbortReason;
+      // Absent for startup cancellation / cleanup without a delivered terminal event.
+      streamAbort?: Omit<StreamAbortEvent, "messageId" | "abortReason">;
+      systemMessageTokens?: number;
+    }
   | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
 
 export interface TurnStreamHandle {
@@ -276,9 +290,15 @@ type StreamRequestInput = StreamRequestOptions & {
 };
 
 interface StepMessageTracker {
+  workspaceId?: string;
+  pendingPrefixSwap?: ContinuousPrefixSwap;
+  consumedPrefixSwap?: ContinuousPrefixSwap;
+  prefixSwapInvalidated?: boolean;
+  prefixSwapInvalidationEmitted?: boolean;
   latestMessages?: ModelMessage[];
 }
 interface StreamRequestConfig {
+  cacheEnabled?: boolean;
   model: LanguageModel;
   messages: ModelMessage[];
   /** Provider-ready system instructions from TurnContextAssembler. */
@@ -678,6 +698,8 @@ interface WorkspaceStreamInfo {
   terminalRawFinishReason?: string;
   // Index into parts where the current step started (used to ensure safe retries)
   currentStepStartIndex: number;
+  // Exact SDK step starts; part shapes cannot distinguish consecutive tool-only steps.
+  stepStartIndices: number[];
   historySequence: number;
   // Track accumulated parts for partial message (includes reasoning, text, and tools)
   parts: CompletedMessagePart[];
@@ -887,6 +909,11 @@ export class StreamManager {
 
   setMockStreamLifecycle(lifecycle: MockStreamLifecycle | undefined): void {
     this.mockStreamLifecycle = lifecycle;
+  }
+
+  getStartupAbortReason(signal?: AbortSignal): StreamAbortReason {
+    const reason: unknown = signal?.reason;
+    return reason === "user" || reason === "system" || reason === "startup" ? reason : "startup";
   }
 
   beginStreamStart(input: {
@@ -1826,19 +1853,16 @@ export class StreamManager {
       return streamInfo.cancelPromise;
     }
     streamInfo.cancelPromise = (async () => {
+      streamInfo.state = StreamState.STOPPING;
       try {
-        streamInfo.state = StreamState.STOPPING;
-        // Flush any pending partial write immediately (preserves work on interruption)
+        // A failed best-effort flush must not prevent the provider from being stopped.
         await this.flushPartialWrite(workspaceId, streamInfo);
-
-        streamInfo.abortController.abort();
-
-        // Unlike checkSoftCancelStream, await cleanup (blocking)
-        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
       } catch (error) {
-        log.error("Error during stream cancellation:", error);
-        // Force cleanup even if cancellation fails
-        this.workspaceStreams.delete(workspaceId);
+        log.error("Failed to flush partial before cancellation", { error });
+      } finally {
+        streamInfo.abortController.abort();
+        // Unlike checkSoftCancelStream, await cleanup (blocking).
+        await this.cleanupAbortedStream(workspaceId, streamInfo, abortReason, abandonPartial);
       }
     })();
     return streamInfo.cancelPromise;
@@ -1856,7 +1880,9 @@ export class StreamManager {
 
       // Flush any pending partial write immediately (preserves work on interruption)
       await this.flushPartialWrite(workspaceId, streamInfo);
-
+    } catch (error) {
+      log.error("Failed to flush partial before soft cancellation", { error });
+    } finally {
       streamInfo.abortController.abort();
 
       // Return back to the stream loop so we can wait for it to finish before
@@ -1872,10 +1898,6 @@ export class StreamManager {
         abortReason,
         abandonPartial
       );
-    } catch (error) {
-      log.error("Error during stream cancellation:", error);
-      // Force cleanup even if cancellation fails
-      this.workspaceStreams.delete(workspaceId);
     }
   }
 
@@ -1888,7 +1910,13 @@ export class StreamManager {
     // CRITICAL: Wait for processing to fully complete before cleanup
     // This prevents race conditions where the old stream is still running
     // while a new stream starts (e.g., old stream writing to partial.json)
-    await streamInfo.processingPromise;
+    try {
+      await streamInfo.processingPromise;
+    } catch (error) {
+      // The provider has exited even when teardown failed. Cancellation still owns
+      // an aborted terminal unless the loop already published another outcome.
+      log.error("Stream processing failed during cancellation", { error });
+    }
 
     // The cancel lost the race: the loop had already left the fullStream and
     // finished as completed/failed (terminalCompletion set, stream-end/error
@@ -1908,7 +1936,6 @@ export class StreamManager {
     const usage = hasTokenUsage(streamInfo.cumulativeUsage)
       ? streamInfo.cumulativeUsage
       : undefined;
-    await this.backfillReasoningTokensFromParts(streamInfo, usage);
 
     // For context window display, use last step's usage (inputTokens = current context size)
     const contextUsage = streamInfo.lastStepUsage;
@@ -1920,47 +1947,81 @@ export class StreamManager {
       streamInfo.initialMetadata?.costsIncluded
     );
 
-    // Record session usage for aborted streams (mirrors stream-end path)
-    // This ensures tokens consumed before abort are tracked for cost display
-    await this.recordSessionUsage(
+    const streamAbort: StreamAbortEvent = {
+      type: "stream-abort",
       workspaceId,
-      streamInfo.model,
-      usage,
-      providerMetadata,
-      "Failed to record session usage on abort",
-      "error",
-      streamInfo
-    );
-
-    // Stamp the aborted turn's usage onto the partial message BEFORE emitting
-    // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
-    // prices history rows from metadata.usage, so without this every
-    // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
-    // would ingest as $0 even though the provider billed all completed steps.
-    if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+      messageId: streamInfo.messageId,
+      metadata: { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
+      abortReason,
+      abandonPartial,
+      acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+    };
+    try {
       try {
-        await this.awaitPendingPartialWrite(streamInfo);
-        const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
-          metadata: {
-            ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
-            ...(providerMetadata !== undefined ? { providerMetadata } : {}),
-            ...(contextUsage !== undefined ? { contextUsage } : {}),
-            ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
-            duration,
-            ...(streamInfo.toolModelUsages.length > 0
-              ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
-              : {}),
-          },
-        });
-        await this.historyService.writePartial(workspaceId as string, partialMessage);
+        await this.backfillReasoningTokensFromParts(streamInfo, usage);
+      } catch (error) {
+        // Estimation is optional: preserve provider usage and the user's abort reason.
+        log.error("Failed to estimate reasoning usage on abort", { error });
+      }
 
-        // Tool-only aborts (Esc while a tool is still running): commitPartial
-        // refuses to commit partials whose only parts are input-available tool
-        // calls, so the usage stamped above would die with the deleted
-        // partial. Route that spend through the headless-usage sidecar
-        // instead. Same predicate commitPartial applies, so exactly one of
-        // {chat row, sidecar row} carries this turn's usage.
-        if (!hasCommitWorthyParts(partialMessage.parts)) {
+      // Record session usage for aborted streams (mirrors stream-end path)
+      // This ensures tokens consumed before abort are tracked for cost display
+      await this.recordSessionUsage(
+        workspaceId,
+        streamInfo.model,
+        usage,
+        providerMetadata,
+        "Failed to record session usage on abort",
+        "error",
+        streamInfo
+      );
+
+      // Stamp the aborted turn's usage onto the partial message BEFORE emitting
+      // stream-abort (whose handler commits the partial to chat.jsonl). Analytics
+      // prices history rows from metadata.usage, so without this every
+      // interrupted turn — user Esc, queued tool-end preemption, monitor wakes —
+      // would ingest as $0 even though the provider billed all completed steps.
+      if (!abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+        try {
+          await this.awaitPendingPartialWrite(streamInfo);
+          const partialMessage = this.buildPartialAssistantMessage(streamInfo, {
+            metadata: {
+              ...(usage !== undefined ? { usage: cloneUsage(usage) } : {}),
+              ...(providerMetadata !== undefined ? { providerMetadata } : {}),
+              ...(contextUsage !== undefined ? { contextUsage } : {}),
+              ...(contextProviderMetadata !== undefined ? { contextProviderMetadata } : {}),
+              duration,
+              ...(streamInfo.toolModelUsages.length > 0
+                ? { toolModelUsages: streamInfo.toolModelUsages.map(clonePersistedToolModelUsage) }
+                : {}),
+            },
+          });
+          await this.historyService.writePartial(workspaceId as string, partialMessage);
+
+          // Tool-only aborts (Esc while a tool is still running): commitPartial
+          // refuses to commit partials whose only parts are input-available tool
+          // calls, so the usage stamped above would die with the deleted
+          // partial. Route that spend through the headless-usage sidecar
+          // instead. Same predicate commitPartial applies, so exactly one of
+          // {chat row, sidecar row} carries this turn's usage.
+          if (!hasCommitWorthyParts(partialMessage.parts)) {
+            await this.recordDroppedPartialUsageInSidecar(
+              workspaceId,
+              streamInfo,
+              usage,
+              providerMetadata,
+              "aborted_stream"
+            );
+          }
+        } catch (error) {
+          log.error("Failed to persist aborted-stream usage on partial message", { error });
+        }
+      } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
+        // Abandoned aborts (edit/discard of the streaming turn): the partial is
+        // deliberately dropped and its content never reaches chat.jsonl, but
+        // the provider still billed every completed step. The sidecar is the
+        // only route to the events table for this spend.
+        try {
           await this.recordDroppedPartialUsageInSidecar(
             workspaceId,
             streamInfo,
@@ -1968,50 +2029,36 @@ export class StreamManager {
             providerMetadata,
             "aborted_stream"
           );
+        } catch (error) {
+          log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
         }
-      } catch (error) {
-        log.error("Failed to persist aborted-stream usage on partial message", { error });
       }
-    } else if (abandonPartial && (usage !== undefined || streamInfo.toolModelUsages.length > 0)) {
-      // Abandoned aborts (edit/discard of the streaming turn): the partial is
-      // deliberately dropped and its content never reaches chat.jsonl, but
-      // the provider still billed every completed step. The sidecar is the
-      // only route to the events table for this spend.
-      try {
-        await this.recordDroppedPartialUsageInSidecar(
-          workspaceId,
-          streamInfo,
-          usage,
-          providerMetadata,
-          "aborted_stream"
-        );
-      } catch (error) {
-        log.error("Failed to record abandoned-abort usage in headless sidecar", { error });
+    } catch (error) {
+      log.error("Failed abort bookkeeping; delivering preserved terminal metadata", { error });
+    } finally {
+      // Emit abort asynchronously as before; completion settles only after the facade's
+      // partial cleanup and external stream-abort emission have finished.
+      const abortDelivery = (async () => this.eventSink(streamAbort))();
+
+      // Clean up immediately
+      if (this.workspaceStreams.get(workspaceId) === streamInfo) {
+        this.workspaceStreams.delete(workspaceId);
       }
+      void abortDelivery
+        .catch((error) => {
+          // Contain sink rejections: .finally alone would re-propagate them as
+          // an unhandled rejection after completion settles.
+          log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
+        })
+        .finally(() => {
+          streamInfo.completionController?.settle({
+            status: "aborted",
+            abortReason,
+            streamAbort,
+            systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens,
+          });
+        });
     }
-
-    // Emit abort asynchronously as before; completion settles only after the facade's
-    // partial cleanup and external stream-abort emission have finished.
-    const abortDelivery = this.emitStreamAbort(
-      workspaceId,
-      streamInfo.messageId,
-      { usage, contextUsage, duration, providerMetadata, contextProviderMetadata },
-      abortReason,
-      abandonPartial,
-      streamInfo.initialMetadata?.acpPromptId
-    );
-
-    // Clean up immediately
-    this.workspaceStreams.delete(workspaceId);
-    void abortDelivery
-      .catch((error) => {
-        // Contain sink rejections: .finally alone would re-propagate them as
-        // an unhandled rejection after completion settles.
-        log.error("Stream-abort delivery failed", { error: getErrorMessage(error) });
-      })
-      .finally(() => {
-        streamInfo.completionController?.settle({ status: "aborted", abortReason });
-      });
   }
 
   /**
@@ -2174,6 +2221,7 @@ export class StreamManager {
       model,
       messages,
       system,
+      cacheEnabled: supportsAnthropicCache(modelString, requestProvidersConfig),
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
       tools: withSequentialExecution(tools, onToolExecutionStart),
@@ -2297,6 +2345,80 @@ export class StreamManager {
     return rebuilt.providerOptions;
   }
 
+  getPrefixSwapPreparation(workspaceId: string) {
+    const info = this.workspaceStreams.get(workspaceId as WorkspaceId);
+    if (!info) return null;
+    return {
+      requestProviderOptions: info.request.providerOptions,
+      systemPrefix: info.request.messages.filter((message) => message.role === "system"),
+      cacheEnabled: info.request.cacheEnabled ?? false,
+      preparation: {
+        effectiveAgentId: info.initialMetadata?.agentId ?? "exec",
+        toolNamesForSentinel: Object.keys(info.request.tools ?? {}),
+        effectiveThinkingLevel: ThinkingLevelSchema.parse(info.thinkingLevel ?? "off"),
+        modelString: info.model,
+        providerForMessages: info.metadataModel.split(":", 1)[0],
+        anthropicCacheTtl: getAnthropicCacheTtl(info.request.providerOptions),
+      },
+    };
+  }
+
+  setPrefixSwap(workspaceId: string, swap: ContinuousPrefixSwap): boolean {
+    const stream = this.workspaceStreams.get(workspaceId as WorkspaceId);
+    if (
+      !stream ||
+      stream.messageId !== swap.journal.streamMessageId ||
+      stream.model !== swap.journal.parentModel ||
+      (stream.thinkingLevel ?? "off") !== swap.journal.preparation.effectiveThinkingLevel ||
+      stream.stepTracker.pendingPrefixSwap ||
+      stream.stepTracker.consumedPrefixSwap
+    )
+      return false;
+    stream.stepTracker.pendingPrefixSwap = swap;
+    return true;
+  }
+
+  clearPrefixSwap(workspaceId: string): void {
+    const tracker = this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker;
+    if (tracker) {
+      tracker.pendingPrefixSwap = undefined;
+      tracker.consumedPrefixSwap = undefined;
+    }
+  }
+
+  getPrefixSwapState(workspaceId: string): "none" | "pending" | "consumed" | "invalidated" {
+    const tracker = this.workspaceStreams.get(workspaceId as WorkspaceId)?.stepTracker;
+    return tracker?.prefixSwapInvalidated
+      ? "invalidated"
+      : tracker?.consumedPrefixSwap
+        ? "consumed"
+        : tracker?.pendingPrefixSwap
+          ? "pending"
+          : "none";
+  }
+
+  private swapPrefix(messages: ModelMessage[], swap: ContinuousPrefixSwap): ModelMessage[] | null {
+    // Reused IDs can name different turns or steps. Neither oldest nor newest
+    // proves the cut: ambiguity must use P1 instead of dropping or restoring context.
+    let index = -1;
+    for (const [messageIndex, message] of messages.entries()) {
+      if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+      for (const part of message.content) {
+        if (part.type !== "tool-call" || part.toolCallId !== swap.firstTailToolCallId) continue;
+        if (index !== -1) {
+          log.warn("[continuous-compaction] ambiguous prefix locator; retaining full context");
+          return null;
+        }
+        index = messageIndex;
+      }
+    }
+    if (index < 0) {
+      log.warn("[continuous-compaction] prefix locator missing; retaining full context");
+      return null;
+    }
+    return [...swap.prefix, ...stripMessageCacheControl(messages.slice(index))];
+  }
+
   private createStreamResult(
     request: StreamRequestConfig,
     abortController: AbortController,
@@ -2322,7 +2444,60 @@ export class StreamManager {
         const withoutWorkflowRunRecords = stripWorkflowRunRecordsFromModelMessages(stepMessages);
         const rewritten =
           await extractToolMediaAsUserMessagesFromModelMessages(withoutWorkflowRunRecords);
-        const effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
+        let effectiveMessages = rewritten === stepMessages ? stepMessages : rewritten;
+        if (stepTracker?.prefixSwapInvalidated) {
+          // Cross-family fallback must not send the old provider's cached prefix.
+          // Release only on the session's stop, after fallback reset/locks have completed.
+          if (!abortController.signal.aborted) {
+            await new Promise<void>((resolve) =>
+              abortController.signal.addEventListener("abort", () => resolve(), { once: true })
+            );
+          }
+          throw abortController.signal.reason ?? new Error("Prefix swap invalidated");
+        }
+        // The staged prefix was prepared under the previous thinking options.
+        // Keep full context if those options change before the swap is consumed.
+        const pendingSwap = stepTracker?.pendingPrefixSwap;
+        const appliedThinking = request.thinkingOverrideState?.applied;
+        if (
+          stepTracker &&
+          (request.thinkingOverrideState?.pending != null ||
+            (pendingSwap &&
+              appliedThinking != null &&
+              appliedThinking !== pendingSwap.journal.preparation.effectiveThinkingLevel))
+        ) {
+          stepTracker.pendingPrefixSwap = undefined;
+        }
+        const swap = stepTracker?.pendingPrefixSwap;
+        if (swap && stepTracker?.workspaceId) {
+          const swapped = this.swapPrefix(effectiveMessages, swap);
+          if (swapped) {
+            const store = this.historyService.getContinuousCompactionJournal(
+              stepTracker.workspaceId
+            );
+            const thinkingLevel = request.thinkingOverrideState?.applied;
+            const isCurrent = () =>
+              stepTracker.pendingPrefixSwap === swap &&
+              !abortController.signal.aborted &&
+              request.thinkingOverrideState?.pending == null &&
+              request.thinkingOverrideState?.applied === thinkingLevel;
+            const journal = await store.write(
+              { ...swap.journal, stepNumber },
+              swap.prefix,
+              isCurrent
+            );
+            if (journal && isCurrent()) {
+              swap.journal = journal;
+              swap.consumed = true;
+              stepTracker.consumedPrefixSwap = swap;
+              effectiveMessages = swapped;
+            } else if (journal && stepTracker.pendingPrefixSwap === swap) {
+              // A thinking change can also arrive after write()'s last fence.
+              await store.clear();
+            }
+          }
+          if (stepTracker.pendingPrefixSwap === swap) stepTracker.pendingPrefixSwap = undefined;
+        }
         if (stepTracker) {
           stepTracker.latestMessages = effectiveMessages;
         }
@@ -2352,6 +2527,7 @@ export class StreamManager {
         if (
           thinkingOverride !== undefined &&
           stepNumber === 0 &&
+          !stepTracker?.consumedPrefixSwap &&
           request.rebuildFirstStepForThinkingLevel != null &&
           appliedLevel != null
         ) {
@@ -2380,7 +2556,7 @@ export class StreamManager {
           }
         }
         if (
-          rewritten === stepMessages &&
+          effectiveMessages === stepMessages &&
           activeTools === undefined &&
           thinkingOverride === undefined
         ) {
@@ -2389,9 +2565,9 @@ export class StreamManager {
         return {
           ...(rebuiltFirstStepMessages != null
             ? { messages: rebuiltFirstStepMessages }
-            : rewritten === stepMessages
+            : effectiveMessages === stepMessages
               ? {}
-              : { messages: rewritten }),
+              : { messages: effectiveMessages }),
           ...(forceFirstStepTools !== undefined ? { toolChoice: "required" as const } : {}),
           ...(activeTools !== undefined ? { activeTools } : {}),
           // Defense in depth: the in-place request mutation is authoritative
@@ -2439,7 +2615,7 @@ export class StreamManager {
       maxOutputTokens,
       runtime,
     } = options;
-    const stepTracker: StepMessageTracker = {};
+    const stepTracker: StepMessageTracker = { workspaceId: options.workspaceId };
     const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
     const request = this.buildStreamRequestConfig({
       ...options,
@@ -2494,6 +2670,7 @@ export class StreamManager {
       stepTracker,
       receivedTerminalEvent: false,
       currentStepStartIndex: 0,
+      stepStartIndices: [0],
       request,
       historySequence,
       parts: [], // Initialize empty parts array
@@ -3057,6 +3234,9 @@ export class StreamManager {
         }),
         partial: true,
         ...options.metadata,
+        stepStartPartIndices: streamInfo.stepStartIndices.filter(
+          (index) => index < (options.parts ?? streamInfo.parts).length
+        ),
       },
       parts: options.parts ?? streamInfo.parts,
     };
@@ -3187,6 +3367,7 @@ export class StreamManager {
             ...(thinkingLevelOverride != null ? { thinkingLevelOverride } : {}),
           }
         : undefined;
+    streamInfo.stepTracker.pendingPrefixSwap = undefined;
     let prepared: Result<PreparedModelFallback, string>;
     try {
       prepared = await fallbackState.options.prepare(nextModelString, prepareCallOptions);
@@ -3237,6 +3418,63 @@ export class StreamManager {
       providersConfigSnapshot: prepared.data.providersConfig,
       rebuildFirstStepForThinkingLevel: prepared.data.rebuildFirstStepForThinkingLevel,
     });
+    const consumedSwap = streamInfo.stepTracker.consumedPrefixSwap;
+    if (consumedSwap) {
+      const family = this.resolveMetadataModel(
+        prepared.data.modelString,
+        prepared.data.providersConfig
+      ).split(":", 1)[0];
+      // Fallback preparation can combine consecutive tool-only steps from the live
+      // Mux row. An internal cut is no longer a provable wire-message boundary.
+      let messages: ModelMessage[] | null = null;
+      if (
+        family === consumedSwap.journal.providerFamily &&
+        consumedSwap.journal.liveTailCopySpec.partIndex === 0 &&
+        (prepared.data.thinkingLevel ?? "off") ===
+          consumedSwap.journal.preparation.effectiveThinkingLevel
+      ) {
+        const conversation = stripMessageCacheControl(
+          consumedSwap.prefix.filter((message) => message.role !== "system")
+        );
+        const prefix = [
+          ...nextRequest.messages.filter((message) => message.role === "system"),
+          ...(nextRequest.cacheEnabled
+            ? applyCacheControl(
+                conversation,
+                "anthropic:prefix",
+                getAnthropicCacheTtl(nextRequest.providerOptions)
+              )
+            : conversation),
+        ];
+        const swapped = this.swapPrefix(nextRequest.messages, { ...consumedSwap, prefix });
+        if (swapped) {
+          const appliedThinking = nextRequest.thinkingOverrideState?.applied;
+          const isCurrent = () =>
+            streamInfo.stepTracker.consumedPrefixSwap === consumedSwap &&
+            !streamInfo.abortController.signal.aborted &&
+            nextRequest.thinkingOverrideState?.pending == null &&
+            nextRequest.thinkingOverrideState?.applied === appliedThinking;
+          const journal = await this.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .recordFallbackPrefix(
+              consumedSwap.journal,
+              {
+                modelString: prepared.data.modelString,
+                prefix,
+                providerOptions: nextRequest.providerOptions,
+                system: nextRequest.system,
+              },
+              isCurrent
+            );
+          if (journal && isCurrent()) {
+            consumedSwap.journal = journal;
+            messages = swapped;
+          }
+        }
+      }
+      if (messages) nextRequest.messages = messages;
+      else streamInfo.stepTracker.prefixSwapInvalidated = true;
+    }
     // createStreamResult may eagerly prepare the first fallback step and update
     // latestMessages. Clear stale source-step messages before starting it so a
     // later disk-reset await cannot wipe freshly prepared fallback messages.
@@ -3284,7 +3522,6 @@ export class StreamManager {
       preserveParts,
       workspaceLog,
     });
-    streamInfo.currentStepStartIndex = streamInfo.parts.length;
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
 
     streamInfo.model = prepared.data.modelString;
@@ -3312,6 +3549,18 @@ export class StreamManager {
     streamInfo.request = nextRequest;
     streamInfo.streamResult = nextStreamResult;
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
+    if (
+      consumedSwap &&
+      streamInfo.stepTracker.prefixSwapInvalidated &&
+      !streamInfo.stepTracker.prefixSwapInvalidationEmitted
+    ) {
+      streamInfo.stepTracker.prefixSwapInvalidationEmitted = true;
+      this.emitTurnEvent({
+        type: "prefix-swap-invalidated",
+        workspaceId,
+        messageId: streamInfo.messageId,
+      });
+    }
 
     return { kind: "swapped" };
   }
@@ -3380,7 +3629,6 @@ export class StreamManager {
       preserveUsage: true,
       workspaceLog,
     });
-    streamInfo.currentStepStartIndex = 0;
     streamInfo.streamResult = this.createStreamResult(
       streamInfo.request,
       streamInfo.abortController,
@@ -3435,7 +3683,7 @@ export class StreamManager {
 
             switch (part.type) {
               case "start-step": {
-                streamInfo.currentStepStartIndex = streamInfo.parts.length;
+                this.recordStepStart(streamInfo);
                 break;
               }
 
@@ -4036,6 +4284,9 @@ export class StreamManager {
                 metadata: {
                   ...streamEndEvent.metadata,
                   historySequence: streamInfo.historySequence,
+                  stepStartPartIndices: streamInfo.stepStartIndices.filter(
+                    (index) => index < streamInfo.parts.length
+                  ),
                 },
                 parts: streamInfo.parts,
               };
@@ -4088,7 +4339,7 @@ export class StreamManager {
             // before updateHistory completes, compaction can clear the file and then
             // updateHistory writes stale data back.
             this.emitTurnEvent(streamEndEvent);
-            streamInfo.terminalCompletion = { status: "completed" };
+            streamInfo.terminalCompletion = { status: "completed", streamEnd: streamEndEvent };
           }
           break;
         } catch (error) {
@@ -4463,11 +4714,20 @@ export class StreamManager {
     };
   }
 
+  private recordStepStart(streamInfo: WorkspaceStreamInfo): void {
+    const start = streamInfo.parts.length;
+    // Retries may discard parts. Drop stale/duplicate starts before reseeding.
+    streamInfo.stepStartIndices = streamInfo.stepStartIndices.filter((index) => index < start);
+    streamInfo.stepStartIndices.push(start);
+    streamInfo.currentStepStartIndex = start;
+  }
+
   private async resetStreamStateForRetry(
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
     options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
   ): Promise<void> {
+    streamInfo.stepTracker.pendingPrefixSwap = undefined;
     const preserveParts = options?.preserveParts ?? false;
     const preserveUsage = options?.preserveUsage ?? false;
 
@@ -4482,6 +4742,7 @@ export class StreamManager {
     if (!preserveParts) {
       streamInfo.reasoningBackfillStartIndex = undefined;
     }
+    this.recordStepStart(streamInfo);
     streamInfo.receivedTerminalEvent = false;
     streamInfo.terminalFinishReason = undefined;
     streamInfo.terminalRawFinishReason = undefined;
@@ -4585,7 +4846,6 @@ export class StreamManager {
       workspaceLog,
     });
 
-    streamInfo.currentStepStartIndex = streamInfo.parts.length;
     streamInfo.request = {
       ...streamInfo.request,
       ...(stepMessages ? { messages: stepMessages } : {}),
@@ -4821,7 +5081,10 @@ export class StreamManager {
     const completionController = createTurnCompletionController();
     const handle: TurnStreamHandle = { messageId, completion: completionController.promise };
     const settleStartupAbort = (): Result<TurnStreamHandle, SendMessageError> => {
-      completionController.settle({ status: "aborted", abortReason: "startup" });
+      completionController.settle({
+        status: "aborted",
+        abortReason: this.getStartupAbortReason(abortSignal),
+      });
       return Ok(handle);
     };
 
@@ -4985,7 +5248,10 @@ export class StreamManager {
       // No handle is handed out on this path, so the completion is observed only
       // by a supervisor forked at registration: settle it so that fiber exits
       // instead of cancelling this never-started stream at shutdown.
-      completionController.settle({ status: "aborted", abortReason: "startup" });
+      completionController.settle({
+        status: "aborted",
+        abortReason: this.getStartupAbortReason(abortSignal),
+      });
       // Convert to strongly-typed error
       return Err(this.convertToSendMessageError(error));
     }
@@ -5212,7 +5478,7 @@ export class StreamManager {
       : this.isStreaming(workspaceId);
 
     if (pending) {
-      pending.abortController.abort();
+      pending.abortController.abort(options?.abortReason ?? "startup");
       if (!isActuallyStreaming) {
         await this.emitStreamAbort(
           typedWorkspaceId,
@@ -5310,6 +5576,9 @@ export class StreamManager {
         historySequence: number;
         startTime: number;
         parts: CompletedMessagePart[];
+        currentStepStartIndex: number;
+        stepStartIndices: number[];
+        initialMetadata?: { systemMessageTokens?: number };
         toolCompletionTimestamps: Map<string, number>;
         muxMetadata?: unknown;
       }
@@ -5329,6 +5598,9 @@ export class StreamManager {
         startTime: streamInfo.startTime,
         toolCompletionTimestamps: streamInfo.toolCompletionTimestamps ?? new Map(),
         parts: streamInfo.parts,
+        currentStepStartIndex: streamInfo.currentStepStartIndex,
+        stepStartIndices: streamInfo.stepStartIndices.slice(),
+        initialMetadata: { systemMessageTokens: streamInfo.initialMetadata?.systemMessageTokens },
         // Correlation metadata for delegated work (e.g. workspace-turn
         // continuations); lets TaskService match a live continuation stream
         // to its still-open workspace-turn handle.
