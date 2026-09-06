@@ -70,8 +70,6 @@ export interface ResolveAgentOptions {
   emitError: (event: ErrorEvent) => void;
   /** Whether the advisor-tool experiment is enabled (from ExperimentsService). */
   isAdvisorExperimentEnabled?: boolean;
-  /** Whether token-budget history recovery is available as a baseline tool. */
-  sessionHistoryEnabled?: boolean;
   /** agent-plugins experiment: also resolve agents contributed by Agent Plugins. */
   includeAgentPlugins?: boolean;
 }
@@ -499,7 +497,6 @@ export async function resolveAgentForStream(
     isSubagent: isSubagentWorkspace,
     disableTaskToolsForDepth: shouldDisableTaskToolsForDepth,
     advisorEnabled,
-    sessionHistoryEnabled: opts.sessionHistoryEnabled,
   });
 
   // Caller require policies (e.g. task completion enforcement) must take precedence.

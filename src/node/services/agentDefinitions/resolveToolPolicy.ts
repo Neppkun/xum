@@ -24,8 +24,6 @@ export interface ResolveToolPolicyOptions {
   disableTaskToolsForDepth: boolean;
   /** Whether the advisor tool is eligible for this agent (experiment on + per-agent config) */
   advisorEnabled?: boolean;
-  /** Add recovery to the baseline before explicit agent and caller rules narrow it. */
-  sessionHistoryEnabled?: boolean;
 }
 
 // Tools that are never allowed in autonomous sub-agent flows.
@@ -77,12 +75,9 @@ function matchesSubagentHardDeniedTool(pattern: string): boolean {
 export function resolveToolPolicyForAgent(options: ResolveToolPolicyOptions): ToolPolicy {
   const { agents, isSubagent, disableTaskToolsForDepth } = options;
 
-  // Start with deny-all baseline
+  // History recovery uses the deny-all baseline too: enabling its experiment
+  // must not widen a deliberately narrow agent allowlist.
   const agentPolicy: ToolPolicy = [{ regex_match: ".*", action: "disable" }];
-  // Recovery survives implicit allowlist omission, never an explicit regex denial.
-  if (options.sessionHistoryEnabled) {
-    agentPolicy.push({ regex_match: "session_history", action: "enable" });
-  }
 
   // Process inheritance chain: base → child
   const configs = collectToolConfigsFromResolvedChain(agents);

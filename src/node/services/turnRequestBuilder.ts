@@ -1316,7 +1316,6 @@ export class TurnRequestBuilder {
         onPreStartError?.(event);
       },
       isAdvisorExperimentEnabled: advisorExperimentEnabled,
-      sessionHistoryEnabled,
       includeAgentPlugins: agentPluginsExperimentEnabled,
     });
     recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);

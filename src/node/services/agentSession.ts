@@ -3,7 +3,7 @@ import { createContextBudgetRejectedMessage } from "@/common/utils/messages/cont
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { randomUUID } from "crypto";
 import { sandboxHostService } from "./sandbox/sandboxHostService";
-import { isSessionHistoryExplicitlyDisabled } from "@/common/utils/tools/toolPolicy";
+import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
 import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
@@ -4753,10 +4753,10 @@ export class AgentSession {
       message:
         "Context budget reached, but session_history is disabled. Enable it, use /compact, or /clear --soft.",
     });
-    if (isSessionHistoryExplicitlyDisabled(options?.toolPolicy)) {
+    if (isSessionHistoryDisabled(options?.toolPolicy)) {
       return blocked;
     }
-    // Agent removals are absent from caller options. Resolve them before sealing
+    // Agent allowlists and removals are absent from caller options. Resolve them before sealing
     // history, including after restart or switching agents between turns.
     try {
       const metadata = await this.aiService.getWorkspaceMetadata(this.workspaceId);
@@ -4775,12 +4775,9 @@ export class AgentSession {
           options?.experiments?.advisorTool ??
           this.aiService.isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
         includeAgentPlugins: this.aiService.isAgentPluginsEnabled?.() ?? false,
-        sessionHistoryEnabled: true,
       });
       if (!resolved.success) return Err(resolved.error);
-      return isSessionHistoryExplicitlyDisabled(resolved.data.effectiveToolPolicy)
-        ? blocked
-        : Ok(undefined);
+      return isSessionHistoryDisabled(resolved.data.effectiveToolPolicy) ? blocked : Ok(undefined);
     } catch (error) {
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
@@ -5107,8 +5104,7 @@ export class AgentSession {
           decision.projected,
           maxTokens,
           this.contextBudgetMemoryWritable,
-          this.contextBudgetHistoryAvailable &&
-            !isSessionHistoryExplicitlyDisabled(options.toolPolicy)
+          this.contextBudgetHistoryAvailable && !isSessionHistoryDisabled(options.toolPolicy)
         ),
       ]);
     }

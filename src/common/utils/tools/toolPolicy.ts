@@ -79,6 +79,6 @@ export function applyToolPolicy(
 }
 
 /** Rollover must honor the same last-match regex policy as tool assembly. */
-export function isSessionHistoryExplicitlyDisabled(policy?: ToolPolicy): boolean {
+export function isSessionHistoryDisabled(policy?: ToolPolicy): boolean {
   return applyToolPolicyToNames(["session_history"], policy).length === 0;
 }

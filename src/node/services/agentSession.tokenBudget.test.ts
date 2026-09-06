@@ -1154,6 +1154,36 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
+  test.each([
+    { add: [], allowed: false },
+    { add: ["file_read"], allowed: false },
+    { add: ["file_read", "session_history"], allowed: true },
+    { add: ["file_read", "session_.*"], allowed: true },
+  ])("custom allowlists gate on-send and emergency rollover: $add", async ({ add, allowed }) => {
+    for (const emergency of [false, true]) {
+      const h = await setup(
+        emergency ? { failure: (attempt) => (attempt === 1 ? exceeded : undefined) } : undefined
+      );
+      const agentsDir = path.join(h.config.rootDir, ".xum", "agents");
+      await fs.mkdir(agentsDir, { recursive: true });
+      await fs.writeFile(
+        path.join(agentsDir, "restricted.md"),
+        `---\nname: Restricted\ntools:\n  add: ${JSON.stringify(add)}\n---\nRestricted agent.\n`
+      );
+      await seedHistory(h, emergency ? 20_000 : 110_000);
+      const result = await h.session.sendMessage("Preserve access", {
+        ...options,
+        agentId: "restricted",
+      });
+      expect(result.success).toBe(allowed);
+      if (!allowed) {
+        expect(result).toMatchObject({ error: { type: "context_budget_blocked" } });
+      }
+      expect(h.requests).toHaveLength(Number(emergency) + Number(allowed));
+      expect(rolloverRows(await allRows(h))).toHaveLength(Number(allowed));
+    }
+  });
+
   test("emergency rollover preserves accepted assistant payloads and fixed trigger references", async () => {
     const h = await setup({ failure: (attempt) => (attempt === 1 ? exceeded : undefined) });
     await seedHistory(h, 20_000);

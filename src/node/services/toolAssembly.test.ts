@@ -1,5 +1,7 @@
 import { resolveToolPolicyForAgent } from "./agentDefinitions/resolveToolPolicy";
-import { isSessionHistoryExplicitlyDisabled } from "@/common/utils/tools/toolPolicy";
+import { isSessionHistoryDisabled } from "@/common/utils/tools/toolPolicy";
+import { resolveAgentFrontmatter } from "./agentDefinitions/agentDefinitionsService";
+import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { ToolBridge } from "./ptc/toolBridge";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fsPromises from "node:fs/promises";
@@ -547,35 +549,56 @@ describe("resolveBackendGatedPtcExperiments", () => {
 });
 
 describe("token budget history policy", () => {
-  test.each(["plan", "explore", "custom"])(
-    "%s allowlist omission does not hide recovery",
-    async (agent) => {
-      const resolvePolicy = (sessionHistoryEnabled: boolean) =>
-        resolveToolPolicyForAgent({
-          agents: [
-            { tools: { add: agent === "plan" ? ["file_read", "propose_plan"] : ["file_read"] } },
-          ],
-          isSubagent: agent === "explore",
-          disableTaskToolsForDepth: false,
-          sessionHistoryEnabled,
-        });
-      const policy = resolvePolicy(true);
-      expect(isSessionHistoryExplicitlyDisabled(policy)).toBe(false);
+  test.each([
+    { add: [], allowed: false },
+    { add: ["file_read"], allowed: false },
+    { add: ["session_history"], allowed: true },
+    { add: ["session_.*"], allowed: true },
+    { add: [".*"], allowed: true },
+  ])("recovery follows the agent allowlist: $add", async ({ add, allowed }) => {
+    const policy = resolveToolPolicyForAgent({
+      agents: [{ tools: { add } }],
+      isSubagent: false,
+      disableTaskToolsForDepth: false,
+    });
+    expect(isSessionHistoryDisabled(policy)).toBe(!allowed);
+    const history = executableTool("History");
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { session_history: history, file_read: executableTool("Read") },
+      effectiveToolPolicy: policy,
+      experiments: { tokenBudget: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    if (allowed) {
+      expect(result.session_history).toBe(history);
+    } else {
+      expect(result.session_history).toBeUndefined();
+    }
+  });
+
+  test.each(["exec", "plan", "explore"])(
+    "%s retains recovery through its built-in inherited policy",
+    async (agentId) => {
+      using tempDir = new DisposableTempDir("history-policy");
+      const agent = await resolveAgentFrontmatter(
+        new LocalRuntime(tempDir.path),
+        tempDir.path,
+        agentId
+      );
+      const policy = resolveToolPolicyForAgent({
+        agents: [agent],
+        isSubagent: agentId === "explore",
+        disableTaskToolsForDepth: false,
+      });
       const history = executableTool("History");
       const result = await applyToolPolicyAndExperiments({
-        allTools: { session_history: history, file_read: executableTool("Read") },
+        allTools: { session_history: history },
         effectiveToolPolicy: policy,
         experiments: { tokenBudget: true },
         emitNestedToolEvent: () => undefined,
       });
+      expect(isSessionHistoryDisabled(policy)).toBe(false);
       expect(result.session_history).toBe(history);
-      const off = await applyToolPolicyAndExperiments({
-        allTools: { session_history: history },
-        effectiveToolPolicy: resolvePolicy(false),
-        experiments: { tokenBudget: false },
-        emitNestedToolEvent: () => undefined,
-      });
-      expect(off.session_history).toBeUndefined();
     }
   );
 
@@ -584,11 +607,10 @@ describe("token budget history policy", () => {
     async (name) => {
       const policy = resolveToolPolicyForAgent({
         agents: [{ tools: { remove: [name] } }, { tools: { add: [".*"] } }],
-        sessionHistoryEnabled: true,
         isSubagent: false,
         disableTaskToolsForDepth: false,
       });
-      expect(isSessionHistoryExplicitlyDisabled(policy)).toBe(true);
+      expect(isSessionHistoryDisabled(policy)).toBe(true);
       const result = await applyToolPolicyAndExperiments({
         allTools: { session_history: executableTool("History") },
         effectiveToolPolicy: policy,
@@ -611,10 +633,10 @@ describe("token budget history policy", () => {
         experiments: { tokenBudget: true },
         emitNestedToolEvent: () => undefined,
       });
-    expect(isSessionHistoryExplicitlyDisabled(policy)).toBe(false);
+    expect(isSessionHistoryDisabled(policy)).toBe(false);
     expect((await assemble(policy)).session_history).toBeDefined();
     const disabledAgain = [...policy, { regex_match: "session_.*", action: "disable" as const }];
-    expect(isSessionHistoryExplicitlyDisabled(disabledAgain)).toBe(true);
+    expect(isSessionHistoryDisabled(disabledAgain)).toBe(true);
     expect((await assemble(disabledAgain)).session_history).toBeUndefined();
   });
 

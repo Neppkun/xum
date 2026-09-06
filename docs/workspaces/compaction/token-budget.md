@@ -12,7 +12,7 @@ Use the existing context-usage slider to choose the per-model threshold. The **R
 - Manual `/compact` and idle compaction still summarize normally.
 - Continuous compaction and effective RLM take precedence over rollover.
 - Setting the usage threshold to **100%** disables automatic rollover and its warning. Hard request-size checks still apply.
-- Explicitly disabling `session_history` blocks at the rollover threshold instead of falling back to a lossy summary.
+- `session_history` must be allowed by the agent's inherited tool policy and any caller restrictions. Built-in Exec, Plan, and Explore already allow it. Narrow custom agents can add `session_history` or a matching wildcard to `tools.add`. If access is omitted or disabled, rollover pauses before sealing existing context instead of falling back to a lossy summary.
 
 ## Keeping useful context
 
