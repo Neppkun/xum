@@ -264,6 +264,8 @@ interface AutoRetryResumeRequest {
   // ACP correlation/delegation lives in transient send options that are
   // intentionally omitted from durable startup-recovery snapshots.
   options: SendMessageOptions;
+  // Keep billing identity across backoff. Credentials stay in memory, never in startup-recovery metadata.
+  modelRoutingSnapshot?: ModelRoutingSnapshot;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
   /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
@@ -1322,7 +1324,8 @@ export class AgentSession {
     options: SendMessageOptions | undefined,
     agentInitiated?: boolean,
     goalKind?: GoalSyntheticMessageKind,
-    goalId?: string
+    goalId?: string,
+    modelRoutingSnapshot?: ModelRoutingSnapshot
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1331,6 +1334,7 @@ export class AgentSession {
 
     this.lastAutoRetryResumeRequest = {
       options,
+      ...(modelRoutingSnapshot != null ? { modelRoutingSnapshot } : {}),
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
       ...(goalId != null ? { goalId } : {}),
@@ -1368,6 +1372,7 @@ export class AgentSession {
         agentInitiated: request.agentInitiated === true ? true : undefined,
         goalKind: request.goalKind,
         goalId: request.goalId,
+        modelRoutingSnapshot: request.modelRoutingSnapshot,
       });
       if (result.success) {
         if (!result.data.started) {
@@ -4116,7 +4121,13 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
+    this.setAutoRetryResumeState(
+      optionsForStream,
+      agentInitiated,
+      goalKind,
+      internal?.goalId,
+      modelRoutingSnapshot
+    );
     try {
       await internal?.onAccepted?.();
     } catch (error) {
@@ -4275,7 +4286,12 @@ export class AgentSession {
 
   async resumeStream(
     options: SendMessageOptions,
-    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
+    internal?: {
+      agentInitiated?: boolean;
+      goalKind?: GoalSyntheticMessageKind;
+      goalId?: string;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
+    }
   ): Promise<AgentSessionResult<{ started: boolean }>> {
     this.assertNotDisposed("resumeStream");
 
@@ -4314,13 +4330,18 @@ export class AgentSession {
       return Ok({ started: false });
     }
 
+    // Automatic retries keep their failed attempt. Explicit resumes and restart recovery capture current settings.
+    const modelRoutingSnapshot =
+      internal?.modelRoutingSnapshot ?? this.captureModelRoutingSnapshot();
+
     // A resumed attempt becomes the latest live resume request as soon as we
     // accept its options, even if startup fails before the stream fully begins.
     this.setAutoRetryResumeState(
       optionsForStream,
       internal?.agentInitiated,
       internal?.goalKind,
-      internal?.goalId
+      internal?.goalId,
+      modelRoutingSnapshot
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
     const preparedTurn = this.coordinator.prepare();
@@ -4341,7 +4362,8 @@ export class AgentSession {
         undefined,
         internal?.goalKind,
         internal?.goalId,
-        turnThinkingOverride
+        turnThinkingOverride,
+        modelRoutingSnapshot
       );
       if (!result.success) {
         return result;
@@ -5889,7 +5911,8 @@ export class AgentSession {
     const retryAgentInitiated = this.activeStreamContext?.agentInitiated;
     const retryGoalKind = this.activeStreamContext?.goalKind;
     const retryGoalId = this.activeStreamContext?.goalId;
-    const retryRoutingSnapshot = this.activeStreamContext?.modelRoutingSnapshot;
+    const retryRoutingSnapshot =
+      this.activeStreamContext?.modelRoutingSnapshot ?? this.captureModelRoutingSnapshot();
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -5913,7 +5936,8 @@ export class AgentSession {
       retryOptionsForResume,
       retryAgentInitiated,
       retryGoalKind,
-      retryGoalId
+      retryGoalId,
+      retryRoutingSnapshot
     );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata

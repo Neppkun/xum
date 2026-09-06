@@ -1670,6 +1670,40 @@ describe("CodexOauthService", () => {
       expect(deps.providersConfig.openai?.codexOauthDefaultAccountId).toBe("default");
     });
 
+    it.each(["default", "work"])(
+      "rejects an older %s startup that completes after its retry",
+      async (accountId) => {
+        const auth = validAuth();
+        deps.providersConfig = {
+          openai:
+            accountId === "default"
+              ? { codexOauth: auth }
+              : { codexOauthAccounts: { work: { label: "Work", auth } } },
+        };
+        deviceFetch();
+        const fetch = globalThis.fetch;
+        const firstStarted = createDeferred<void>();
+        const firstResponse = createDeferred<Response>();
+        let starts = 0;
+        mockFetch((input, init) => {
+          if (input === CODEX_OAUTH_DEVICE_USERCODE_URL && starts++ === 0) {
+            firstStarted.resolve(undefined);
+            return firstResponse.promise;
+          }
+          return fetch(input, init);
+        });
+        const older = service.startDeviceFlow({ accountId });
+        await firstStarted.promise;
+        const newer = await service.startDeviceFlow({ accountId });
+        if (!newer.success) throw new Error(newer.error);
+        firstResponse.resolve(
+          mockRefreshResponse({ device_auth_id: "older", user_code: "OLD", interval: 1 })
+        );
+        expect((await older).success).toBe(false);
+        expect(await service.waitForDeviceFlow(newer.data.flowId)).toEqual(Ok(undefined));
+      }
+    );
+
     it("keeps the active device login when a newer device startup fails", async () => {
       deps.providersConfig = { openai: { codexOauth: validAuth() } };
       deviceFetch();

@@ -171,6 +171,8 @@ export class CodexOauthService {
   private readonly refreshMutexes = new Map<string, AsyncMutex>();
   private readonly accountRevisions = new Map<string, number>();
   private readonly loginSelections = new Map<string, AccountSelection>();
+  private readonly loginStartupGenerations = new Map<string, number>();
+  private nextLoginStartupGeneration = 0;
   private readonly authMutationMutexes = new Map<string, AsyncMutex>();
 
   constructor(
@@ -316,8 +318,6 @@ export class CodexOauthService {
           );
         }, DEFAULT_DESKTOP_TIMEOUT_MS),
       });
-
-      self.loginSelections.set(destination.accountId, destination);
 
       const authorizeUrl = buildCodexAuthorizeUrl({
         redirectUri,
@@ -510,8 +510,6 @@ export class CodexOauthService {
             resolveResult,
             settled: false,
           });
-
-          self.loginSelections.set(destination.accountId, destination);
 
           log.debug(`[Codex OAuth] Device flow started (flowId=${flowId})`);
 
@@ -792,9 +790,17 @@ export class CodexOauthService {
     return Effect.tryPromise({
       try: async () => {
         const initial = await Effect.runPromise(this.selectLoginDestination(options));
+        const generation = ++this.nextLoginStartupGeneration;
+        this.loginStartupGenerations.set(initial.accountId, generation);
+        const assertCurrentStartup = () => {
+          if (this.loginStartupGenerations.get(initial.accountId) !== generation) {
+            throw new Error("Codex OAuth login startup was superseded");
+          }
+        };
         const prepare = async (destination: AccountSelection) => {
           const resource = await Effect.runPromise(start);
           try {
+            assertCurrentStartup();
             const current = this.readStoredAuth(destination.accountId);
             if (
               this.getAccountRevision(destination.accountId) !== destination.revision ||
@@ -807,22 +813,35 @@ export class CodexOauthService {
               const auth = await this.initializeCredentialId(destination);
               destination = { ...destination, auth, credentialId: auth.credentialId };
             }
+            // Claim the selection before yielding. An older startup must not replace a newer invocation.
+            assertCurrentStartup();
+            this.loginSelections.set(destination.accountId, destination);
             return { destination, resource };
           } catch (error) {
             await cleanup(resource);
             throw error;
           }
         };
-        if (!initial.auth || initial.credentialId) return prepare(initial);
-        // Successful reconnect startup establishes the legacy identity boundary; failed startup must leave active snapshots usable.
-        // Hold rotations until startup and stamping finish.
-        return this.fileLeaseManager.withCodexOauthRefreshLock(initial.accountId, async () => {
-          const destination = await Effect.runPromise(this.selectLoginDestination(options));
-          if (destination.revision !== initial.revision) {
-            throw new Error("Codex OAuth account changed during login startup");
+        try {
+          if (!initial.auth || initial.credentialId) return await prepare(initial);
+          // Successful reconnect startup establishes the legacy identity boundary; failed startup must leave active snapshots usable.
+          // Hold rotations until startup and stamping finish.
+          return await this.fileLeaseManager.withCodexOauthRefreshLock(
+            initial.accountId,
+            async () => {
+              assertCurrentStartup();
+              const destination = await Effect.runPromise(this.selectLoginDestination(options));
+              if (destination.revision !== initial.revision) {
+                throw new Error("Codex OAuth account changed during login startup");
+              }
+              return prepare(destination);
+            }
+          );
+        } finally {
+          if (this.loginStartupGenerations.get(initial.accountId) === generation) {
+            this.loginStartupGenerations.delete(initial.accountId);
           }
-          return prepare(destination);
-        });
+        }
       },
       catch: (error) => new CodexOauthError({ reason: getErrorMessage(error) }),
     });
