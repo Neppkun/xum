@@ -1,3 +1,5 @@
+import type { Scope } from "effect";
+import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
 import {
   DesktopInputCoordinator,
   settleArchivedSharedDesktopTask,
@@ -2355,7 +2357,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       config.rootDir
     ),
     private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir),
-    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
+    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config),
+    private readonly effectRunner: EffectRunner = defaultEffectRunner,
+    private readonly appFiberScope?: Scope.Scope
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -4026,6 +4030,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   private createSession(workspaceId: string): AgentSession {
     return new AgentSession({
+      effectRunner: this.effectRunner,
+      appFiberScope: this.appFiberScope,
       workspaceId,
       config: this.config,
       historyService: this.historyService,
