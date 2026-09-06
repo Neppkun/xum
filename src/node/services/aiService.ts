@@ -67,6 +67,9 @@ import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
 
 import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
+import { getCodexOauthAccountId } from "@/node/utils/codexOauthAuth";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
 import {
   resolveMemoryProjectIdentity,
@@ -313,8 +316,28 @@ export class AIService extends EventEmitter {
     }
   }
 
-  getProvidersConfig(): ProvidersConfigMap | null {
-    return this.providerService.getConfig();
+  getProvidersConfig(providersConfig?: ProvidersConfig): ProvidersConfigMap | null {
+    return this.providerService.getConfig(providersConfig);
+  }
+
+  /** Keep model credentials and compaction limits on one backend-only snapshot for the turn. */
+  captureModelRoutingSnapshot(workspaceId: string): ModelRoutingSnapshot {
+    // CLI routing config can be temporary. Read credentials from the injected provider store.
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+    const projectPath = getCodexOauthProjectPath(this.config.findWorkspace(workspaceId));
+    const projectAccountId = projectPath
+      ? this.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
+      : undefined;
+    return {
+      providersConfig,
+      metadata: this.getProvidersConfig(providersConfig),
+      codexOauthSelection: {
+        accountId: getCodexOauthAccountId(providersConfig.openai, projectAccountId),
+        explicit:
+          projectAccountId !== undefined ||
+          providersConfig.openai?.codexOauthDefaultAccountId !== undefined,
+      },
+    };
   }
 
   private emitEngineEvent(event: TurnEngineEvent): void | Promise<void> {
@@ -561,12 +584,21 @@ export class AIService extends EventEmitter {
    */
   async createModelWithPinnedMetadata(
     modelString: string,
-    opts?: { agentInitiated?: boolean; workspaceId?: string; projectPath?: string }
+    opts?: {
+      agentInitiated?: boolean;
+      workspaceId?: string;
+      projectPath?: string;
+      modelRoutingSnapshot?: ModelRoutingSnapshot;
+    }
   ): Promise<Result<{ model: LanguageModel; metadataModel: string }, SendMessageError>> {
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+    const providersConfig =
+      opts?.modelRoutingSnapshot?.providersConfig ??
+      this.providersConfigStore.loadProvidersConfig() ??
+      {};
     const result = await this.providerModelFactory.createModel(modelString, undefined, {
       ...opts,
       providersConfig,
+      codexOauthSelection: opts?.modelRoutingSnapshot?.codexOauthSelection,
     });
     if (!result.success) {
       return result;

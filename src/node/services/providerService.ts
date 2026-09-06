@@ -29,7 +29,7 @@ import {
   SUPPORTED_PROVIDERS,
   type ProviderName,
 } from "@/common/constants/providers";
-import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
+import type { BaseProviderConfig, ProvidersConfig } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
 import type {
   AddCustomProviderInput,
@@ -363,8 +363,9 @@ export class ProviderService {
   /**
    * Get the full providers config with safe info (no actual API keys)
    */
-  public getConfig(): ProvidersConfigMap {
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+  public getConfig(
+    providersConfig: ProvidersConfig = this.providersConfigStore.loadProvidersConfig() ?? {}
+  ): ProvidersConfigMap {
     const mainConfig = this.config.loadConfigOrDefault();
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);

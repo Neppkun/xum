@@ -1062,6 +1062,63 @@ describe("ProviderModelFactory GitHub Copilot", () => {
     });
   });
 
+  it.each(["preference", "wire-format"])(
+    "uses pre-send routing config after a %s change",
+    async (change) => {
+      await withTempConfig(async (config, factory, _oauth, store) => {
+        const auth = {
+          type: "oauth" as const,
+          access: "access",
+          refresh: "refresh",
+          expires: Date.now() + 60_000,
+        };
+        const providersConfig = {
+          openai: { apiKey: "test-api-key", codexOauthAccounts: { work: { label: "Work", auth } } },
+        };
+        store.saveProvidersConfig(providersConfig);
+        await config.editConfig((cfg) => {
+          cfg.projects.set("/project", {
+            codexOauthAccountId: "work",
+            workspaces: [{ id: "snapshot-ws", name: "snapshot-ws", path: "/project/ws" }],
+          });
+          return cfg;
+        });
+        const options = {
+          workspaceId: "snapshot-ws",
+          providersConfig,
+          codexOauthSelection: { accountId: "work", explicit: true },
+        };
+        store.saveProvidersConfig({
+          openai: {
+            ...providersConfig.openai,
+            ...(change === "preference"
+              ? { codexOauthDefaultAuth: "apiKey" }
+              : { wireFormat: "chatCompletions" }),
+          },
+        });
+        await config.editConfig((cfg) => {
+          delete cfg.projects.get("/project")!.codexOauthAccountId;
+          return cfg;
+        });
+        const pinned = await factory.resolveAndCreateModel(
+          "openai:gpt-5.5",
+          "off",
+          undefined,
+          options
+        );
+        expect(pinned.success).toBe(true);
+        if (!pinned.success) return;
+        expect(pinned.data.codexOauthAccountId).toBe("work");
+        expect(modelCostsIncluded(pinned.data.model)).toBe(true);
+        const next = await factory.resolveAndCreateModel("openai:gpt-5.5", "off", undefined, {
+          workspaceId: "snapshot-ws",
+        });
+        expect(next.success).toBe(true);
+        if (next.success) expect(modelCostsIncluded(next.data.model)).toBe(false);
+      });
+    }
+  );
+
   it("pins project Codex accounts across requests and rejects deleted slots", async () => {
     await withTempConfig(async (config, factory, oauth, providersConfigStore) => {
       const personal = {
@@ -2312,6 +2369,74 @@ describe("ProviderModelFactory routing", () => {
               routeProvider: "openrouter",
             });
           }
+        });
+      } finally {
+        if (savedKey !== undefined) process.env.OPENAI_API_KEY = savedKey;
+      }
+    }
+  );
+
+  it.each(["default", "work"])(
+    "uses a gateway for models outside the %s OAuth slot's model support",
+    async (accountId) => {
+      const savedKey = process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_API_KEY;
+      try {
+        await withTempConfig(async (config, factory) => {
+          const auth = {
+            type: "oauth" as const,
+            access: "access",
+            refresh: "refresh",
+            expires: Date.now() + 60_000,
+          };
+          const openai = {
+            ...(accountId === "default"
+              ? { codexOauth: auth }
+              : { codexOauthAccounts: { work: { label: "Work", auth } } }),
+            codexOauthDefaultAccountId: accountId,
+          };
+          const store = new ProvidersConfigStore(config.rootDir);
+          store.saveProvidersConfig({ openai, openrouter: { apiKey: "or-test" } });
+
+          for (const routeOverrides of [{}, { "openai:gpt-4.1": "direct" }]) {
+            await saveRoutePriority(config, ["direct", "openrouter"], { routeOverrides });
+            expect(factory.resolveGatewayModelString("openai:gpt-4.1")).toBe(
+              "openrouter:openai/gpt-4.1"
+            );
+            expect((await factory.createModel("openai:gpt-4.1")).success).toBe(true);
+            const result = await factory.resolveAndCreateModel("openai:gpt-4.1", "off");
+            expectSuccessfulRouteResult(result, {
+              effectiveModelString: "openrouter:openai/gpt-4.1",
+              routeProvider: "openrouter",
+            });
+          }
+
+          store.saveProvidersConfig({
+            openai: {
+              ...openai,
+              models: [{ id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id }],
+            },
+            openrouter: { apiKey: "or-test" },
+          });
+          expectSuccessfulRouteResult(
+            await factory.resolveAndCreateModel("openai:team-codex", "off"),
+            {
+              effectiveModelString: "openai:team-codex",
+              routeProvider: "openai",
+            }
+          );
+
+          store.saveProvidersConfig({
+            openai: { ...openai, apiKey: "sk-test" },
+            openrouter: { apiKey: "or-test" },
+          });
+          expectSuccessfulRouteResult(
+            await factory.resolveAndCreateModel("openai:gpt-4.1", "off"),
+            {
+              effectiveModelString: "openai:gpt-4.1",
+              routeProvider: "openai",
+            }
+          );
         });
       } finally {
         if (savedKey !== undefined) process.env.OPENAI_API_KEY = savedKey;

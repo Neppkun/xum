@@ -8,6 +8,8 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 import type { SessionUsageService } from "./sessionUsageService";
+import { AIService } from "./aiService";
+import { ProviderService } from "./providerService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import {
@@ -94,6 +96,19 @@ describe("AgentSession continuous compaction wiring", () => {
 
   async function setup(usagePercent = 0) {
     harness = await createAgentSessionHarness({ workspaceId, captureEvents: true });
+    const h = harness;
+    const routingService = new AIService(
+      h.config,
+      h.historyService,
+      h.initStateManager,
+      new ProviderService(h.config)
+    );
+    spyOn(routingService, "getProvidersConfig").mockImplementation(() =>
+      structuredClone(h.aiService.getProvidersConfig())
+    );
+    spyOn(h.aiService, "captureModelRoutingSnapshot").mockImplementation((id) =>
+      routingService.captureModelRoutingSnapshot(id)
+    );
     harness.session.setAutoCompactionThreshold(0.7);
     if (usagePercent > 0) {
       await harness.historyService.appendToHistory(
@@ -189,6 +204,159 @@ describe("AgentSession continuous compaction wiring", () => {
       expect(readLimit()).toBe(272_000);
     }
   );
+
+  test("active compaction keeps its routing snapshot until the next turn", async () => {
+    const h = await setup();
+    await setWorkspaceAccountScope(h, "root");
+    const providersConfig: ProvidersConfigMap = {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    };
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue(providersConfig);
+    const scopedModel = "openai:gpt-5.5";
+    const options = { ...sendOptions, model: scopedModel };
+    spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+      startStream(h);
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const observed = deferred<void>();
+    const observe = spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+      (_usage, context) => {
+        if (context.phase === "mid-stream") observed.resolve();
+        return Promise.resolve("none");
+      }
+    );
+    expect((await h.session.sendMessage("Start", options)).success).toBe(true);
+    await h.config.editConfig((cfg) => {
+      delete cfg.projects.get(h.config.rootDir)!.codexOauthAccountId;
+      return cfg;
+    });
+    // The next turn now has an API route. This turn keeps its explicit selection and smaller cap.
+    expect(resolveCodexOauthRouting(scopedModel, providersConfig)).toBe("other");
+    expect(
+      internals(h.session).getContinuousCompactionContext(scopedModel, options).contextWindowTokens
+    ).toBe(272_000);
+    h.aiEmitter.emit("usage-delta", {
+      type: "usage-delta",
+      workspaceId,
+      messageId: "live-assistant",
+      usage: { inputTokens: 200_000, outputTokens: 1, totalTokens: 200_001 },
+    });
+    await observed.promise;
+    expect(
+      observe.mock.calls.find((call) => call[1].phase === "mid-stream")?.[1].contextWindowTokens
+    ).toBe(272_000);
+    endStream(h);
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("Next", options)).success).toBe(true);
+    expect(
+      internals(h.session).getContinuousCompactionContext(scopedModel, options).contextWindowTokens
+    ).toBe(1_050_000);
+  });
+
+  test.each(["api-key", "wire-format"] as const)(
+    "active OAuth compaction ignores later %s changes",
+    async (change) => {
+      const h = await setup();
+      const providersConfig: ProvidersConfigMap = {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true, codexOauthSet: true },
+      };
+      spyOn(h.aiService, "getProvidersConfig").mockReturnValue(providersConfig);
+      const scopedModel = "openai:gpt-5.5";
+      const options = { ...sendOptions, model: scopedModel };
+      spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+        startStream(h);
+        return Promise.resolve(Ok(createStartedTurnHandle()));
+      });
+      spyOn(internals(h.session).continuousCompactor, "observe").mockResolvedValue("none");
+      expect(resolveCodexOauthRouting(scopedModel, providersConfig)).toBe("oauth");
+      expect((await h.session.sendMessage("Start", options)).success).toBe(true);
+      if (change === "api-key") providersConfig.openai.codexOauthDefaultAuth = "apiKey";
+      else providersConfig.openai.wireFormat = "chatCompletions";
+      expect(resolveCodexOauthRouting(scopedModel, providersConfig)).toBe("other");
+      expect(
+        internals(h.session).getContinuousCompactionContext(scopedModel, options)
+          .contextWindowTokens
+      ).toBe(272_000);
+      endStream(h);
+      await h.session.waitForIdle();
+      expect((await h.session.sendMessage("Next", options)).success).toBe(true);
+      expect(
+        internals(h.session).getContinuousCompactionContext(scopedModel, options)
+          .contextWindowTokens
+      ).toBe(1_050_000);
+    }
+  );
+
+  test("pre-send and model construction share the selection before asynchronous preparation", async () => {
+    const h = await setup();
+    await setWorkspaceAccountScope(h, "root");
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    });
+    spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+      async (_usage, context) => {
+        if (context.phase === "on-send")
+          await h.config.editConfig((cfg) => {
+            delete cfg.projects.get(h.config.rootDir)!.codexOauthAccountId;
+            return cfg;
+          });
+        return "none";
+      }
+    );
+    const stream = spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+      startStream(h);
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const options = { ...sendOptions, model: "openai:gpt-5.5" };
+    expect((await h.session.sendMessage("Start", options)).success).toBe(true);
+    expect(stream.mock.calls[0]?.[0].modelRoutingSnapshot?.codexOauthSelection).toEqual({
+      accountId: "missing",
+      explicit: true,
+    });
+    expect(
+      internals(h.session).getContinuousCompactionContext(options.model, options)
+        .contextWindowTokens
+    ).toBe(272_000);
+  });
+
+  test("compaction follows the current fallback model within the pinned turn", async () => {
+    const h = await setup();
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
+      openai: { apiKeySet: true, isConfigured: true, isEnabled: true, codexOauthSet: true },
+    });
+    spyOn(h.aiService, "streamMessage").mockImplementation(() => {
+      startStream(h);
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const observed = deferred<void>();
+    const observe = spyOn(internals(h.session).continuousCompactor, "observe").mockImplementation(
+      (_usage, context) => {
+        if (context.phase === "mid-stream") observed.resolve();
+        return Promise.resolve("none");
+      }
+    );
+    expect(
+      (await h.session.sendMessage("Start", { ...sendOptions, model: "openai:gpt-5.6-sol" }))
+        .success
+    ).toBe(true);
+    spyOn(h.aiService, "getStreamInfo").mockReturnValue({
+      messageId: "live-assistant",
+      model: "openai:gpt-5.5",
+      parts: [],
+      toolCompletionTimestamps: new Map(),
+    });
+    h.aiEmitter.emit("usage-delta", {
+      type: "usage-delta",
+      workspaceId,
+      messageId: "live-assistant",
+      usage: { inputTokens: 200_000, outputTokens: 1, totalTokens: 200_001 },
+    });
+    await observed.promise;
+    expect(observe.mock.calls.find((call) => call[1].phase === "mid-stream")?.[1]).toMatchObject({
+      model: "openai:gpt-5.5",
+      contextWindowTokens: 272_000,
+    });
+  });
 
   async function rows(h: AgentSessionHarness): Promise<MuxMessage[]> {
     const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -1198,6 +1366,34 @@ describe("AgentSession continuous compaction wiring", () => {
       head,
       compactOptions: {
         ...args.compactOptions,
+        model: "openai:gpt-5.5",
+        providerOptions: { openai: { wireFormat: "chatCompletions" } },
+      },
+    });
+    expect(result).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  test("headless fallback does not inherit the active Chat Completions window", async () => {
+    const { h, args } = await summarySetup();
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
+      openai: {
+        apiKeySet: true,
+        isConfigured: true,
+        isEnabled: true,
+        codexOauthSet: true,
+        models: [{ id: "gpt-4.1-mini", contextWindowTokens: 100 }],
+      },
+    });
+    const create = spyOn(h.aiService, "createModelWithPinnedMetadata");
+    const result = await summarizeContinuousCompaction({
+      ...args,
+      head: [
+        createMuxMessage("large-head", "user", "Important context to retain. ".repeat(40_000)),
+      ],
+      context: { ...args.context, model: "openai:gpt-5.5", contextWindowTokens: 1_050_000 },
+      baseOptions: {
+        ...sendOptions,
         model: "openai:gpt-5.5",
         providerOptions: { openai: { wireFormat: "chatCompletions" } },
       },

@@ -111,12 +111,14 @@ function createBasicAIService(
     sessionUsageService?: SessionUsageService;
     devToolsService?: DevToolsService;
     experimentsService?: ExperimentsService;
+    providersConfigStore?: ProvidersConfigStore;
   }
 ): BasicAIServiceParts {
   const config = new Config(root);
   const historyService = new HistoryService(config);
   const initStateManager = new InitStateManager(config);
-  const providersConfigStore = new ProvidersConfigStore(config.rootDir);
+  const providersConfigStore =
+    options?.providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
   const providerService = new ProviderService(config, undefined, providersConfigStore);
   const service = new AIService(
     config,
@@ -1034,7 +1036,113 @@ describe("AIService.createModel (Codex OAuth routing)", () => {
   });
 });
 
+describe("AIService.captureModelRoutingSnapshot", () => {
+  afterEach(() => {
+    mock.restore();
+  });
+
+  it("uses permanent provider credentials with temporary workspace routing config", async () => {
+    using temporaryHome = new DisposableTempDir("snapshot-temporary-routing");
+    using permanentHome = new DisposableTempDir("snapshot-permanent-providers");
+    const providersConfigStore = new ProvidersConfigStore(permanentHome.path);
+    const { config, service } = createBasicAIService(temporaryHome.path, { providersConfigStore });
+    const workspaceId = "temporary-workspace";
+    await config.editConfig((cfg) => {
+      cfg.projects.set(temporaryHome.path, {
+        codexOauthAccountId: "work",
+        workspaces: [{ id: workspaceId, name: workspaceId, path: temporaryHome.path }],
+      });
+      return cfg;
+    });
+    new ProvidersConfigStore(temporaryHome.path).saveProvidersConfig({
+      openai: { apiKey: "temporary-api-key" },
+    });
+    providersConfigStore.saveProvidersConfig({
+      openai: {
+        codexOauthAccounts: { work: { label: "Work", auth: TEST_CODEX_OAUTH } },
+      },
+    });
+    const requests: RecordedFetchRequest[] = [];
+    const loadProvidersConfig = providersConfigStore.loadProvidersConfig.bind(providersConfigStore);
+    const read = spyOn(providersConfigStore, "loadProvidersConfig").mockImplementation(() => {
+      const raw = loadProvidersConfig()!;
+      return { ...raw, openai: { ...raw.openai, fetch: createRecordingOpenAIFetch(requests) } };
+    });
+    const getValidAuth = mock(() => Promise.resolve({ success: true, data: TEST_CODEX_OAUTH }));
+    service.turnRequestBuilderBindings.codexOauthService = {
+      getValidAuth,
+    } as unknown as CodexOauthService;
+
+    const snapshot = service.captureModelRoutingSnapshot(workspaceId);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(snapshot.codexOauthSelection).toEqual({ accountId: "work", explicit: true });
+    expect(
+      getEffectiveContextLimit("openai:gpt-5.5", false, snapshot.metadata, {
+        codexOauthAccountId: snapshot.codexOauthSelection.accountId,
+      })
+    ).toBe(272_000);
+    const pinned = await service.createModelWithPinnedMetadata("openai:gpt-5.5", {
+      workspaceId,
+      modelRoutingSnapshot: snapshot,
+    });
+    expect(pinned.success).toBe(true);
+    if (!pinned.success || typeof pinned.data.model === "string") {
+      throw new Error("Expected a generated model");
+    }
+    await pinned.data.model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(getValidAuth).toHaveBeenCalledWith("work", expect.any(Object));
+    expect(requests).toHaveLength(1);
+    expect(getFetchUrl(requests[0].input)).toBe(CODEX_ENDPOINT);
+    expect(new Headers(requests[0].init?.headers).get("authorization")).toBe(
+      "Bearer test-access-token"
+    );
+  });
+});
+
 describe("AIService.createModelWithPinnedMetadata", () => {
+  it("uses the summary account snapshot after project selection changes", async () => {
+    using xumHome = new DisposableTempDir("headless-account-snapshot");
+    const { config, service, providersConfigStore } = createBasicAIService(xumHome.path);
+    const workspaceId = "summary-snapshot";
+    await config.editConfig((cfg) => {
+      cfg.projects.set(xumHome.path, {
+        codexOauthAccountId: "work",
+        workspaces: [{ id: workspaceId, name: workspaceId, path: xumHome.path }],
+      });
+      return cfg;
+    });
+    providersConfigStore.saveProvidersConfig({
+      openai: {
+        codexOauthAccounts: {
+          work: {
+            label: "Work",
+            auth: {
+              type: "oauth",
+              access: "access",
+              refresh: "refresh",
+              expires: Date.now() + 60_000,
+            },
+          },
+        },
+      },
+    });
+    const modelRoutingSnapshot = service.captureModelRoutingSnapshot(workspaceId);
+    await config.editConfig((cfg) => {
+      cfg.projects.get(xumHome.path)!.codexOauthAccountId = "deleted";
+      return cfg;
+    });
+    const pinned = await service.createModelWithPinnedMetadata("openai:gpt-5.5", {
+      workspaceId,
+      modelRoutingSnapshot,
+    });
+    expect(pinned.success).toBe(true);
+    const next = await service.createModelWithPinnedMetadata("openai:gpt-5.5", { workspaceId });
+    expect(next.success).toBe(false);
+    if (!next.success) expect(next.error.type).toBe("oauth_not_connected");
+  });
+
   it("derives the pinned identity from the effective route when a coder selection falls away", async () => {
     using xumHome = new DisposableTempDir("pinned-metadata-fallback-away");
 
@@ -1099,6 +1207,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       canonicalModelId?: string;
       useRequestedModelString?: boolean;
       experimentsService?: ExperimentsService;
+      providersConfigStore?: ProvidersConfigStore;
     }
   ): StreamMessageHarness {
     const { config, historyService, initStateManager, service } = createBasicAIService(
@@ -1106,6 +1215,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       {
         sessionUsageService: options?.sessionUsageService,
         experimentsService: options?.experimentsService,
+        providersConfigStore: options?.providersConfigStore,
       }
     );
     const planPayloadMessageIds: string[][] = [];
@@ -1216,6 +1326,122 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       new ProvidersConfigStore(harness.config.rootDir).loadProvidersConfig()?.openai
         ?.codexOauthDefaultAccountId
     ).toBe("missing");
+  });
+
+  it("keeps context limits and real factory routing on the raw snapshot during provider edits", async () => {
+    using xumHome = new DisposableTempDir("stream-account-snapshot");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "stream-snapshot";
+    const store = new ProvidersConfigStore(xumHome.path);
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath),
+      { providersConfigStore: store }
+    );
+    const factory = Reflect.get(harness.service, "providerModelFactory") as ProviderModelFactory;
+    spyOn(factory, "resolveAndCreateModel").mockRestore();
+    const requests: RecordedFetchRequest[] = [];
+    configureOpenAICodexOAuth(harness.service, store, requests);
+    const read = spyOn(store, "loadProvidersConfig");
+    const getProvidersConfig = harness.service.getProvidersConfig.bind(harness.service);
+    // Change the backing store after the raw read, before metadata projection.
+    spyOn(harness.service, "getProvidersConfig").mockImplementationOnce((raw) => {
+      read.mockReturnValue({
+        openai: {
+          apiKey: "replacement-api-key",
+          codexOauthDefaultAuth: "apiKey",
+          fetch: createRecordingOpenAIFetch(requests),
+        },
+      });
+      return getProvidersConfig(raw);
+    });
+    const modelRoutingSnapshot = harness.service.captureModelRoutingSnapshot(workspaceId);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(getEffectiveContextLimit("openai:gpt-5.5", false, modelRoutingSnapshot.metadata)).toBe(
+      272_000
+    );
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.5",
+      thinkingLevel: "off",
+      modelRoutingSnapshot,
+    });
+    expect(result.success).toBe(true);
+    const stream = harness.startStreamCalls[0];
+    expect(getEffectiveContextLimit("openai:gpt-5.5", false, stream.providersConfigSnapshot)).toBe(
+      272_000
+    );
+    if (typeof stream.model === "string") throw new Error("Expected a generated model");
+    await stream.model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(requests).toHaveLength(1);
+    expect(getFetchUrl(requests[0].input)).toBe(CODEX_ENDPOINT);
+    expect(new Headers(requests[0].init?.headers).get("authorization")).toBe(
+      "Bearer test-access-token"
+    );
+
+    const nextSnapshot = harness.service.captureModelRoutingSnapshot(workspaceId);
+    expect(getEffectiveContextLimit("openai:gpt-5.5", false, nextSnapshot.metadata)).toBe(
+      1_050_000
+    );
+    const nextResult = await harness.service.streamMessage({
+      messages: [createMuxMessage("next-user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.5",
+      thinkingLevel: "off",
+      modelRoutingSnapshot: nextSnapshot,
+    });
+    expect(nextResult.success).toBe(true);
+    const nextStream = harness.startStreamCalls[1];
+    expect(
+      getEffectiveContextLimit("openai:gpt-5.5", false, nextStream.providersConfigSnapshot)
+    ).toBe(1_050_000);
+    if (typeof nextStream.model === "string") throw new Error("Expected a generated model");
+    await nextStream.model.doGenerate({
+      prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+    });
+    expect(requests).toHaveLength(2);
+    expect(getFetchUrl(requests[1].input)).not.toBe(CODEX_ENDPOINT);
+    expect(new Headers(requests[1].init?.headers).get("authorization")).toBe(
+      "Bearer replacement-api-key"
+    );
+  });
+
+  it("preserves implicit API-key routing in a captured turn snapshot", async () => {
+    using xumHome = new DisposableTempDir("stream-implicit-api-snapshot");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "implicit-api-snapshot";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath),
+      {
+        effectiveModelString: "openai:gpt-5.5",
+        codexOauthAccountId: "default",
+      }
+    );
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      openai: { apiKey: "test-key" },
+    });
+    const modelRoutingSnapshot = harness.service.captureModelRoutingSnapshot(workspaceId);
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.5",
+      thinkingLevel: "off",
+      modelRoutingSnapshot,
+    });
+    expect(result.success).toBe(true);
+    expect(
+      getEffectiveContextLimit(
+        "openai:gpt-5.5",
+        false,
+        harness.startStreamCalls[0]?.providersConfigSnapshot
+      )
+    ).toBe(1_050_000);
   });
 
   interface AdvisorRuntimeForTests {

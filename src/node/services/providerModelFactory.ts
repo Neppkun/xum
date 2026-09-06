@@ -1225,7 +1225,8 @@ export class ProviderModelFactory {
   private isProviderAvailableForRouting(
     provider: ProviderName,
     providersConfig: ProvidersConfig,
-    config: ReturnType<Config["loadConfigOrDefault"]>
+    config: ReturnType<Config["loadConfigOrDefault"]>,
+    canonicalModel: string
   ): boolean {
     const rawProviderConfig = providersConfig[provider] ?? {};
     const providerConfig =
@@ -1234,11 +1235,11 @@ export class ProviderModelFactory {
         : rawProviderConfig;
     const credentials = resolveProviderCredentials(provider, providerConfig);
 
-    // OpenAI Codex OAuth is a valid credential path even without an API key;
-    // routing should treat it as available so direct OpenAI routes are honored.
+    // OAuth cannot serve every OpenAI model. Unsupported models must retain configured gateway routes.
     // Rejected slots remain for reconnect, but must not hide configured gateway routes.
     const hasCodexOauth =
       provider === "openai" &&
+      isCodexOauthAllowedModel(canonicalModel, providersConfig) &&
       getCodexOauthAccounts(providerConfig).some(({ auth }) => auth.invalidReason === undefined);
 
     if (!credentials.isConfigured && !hasCodexOauth) {
@@ -2566,7 +2567,10 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "projectPath">
+    opts?: Pick<
+      CreateModelOptions,
+      "agentInitiated" | "workspaceId" | "projectPath" | "providersConfig" | "codexOauthSelection"
+    >
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -2577,7 +2581,10 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "projectPath">
+    opts?: Pick<
+      CreateModelOptions,
+      "agentInitiated" | "workspaceId" | "projectPath" | "providersConfig" | "codexOauthSelection"
+    >
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -2589,7 +2596,9 @@ export class ProviderModelFactory {
       // through the built-in machinery instead of the user's custom endpoint.
       // The equivalent guard in resolveGatewayModelString only protects callers
       // that pass raw strings.
-      const providersConfigForShadowCheck = self.providersConfigStore.loadProvidersConfig() ?? {};
+      // Pre-send compaction and model construction must use the same routing snapshot.
+      const providersConfigForShadowCheck =
+        opts?.providersConfig ?? self.providersConfigStore.loadProvidersConfig() ?? {};
       const [rawProviderName] = parseModelString(modelString);
       const rawPrefixShadowedByCustomProvider =
         rawProviderName.length > 0 &&
@@ -2677,7 +2686,8 @@ export class ProviderModelFactory {
         const coderProviderRoutable = self.isProviderAvailableForRouting(
           "coder",
           providersConfigForShadowCheck,
-          appConfig
+          appConfig,
+          routeSeedModelString
         );
         const coderModelAccessible = isGatewayModelAccessible("coder", rawCoderGatewayModelId);
         if (coderProviderRoutable && coderModelAccessible) {
@@ -2899,7 +2909,8 @@ export class ProviderModelFactory {
         return this.isProviderAvailableForRouting(
           provider as ProviderName,
           providersConfig,
-          config
+          config,
+          canonicalModel
         );
       },
       isGatewayModelAccessible
@@ -2986,13 +2997,15 @@ export class ProviderModelFactory {
       providersConfig,
       this.policyService
     );
+    const routingModel =
+      typeof modelKeyOrRouteContext === "string"
+        ? normalizeToCanonical(modelKeyOrRouteContext)
+        : canonicalModelString;
     const routeContext =
       typeof modelKeyOrRouteContext === "object" && modelKeyOrRouteContext != null
         ? modelKeyOrRouteContext
         : resolveRoute(
-            typeof modelKeyOrRouteContext === "string"
-              ? normalizeToCanonical(modelKeyOrRouteContext)
-              : canonicalModelString,
+            routingModel,
             config.routePriority ?? ["direct"],
             config.routeOverrides ?? {},
             (provider) => {
@@ -3003,7 +3016,8 @@ export class ProviderModelFactory {
               return this.isProviderAvailableForRouting(
                 provider as ProviderName,
                 providersConfig,
-                config
+                config,
+                routingModel
               );
             },
             isGatewayModelAccessible
@@ -3016,7 +3030,12 @@ export class ProviderModelFactory {
     // gateway selections from being silently rewritten after canonicalization.
     if (
       explicitGateway != null &&
-      this.isProviderAvailableForRouting(explicitGateway, providersConfig, config)
+      this.isProviderAvailableForRouting(
+        explicitGateway,
+        providersConfig,
+        config,
+        canonicalModelString
+      )
     ) {
       const explicitGatewayDefinition = PROVIDER_DEFINITIONS[explicitGateway];
       if (explicitGatewayDefinition.kind === "gateway") {

@@ -12,12 +12,14 @@ import {
 import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { Ok, Err } from "@/common/types/result";
 import { ProvidersConfigStore, type Config } from "@/node/config";
-import type { AIService } from "@/node/services/aiService";
+import { AIService } from "@/node/services/aiService";
+import { ProviderService } from "./providerService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { AgentSession } from "./agentSession";
 import type { CompactionMonitor } from "./compactionMonitor";
 import {
+  createModelRoutingSnapshotMock,
   createAgentSessionHarness,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
@@ -805,8 +807,8 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       openai: {
         models: [
           {
-            id: "openai:gpt-4o",
-            contextWindow: 222_222,
+            id: "gpt-4o",
+            contextWindowTokens: 222_222,
           },
         ],
       },
@@ -852,6 +854,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -860,6 +863,14 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     }) as unknown as AIService;
 
     const initStateManager = new EventEmitter() as unknown as InitStateManager;
+    const routingService = new AIService(
+      config,
+      historyService,
+      initStateManager,
+      new ProviderService(config)
+    );
+    aiService.captureModelRoutingSnapshot =
+      routingService.captureModelRoutingSnapshot.bind(routingService);
 
     const backgroundProcessManager = {
       cleanup: mock((_workspaceId: string) => Promise.resolve()),
@@ -969,6 +980,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     );
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       streamMessage: streamMessage as unknown as (
@@ -1082,6 +1094,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (
@@ -1234,6 +1247,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
 
     const aiService = Object.assign(aiEmitter, {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       isStreaming: mock((_workspaceId: string) => false),
       stopStream,
       streamMessage: streamMessage as unknown as (

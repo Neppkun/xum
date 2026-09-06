@@ -229,6 +229,7 @@ import type { ErrorEvent } from "@/common/types/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { FileState } from "@/node/services/agentSession";
 import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 
 /** Options used to prepare and execute a turn. */
@@ -246,6 +247,8 @@ export interface StreamMessageOptions {
   additionalSystemInstructions?: string;
   maxOutputTokens?: number;
   muxProviderOptions?: MuxProviderOptions;
+  /** Internal routing state shared with the pre-send compaction check. */
+  modelRoutingSnapshot?: ModelRoutingSnapshot;
   /** Internal-only flag for Copilot billing attribution; never sourced from IPC schemas. */
   agentInitiated?: boolean;
   agentId?: string;
@@ -879,7 +882,8 @@ export class TurnRequestBuilder {
       }
 
       const requestedThinkingLevel = options.requestedThinkingLevel ?? THINKING_LEVEL_OFF;
-      const preliminaryProvidersConfig = this.dependencies.providerService.getConfig();
+      const preliminaryProvidersConfig =
+        opts.modelRoutingSnapshot?.metadata ?? this.dependencies.providerService.getConfig();
       const preliminaryMinThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,
@@ -903,7 +907,14 @@ export class TurnRequestBuilder {
         options.rawModelString,
         preliminaryThinkingLevel,
         effectiveMuxProviderOptions,
-        { agentInitiated, workspaceId }
+        {
+          agentInitiated,
+          workspaceId,
+          ...(opts.modelRoutingSnapshot && {
+            providersConfig: opts.modelRoutingSnapshot.providersConfig,
+            codexOauthSelection: opts.modelRoutingSnapshot.codexOauthSelection,
+          }),
+        }
       );
       if (options.recordTiming) {
         recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);
@@ -913,12 +924,16 @@ export class TurnRequestBuilder {
       }
 
       let providersConfig = pinCoderInstanceProvidersConfig(
-        this.dependencies.providerService.getConfig(),
+        opts.modelRoutingSnapshot?.metadata ?? this.dependencies.providerService.getConfig(),
         options.rawModelString,
         resolved.data.coderSelectedInstance
       );
       // Context-limit mirrors must use the account that the model selected.
-      if (providersConfig.openai && resolved.data.codexOauthAccountId != null) {
+      if (
+        providersConfig.openai &&
+        resolved.data.codexOauthAccountId != null &&
+        (!opts.modelRoutingSnapshot || opts.modelRoutingSnapshot.codexOauthSelection.explicit)
+      ) {
         providersConfig = {
           ...providersConfig,
           openai: {

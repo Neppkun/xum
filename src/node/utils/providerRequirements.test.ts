@@ -135,6 +135,27 @@ describe("hasAnyConfiguredProvider", () => {
     }
   });
 
+  it.each(["default", "work"])(
+    "does not count a disabled %s account as configured",
+    (accountId) => {
+      const auth = {
+        type: "oauth" as const,
+        access: "access",
+        refresh: "refresh",
+        expires: Date.now() + 60_000,
+      };
+      const openai = {
+        enabled: false,
+        ...(accountId === "default"
+          ? { codexOauth: auth }
+          : { codexOauthAccounts: { work: { label: "Work", auth } } }),
+      };
+      expect(hasAnyConfiguredProvider({ openai })).toBe(false);
+      expect(hasAnyConfiguredProvider({ openai, openrouter: { apiKey: "or-test" } })).toBe(true);
+      expect(hasAnyConfiguredProvider({ openai: { ...openai, enabled: true } })).toBe(true);
+    }
+  );
+
   it("returns true for keyless providers with explicit config", () => {
     const providers: ProvidersConfig = {
       ollama: {

@@ -20,7 +20,7 @@ import {
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import type { Config } from "@/node/config";
@@ -51,13 +51,15 @@ export async function summarizeContinuousCompaction(args: {
   context: ContinuousCompactionContext;
   baseOptions: SendMessageOptions;
   compactOptions: SendMessageOptions;
+  modelRoutingSnapshot?: ModelRoutingSnapshot;
 }): Promise<{ text: string; model: string } | null> {
   args.signal.throwIfAborted();
-  const providersConfig = args.aiService.getProvidersConfig();
+  const modelRoutingSnapshot =
+    args.modelRoutingSnapshot ?? args.aiService.captureModelRoutingSnapshot(args.workspaceId);
+  const providersConfig = modelRoutingSnapshot.metadata;
   let options = args.compactOptions;
-  const projectPath = getCodexOauthProjectPath(args.config.findWorkspace(args.workspaceId));
-  const codexOauthAccountId = projectPath
-    ? args.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
+  const codexOauthAccountId = modelRoutingSnapshot.codexOauthSelection.explicit
+    ? modelRoutingSnapshot.codexOauthSelection.accountId
     : undefined;
   const compactLimit = getEffectiveContextLimit(
     options.model,
@@ -71,7 +73,18 @@ export async function summarizeContinuousCompaction(args: {
     // Do not truncate the head to fit a cheaper compact model: use the active
     // model's configured route, or leave the old compaction safety net in charge.
     options = args.baseOptions;
-    if (headTokens > args.context.contextWindowTokens * SUMMARIZER_INPUT_FRACTION) return null;
+    const baseLimit = getEffectiveContextLimit(
+      options.model,
+      isAnthropic1MEffectivelyEnabled(options.model, options.providerOptions, providersConfig),
+      providersConfig,
+      { codexOauthAccountId }
+    );
+    // The active turn may use Chat Completions, while headless construction uses stored wire format.
+    if (
+      !baseLimit ||
+      headTokens > Math.min(baseLimit, args.context.contextWindowTokens) * SUMMARIZER_INPUT_FRACTION
+    )
+      return null;
   }
   const modelString = options.model;
   const thinkingLevel = enforceThinkingPolicy(
@@ -125,6 +138,7 @@ export async function summarizeContinuousCompaction(args: {
   const created = await args.aiService.createModelWithPinnedMetadata(modelString, {
     workspaceId: args.workspaceId,
     agentInitiated: true,
+    modelRoutingSnapshot,
   });
   if (!created.success) throw new Error(`Cannot create compact model: ${created.error.type}`);
   try {

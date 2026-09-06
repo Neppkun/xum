@@ -608,6 +608,11 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
       continue;
     }
 
+    // Disabled providers cannot satisfy the CLI startup credential check.
+    if (isProviderDisabledInConfig(rawConfig)) {
+      continue;
+    }
+
     // OpenAI Codex OAuth is a valid credential path even without apiKey.
     if (
       providerKey === "openai" &&
@@ -617,11 +622,7 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
     }
 
     if (!(providerKey in PROVIDER_DEFINITIONS)) {
-      if (
-        isCustomProviderConfig(rawConfig) &&
-        !isProviderDisabledInConfig(rawConfig) &&
-        resolveConfigBaseUrl(rawConfig) !== undefined
-      ) {
+      if (isCustomProviderConfig(rawConfig) && resolveConfigBaseUrl(rawConfig) !== undefined) {
         return true;
       }
 

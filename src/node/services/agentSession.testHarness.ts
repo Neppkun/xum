@@ -19,6 +19,7 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { StreamErrorType } from "@/common/types/errors";
+import type { ModelRoutingSnapshot } from "./modelRoutingSnapshot";
 
 export function createStartedTurnHandle(messageId = "test-assistant"): TurnStreamHandle {
   return { messageId, completion: new Promise(() => undefined) };
@@ -99,6 +100,18 @@ export function createStreamLifecycleMocks() {
   };
 }
 
+export function createModelRoutingSnapshotMock(
+  getProvidersConfig: AgentSessionAIService["getProvidersConfig"] = () => null
+) {
+  return mock(
+    (_workspaceId: string): ModelRoutingSnapshot => ({
+      providersConfig: {},
+      metadata: structuredClone(getProvidersConfig()),
+      codexOauthSelection: { accountId: "default", explicit: false },
+    })
+  );
+}
+
 function createMockAiService(args?: {
   emitter?: EventEmitter;
   overrides?: Partial<AgentSessionAIService>;
@@ -118,6 +131,9 @@ function createMockAiService(args?: {
       Promise.resolve(Err("Test AI service has no workspace metadata"))
     ),
     getProvidersConfig: mock(() => null),
+    captureModelRoutingSnapshot: createModelRoutingSnapshotMock(() =>
+      aiService.getProvidersConfig()
+    ),
     isExperimentEnabled: mock((_experimentId) => false),
     ...createStreamLifecycleMocks(),
     streamMessage: mock(() =>
