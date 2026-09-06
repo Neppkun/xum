@@ -2115,7 +2115,53 @@ describe("session_history real disk recovery", () => {
     );
   });
 
-  test("archive watermark deduplicates crash-replayed rows without content deduplication", async () => {
+  test("below-watermark repaired and imported active rows survive bounded recovery pages", async () => {
+    const archived = await append("repaired-id", "archived facts");
+    await append("archive-high", "higher archived facts");
+    const boundary = await append("active-boundary", "summary", {
+      compacted: true,
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const repaired = createMuxMessage(archived.id, "assistant", "repaired facts", {
+      historySequence: archived.metadata!.historySequence,
+    });
+    const imported = createMuxMessage("unique-import", "assistant", "imported facts", {
+      historySequence: 0,
+    });
+    await appendTrackedHistory(
+      chatPath,
+      [repaired, imported].map((row) => JSON.stringify(row)).join("\n") + "\n"
+    );
+    const recovered = await pages({ action: "search", query: "facts", limit: 1 });
+    expect(recovered.length).toBeGreaterThan(1);
+    expect(recovered.flatMap((page) => page.items ?? []).map((item) => item.text)).toEqual([
+      "opening facts",
+      "archived facts",
+      "higher archived facts",
+      "repaired facts",
+      "imported facts",
+    ]);
+    const activeWindow = `w:${String(boundary.metadata!.historySequence)}`;
+    for (const [message, expected] of [
+      [repaired, "repaired facts"],
+      [imported, "imported facts"],
+    ] as const) {
+      expect(
+        (
+          await pages({
+            action: "read_item",
+            item_id: String(message.metadata!.historySequence),
+            window_id: activeWindow,
+          })
+        )
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual([expected]);
+    }
+  });
+
+  test("potential crash replays remain visible without exact duplicate proof", async () => {
     await append("same-one", "identical content");
     await append("same-two", "identical content");
     const sealed = await fs.readFile(chatPath, "utf8");
@@ -2126,11 +2172,11 @@ describe("session_history real disk recovery", () => {
     });
     await fs.writeFile(chatPath, sealed + (await fs.readFile(chatPath, "utf8")));
     expect((await fs.stat(archivePath)).size).toBeGreaterThan(0);
-    expect(
-      (await pages({ action: "search", query: "identical content" })).flatMap(
-        (page) => page.items ?? []
-      ).length
-    ).toBe(2);
+    // A sequence watermark cannot prove these are exact replays. Conservatively
+    // return both physical copies rather than hiding repaired/imported rows.
+    const recovered = await pages({ action: "search", query: "identical content", limit: 1 });
+    expect(recovered.length).toBeGreaterThan(1);
+    expect(recovered.flatMap((page) => page.items ?? []).length).toBe(4);
   });
 
   test("aggregate encoded result, cursor, Unicode, and markers fit the output budget", async () => {

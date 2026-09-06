@@ -466,7 +466,7 @@ export async function scanHistoryFilesBounded(
       await snapshot("archive", state.snapshots.archive);
       await snapshot("chat", state.validatedChatSnapshot);
       // Rotation grows the archive and rewrites chat; even archive-only changes
-      // invalidate the sequence watermark used to suppress crash-replay duplicates.
+      // invalidate the shared snapshot used by a resumed scan.
       if (
         (await handles.get("archive")?.stat())?.size !==
           state.snapshots.archive.endOffsetSnapshot &&
@@ -669,6 +669,7 @@ export async function scanHistoryFilesBounded(
         0,
         (message, _start, finish, _oversized, possibleReset) => {
           if (reverse) {
+            // Keep the legacy cursor field, but sequence coverage is not replay proof.
             const sequence = message?.metadata?.historySequence;
             if (artifact === "archive" && Number.isSafeInteger(sequence))
               state.archiveWatermark = Math.max(state.archiveWatermark, sequence!);
@@ -684,12 +685,8 @@ export async function scanHistoryFilesBounded(
           const sequence = message.metadata?.historySequence;
           const anchorSequence =
             Number.isSafeInteger(sequence) && sequence! >= 0 ? sequence! : null;
-          if (
-            artifact === "chat" &&
-            anchorSequence != null &&
-            anchorSequence <= state.archiveWatermark
-          )
-            return true;
+          // Repaired/imported rows may reuse archived sequences with different
+          // identities or payloads. Retain possible replays without exact proof.
           const windowId = isDurableContextBoundaryMarker(message)
             ? boundedWindowId(message)
             : state.windowId;
