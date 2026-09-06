@@ -337,6 +337,7 @@ export const StreamAbortEventSchema = z.object({
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
       duration: z.number().optional(),
       model: z.string().optional(),
+      metadataModel: z.string().optional(),
     })
     .optional()
     .meta({

@@ -6272,6 +6272,7 @@ export class AgentSession {
         model: activeModelForAbort,
         usage: payload.metadata?.usage,
         providerMetadata: payload.metadata?.providerMetadata,
+        metadataModel: payload.metadata?.metadataModel,
         goalKind: this.activeStreamContext?.goalKind,
         agentInitiated: this.activeStreamContext?.agentInitiated,
         isCompaction: hadCompactionRequest,

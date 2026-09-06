@@ -1958,6 +1958,7 @@ export class StreamManager {
         providerMetadata,
         contextProviderMetadata,
         model: streamInfo.model,
+        metadataModel: streamInfo.metadataModel,
       },
       abortReason,
       abandonPartial,

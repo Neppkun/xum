@@ -11605,14 +11605,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const session = this.getOrCreateSession(workspaceId);
-      const stopResult = options?.soft
-        ? await session.interruptStream(options)
-        : await this.bashMonitorHistoryLocks.withLock(workspaceId, async () => {
-            const result = await session.interruptStream(options);
-            // Retire already-owed attention before releasing idle dispatch after a hard Stop.
-            if (result.success) await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId);
-            return result;
-          });
+      if (!options?.soft) {
+        // Retire owed attention before the abort: interruptStream returns after the abort
+        // settled, when an idle-triggered dispatch may already be admitting it. Consuming first
+        // withdraws any in-flight dispatch; monitors stay armed for new output. Best-effort, and
+        // never behind the history lock (a wake admission holds it across stream construction).
+        try {
+          await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId);
+        } catch (error: unknown) {
+          log.warn("Failed to retire bash monitor attention before Stop", { workspaceId, error });
+        }
+      }
+      const stopResult = await session.interruptStream(options);
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {

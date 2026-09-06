@@ -170,9 +170,14 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   );
 
-  test.each([undefined, "anthropic:claude-opus-4-1"])(
-    "accounts aborted usage against the effective model %s with request fallback",
-    async (effectiveModel) => {
+  test.each([
+    { effectiveModel: undefined, metadataModel: undefined },
+    { effectiveModel: "anthropic:claude-opus-4-1", metadataModel: undefined },
+    // A Coder runtime ID has no catalog price; the request-pinned identity must price it.
+    { effectiveModel: "coder:acme/opus", metadataModel: "anthropic:claude-opus-4-1" },
+  ])(
+    "accounts aborted usage against the effective model $effectiveModel priced as $metadataModel",
+    async ({ effectiveModel, metadataModel }) => {
       const workspaceId = "abort-effective-model";
       const aiEmitter = new EventEmitter();
       const accounting = Promise.withResolvers<number>();
@@ -218,12 +223,15 @@ describe("AgentSession queued message tool-call dispatch", () => {
           streamAbort: {
             type: "stream-abort",
             workspaceId,
-            metadata: { duration: 1, usage, model: effectiveModel },
+            metadata: { duration: 1, usage, model: effectiveModel, metadataModel },
           },
         });
-        expect(await accounting.promise).toBe(
-          getTotalCost(createDisplayUsage(usage, effectiveModel ?? TEST_MODEL)) ?? -1
-        );
+        const expectedCost =
+          getTotalCost(
+            createDisplayUsage(usage, effectiveModel ?? TEST_MODEL, undefined, metadataModel)
+          ) ?? 0;
+        expect(expectedCost).toBeGreaterThan(0);
+        expect(await accounting.promise).toBe(expectedCost);
         await session.waitForIdle();
       } finally {
         session.dispose();

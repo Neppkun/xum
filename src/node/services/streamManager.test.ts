@@ -6559,9 +6559,10 @@ describe("StreamManager - aborted stream usage persistence", () => {
     });
   });
 
-  test("emits the effective fallback model with aborted usage", async () => {
+  test("emits the effective fallback model and its pinned pricing identity with aborted usage", async () => {
     const streamManager = new StreamManager(historyService);
-    const effectiveModel = "anthropic:claude-opus-4-1";
+    const effectiveModel = "coder:acme/opus";
+    const pinnedMetadataModel = "anthropic:claude-opus-4-1";
     const abort = Promise.withResolvers<unknown>();
     onTurnEngineEvent(streamManager, "stream-abort", (event) => abort.resolve(event));
     const cleanupAborted = getPrivateMethodForTests<CleanupAbortedStreamForTests>(
@@ -6574,11 +6575,13 @@ describe("StreamManager - aborted stream usage persistence", () => {
       {
         ...createAbortStreamInfo("fallback-message"),
         model: effectiveModel,
+        metadataModel: pinnedMetadataModel,
       },
       "system"
     );
     const event = StreamAbortEventSchema.parse(await abort.promise);
     expect(event.metadata?.model).toBe(effectiveModel);
+    expect(event.metadata?.metadataModel).toBe(pinnedMetadataModel);
     expect(event.metadata?.usage?.inputTokens).toBe(120);
   });
 

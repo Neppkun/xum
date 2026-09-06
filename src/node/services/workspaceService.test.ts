@@ -605,6 +605,53 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("hard Stop does not wait behind a wake admission holding the history lock", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      const release = createDeferred<void>();
+      const locks = (
+        h.service as unknown as {
+          bashMonitorHistoryLocks: { withLock<T>(key: string, op: () => Promise<T>): Promise<T> };
+        }
+      ).bashMonitorHistoryLocks;
+      const held = locks.withLock(h.workspaceId, () => release.promise);
+      spyOn(h.aiService, "stopStream").mockImplementation(async () => {
+        h.abort("user");
+        await h.session.waitForIdle();
+        return Ok(undefined);
+      });
+      spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+      expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
+      release.resolve();
+      await held;
+      await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(1);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("hard Stop succeeds when retiring owed attention fails", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      spyOn(h.reconciler, "consumeCurrent").mockRejectedValueOnce(new Error("watermark write"));
+      spyOn(h.aiService, "stopStream").mockImplementation(async () => {
+        h.abort("user");
+        await h.session.waitForIdle();
+        return Ok(undefined);
+      });
+      spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+      expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
+      expect(h.stopStream).toHaveBeenCalledTimes(1);
+    } finally {
+      await h.finish();
+    }
+  });
+
   test.each(["options", "settings"] as const)(
     "wake yields when a turn starts during %s admission",
     async (gate) => {
