@@ -86,17 +86,35 @@ describe("remote microphone approval", () => {
     }
   );
 
-  test.each(["destroyed", "contentsDestroyed", "focused"] as const)(
+  test.each(["destroyed", "contentsDestroyed"] as const)(
     "rechecks the window after consent before OS access: %s",
     async (field) => {
       const { request, deps, state } = setup();
       deps.showMessageBox.mockImplementation(() => {
-        state[field] = field !== "focused";
+        state[field] = true;
         return Promise.resolve({ response: 1, checkboxChecked: false });
       });
       expect(await request()).toBe(false);
       expect(deps.getMediaAccessStatus).not.toHaveBeenCalled();
       expect(deps.askForMediaAccess).not.toHaveBeenCalled();
+    }
+  );
+
+  test.each(["consent", "OS"])(
+    "accepts explicit approval when the %s dialog takes focus",
+    async (stage) => {
+      const { request, deps, state } = setup();
+      deps.getMediaAccessStatus.mockReturnValue("not-determined");
+      deps.showMessageBox.mockImplementation(() => {
+        if (stage === "consent") state.focused = false;
+        return Promise.resolve({ response: 1, checkboxChecked: false });
+      });
+      deps.askForMediaAccess.mockImplementation(() => {
+        if (stage === "OS") state.focused = false;
+        return Promise.resolve(true);
+      });
+      expect(await request()).toBe(true);
+      expect(state.focused).toBe(false);
     }
   );
 
@@ -205,13 +223,13 @@ describe("remote microphone approval", () => {
     await access.promise;
   });
 
-  test.each(["destroyed", "contentsDestroyed", "focused"] as const)(
+  test.each(["destroyed", "contentsDestroyed"] as const)(
     "rejects a stale OS grant after the window changes: %s",
     async (field) => {
       const { request, deps, state } = setup();
       deps.getMediaAccessStatus.mockReturnValue("not-determined");
       deps.askForMediaAccess.mockImplementation(() => {
-        state[field] = field !== "focused";
+        state[field] = true;
         return Promise.resolve(true);
       });
       expect(await request()).toBe(false);

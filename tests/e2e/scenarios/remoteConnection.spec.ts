@@ -533,6 +533,7 @@ microphoneTest.describe("remote microphone permissions", () => {
       await stopMicrophone(page);
       const remote = await connectForMicrophone(app, page, remoteServer.url);
       for (const [index, allow] of [true, false, true].entries()) {
+        await focusNativeWindow(app, remote);
         const previousAccessRequests = await nativeMedia.evaluate(
           (state) => state.statusRequests.length + state.osRequests.length
         );
@@ -655,7 +656,7 @@ microphoneTest.describe("remote microphone permissions", () => {
   );
 
   microphoneTest(
-    "only a focused app popup can request audio",
+    "only an initially focused app popup can request audio",
     async ({ app, page, remoteServer, nativeMedia }) => {
       const remote = await connectForMicrophone(app, page, remoteServer.url);
       const opened = app.waitForEvent("window");
@@ -668,12 +669,16 @@ microphoneTest.describe("remote microphone permissions", () => {
         error: "NotAllowedError",
       });
       const capture = requestMedia(popup, { audio: true });
+      await expect.poll(() => nativeMedia.evaluate((state) => state.prompts.length)).toBe(1);
+      // Native consent can transfer focus away from the requesting window.
+      const popupWindow = await app.browserWindow(popup);
+      await popupWindow.evaluate((window) => window.blur());
+      await expect.poll(() => popupWindow.evaluate((window) => window.isFocused())).toBe(false);
       await respondToMicrophone(nativeMedia, 0, true);
       expect(await capture).toMatchObject({
         allowed: true,
         tracks: [{ kind: "audio", state: "live" }],
       });
-      const popupWindow = await app.browserWindow(popup);
       expect(await nativeMedia.evaluate((state) => state.prompts[0].windowId)).toBe(
         await popupWindow.evaluate((window) => window.id)
       );

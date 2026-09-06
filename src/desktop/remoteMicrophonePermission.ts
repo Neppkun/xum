@@ -24,14 +24,12 @@ export function createRemoteMicrophonePermission(deps: RemoteMicrophonePermissio
     serverUrl: string,
     signal: AbortSignal
   ): Promise<boolean> => {
-    const isRequestActive = () =>
-      !signal.aborted &&
-      !window.isDestroyed() &&
-      !window.webContents.isDestroyed() &&
-      window.isFocused();
+    // Native and OS dialogs can own focus. Recheck identity and liveness, not focus, after consent.
+    const isRequestCurrent = () =>
+      !signal.aborted && !window.isDestroyed() && !window.webContents.isDestroyed();
 
     try {
-      if (!isRequestActive()) return false;
+      if (!isRequestCurrent() || !window.isFocused()) return false;
       // A remote page cannot prove a user gesture. Require consent in trusted native UI.
       const consent = await raceWithAbortAndTimeout(
         deps.showMessageBox(window, {
@@ -47,25 +45,26 @@ export function createRemoteMicrophonePermission(deps: RemoteMicrophonePermissio
         }),
         { signal }
       );
-      if (consent.kind !== "ok" || consent.value.response !== 1 || !isRequestActive()) return false;
+      if (consent.kind !== "ok" || consent.value.response !== 1 || !isRequestCurrent())
+        return false;
 
       // Recheck OS settings on every request so a previous denial does not block retries.
       switch (deps.platform) {
         case "darwin": {
           const status = deps.getMediaAccessStatus("microphone");
-          if (status === "granted") return isRequestActive();
+          if (status === "granted") return isRequestCurrent();
           if (status !== "not-determined") return false;
           const access = await raceWithAbortAndTimeout(deps.askForMediaAccess("microphone"), {
             signal,
           });
-          return access.kind === "ok" && access.value && isRequestActive();
+          return access.kind === "ok" && access.value && isRequestCurrent();
         }
         case "win32": {
           const status = deps.getMediaAccessStatus("microphone");
-          return status !== "denied" && status !== "restricted" && isRequestActive();
+          return status !== "denied" && status !== "restricted" && isRequestCurrent();
         }
         case "linux":
-          return isRequestActive();
+          return isRequestCurrent();
         default:
           return false;
       }

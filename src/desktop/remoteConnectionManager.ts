@@ -296,16 +296,16 @@ export class RemoteConnectionManager {
     securityOrigin: string | undefined
   ): Promise<boolean> {
     const contents = window.webContents;
-    const isActiveRequest = (): boolean =>
+    const isCurrentRequest = (): boolean =>
       this.entry === entry &&
       this.state.status === "connected" &&
       (window === entry.window || entry.popups.get(window) === "app") &&
       !window.isDestroyed() &&
       !contents.isDestroyed() &&
-      window.isFocused() &&
       contents.getURL() === requestingUrl;
     if (
-      !isActiveRequest() ||
+      !isCurrentRequest() ||
+      !window.isFocused() ||
       entry.microphoneRequests.has(window) ||
       !isRemoteAppUrl(entry.serverUrl, requestingUrl) ||
       securityOrigin == null ||
@@ -333,7 +333,7 @@ export class RemoteConnectionManager {
         this.options.requestMicrophoneAccess(window, entry.serverUrl, signal),
         { signal }
       );
-      return result.kind === "ok" && result.value && !signal.aborted && isActiveRequest();
+      return result.kind === "ok" && result.value && !signal.aborted && isCurrentRequest();
     } finally {
       contents.removeListener("did-start-navigation", onNavigation);
       contents.removeListener("did-navigate", cancel);

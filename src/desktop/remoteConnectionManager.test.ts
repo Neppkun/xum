@@ -303,7 +303,7 @@ describe("RemoteConnectionManager", () => {
     }
   });
 
-  test.each(["focus", "url"])("rechecks %s after asynchronous approval", async (change) => {
+  test.each(["focus", "url"])("rechecks the document after approval changes %s", async (change) => {
     const { manager, windows, requestMicrophoneAccess } = setup();
     await manager.connect("https://example.com/");
     requestMicrophoneAccess.mockImplementationOnce(() => {
@@ -311,7 +311,7 @@ describe("RemoteConnectionManager", () => {
       else windows[0].url = "https://example.com/login";
       return Promise.resolve(true);
     });
-    expect(await requestAudio(windows[0])).toBe(false);
+    expect(await requestAudio(windows[0])).toBe(change === "focus");
   });
 
   test("keeps the local window until load completes and shares duplicate connections", async () => {
