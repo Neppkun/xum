@@ -1,3 +1,4 @@
+import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { type Config } from "@/node/config";
@@ -25,6 +26,10 @@ import {
   parseSubagentReportEnvelope,
 } from "@/common/utils/subagentReportEnvelope";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
+import {
+  AGENT_REPORT_PROGRESS_SUPERSEDED_REASON,
+  agentReportProgressDedupePrefix,
+} from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
 import {
   readAgentDefinition,
@@ -52,6 +57,7 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
+  getCompactionFollowUpContent,
   parseWorkspaceTurnTaskCorrelation,
   type MuxMessage,
   type MuxMessageMetadata,
@@ -107,6 +113,52 @@ import {
 // Only the reversible verbs are restored; task_remove stays the sole irreversible verb
 // (delete_worktree/remove remain in the result schema for historical-transcript parsing only).
 type WorkspaceLifecycleAction = "archive" | "unarchive";
+
+// Internal evidence only: future terminal transitions must name and justify their cause.
+// An arbitrary synthetic stream-end is not completion; unknown history retains the existing
+// conservative interruption policy rather than pretending that a manual input was observed.
+type WorkspaceTurnSettlementCause =
+  | {
+      kind:
+        | "creation-admission-failure"
+        | "creation-validation-failure"
+        | "launch-canceled"
+        | "send-failure"
+        | "stale-history-recovery"
+        | "stale-restart"
+        | "correlated-stream-end"
+        | "user-stream-abort"
+        | "continuation-failure"
+        | "terminal-stream-error"
+        | "recovery-admission-failure"
+        | "explicit-interrupt";
+    }
+  | { kind: "manual-supersession"; messageId: string }
+  | {
+      kind: "uncorrelated-conservative-fallback";
+      reason:
+        | "history-read-failed"
+        | "missing-stream-end"
+        | "missing-turn-anchor"
+        | "invalid-manual-input-id";
+    };
+
+const WORKSPACE_TURN_SETTLEMENT_CAUSES: Record<WorkspaceTurnSettlementCause["kind"], true> = {
+  "creation-admission-failure": true,
+  "creation-validation-failure": true,
+  "launch-canceled": true,
+  "send-failure": true,
+  "stale-history-recovery": true,
+  "stale-restart": true,
+  "correlated-stream-end": true,
+  "user-stream-abort": true,
+  "continuation-failure": true,
+  "terminal-stream-error": true,
+  "recovery-admission-failure": true,
+  "explicit-interrupt": true,
+  "manual-supersession": true,
+  "uncorrelated-conservative-fallback": true,
+};
 
 interface WorkspaceLifecycleTarget {
   taskId?: string;
@@ -281,6 +333,22 @@ const WORKSPACE_TURN_STALE_RESTART_ERROR = "Workspace turn interrupted after res
 const WORKSPACE_TURN_SUPERSEDED_BY_NEW_INPUT_ERROR =
   "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report";
 
+/** A human-authored child input that redirects the delegated turn. */
+function isManualChildWorkspaceInput(message: MuxMessage): boolean {
+  if (message.role !== "user") {
+    return false;
+  }
+  if (message.metadata?.synthetic !== true) {
+    return true;
+  }
+  const muxMetadata = message.metadata.muxMetadata;
+  return (
+    muxMetadata?.type === "compaction-request" &&
+    muxMetadata.source === "auto-compaction" &&
+    getCompactionFollowUpContent(muxMetadata)?.dispatchOptions?.source !== "internal-resume"
+  );
+}
+
 /**
  * Reason prefix persisted when the owner's OWN follow-up turn (task
  * kind="workspace", mode="existing", tool-end dispatch) cut its active
@@ -453,7 +521,8 @@ export class WorkspaceTurnManager {
     private readonly initStateManager: InitStateManager,
     private readonly taskHost: WorkspaceTurnManagerHost,
     private readonly terminalAttentionStore: TerminalAttentionStore,
-    private readonly streamManager?: StreamManager
+    private readonly streamManager?: StreamManager,
+    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
     this.taskHandleStore = new TaskHandleStore(config);
   }
@@ -1309,25 +1378,48 @@ export class WorkspaceTurnManager {
       ownerWorkspaceId === targetWorkspaceId
         ? [targetWorkspaceId]
         : [ownerWorkspaceId, targetWorkspaceId].sort();
+    let persistedHandle = false;
     const persisted = await this.withWorkspaceLifecycleLockKeys(
       lifecycleLockKeys,
       async (): Promise<"persisted" | "target_archived" | "owner_archived"> => {
         if (isArchivedInConfig(targetWorkspaceId)) return "target_archived";
         if (isArchivedInConfig(ownerWorkspaceId)) return "owner_archived";
-        await this.taskHandleStore.upsertWorkspaceTurn(record);
-        if (record.status !== "queued") {
-          this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
-            handleId,
-            ownerWorkspaceId,
-            // Reservation only: the sendMessage below may still fail requireIdle or be canceled
-            // pre-admission. Peer-send admission must not treat this entry as live until
-            // markWorkspaceTurnAccepted flips it.
-            accepted: false,
-          });
-        }
-        return "persisted";
+        return await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, async () => {
+          await this.taskHandleStore.upsertWorkspaceTurn(record);
+          persistedHandle = true;
+          if (record.status !== "queued") {
+            this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
+              handleId,
+              ownerWorkspaceId,
+              // Reservation only: the sendMessage below may still fail requireIdle or be canceled
+              // pre-admission. Peer-send admission must not treat this entry as live until
+              // markWorkspaceTurnAccepted flips it.
+              accepted: false,
+            });
+          }
+          if (targetIsAgentWorkspace) {
+            await this.persistAgentTaskExecutionState(
+              targetWorkspaceId,
+              handleId,
+              record.status,
+              true
+            );
+          }
+          return "persisted" as const;
+        });
       }
-    );
+    ).catch((error: unknown) => ({ error: getErrorMessage(error) }));
+    if (typeof persisted === "object") {
+      if (persistedHandle) {
+        await this.settleWorkspaceTurn({
+          cause: { kind: "creation-admission-failure" },
+          record,
+          next: { ...record, status: "error", updatedAt: getIsoNow(), error: persisted.error },
+          waiterSettlement: { status: "error", error: new Error(persisted.error) },
+        });
+      }
+      return Err(persisted.error);
+    }
     if (persisted === "target_archived") {
       return Err("Task.createWorkspaceTurn: target workspace was archived during turn creation");
     }
@@ -1354,10 +1446,6 @@ export class WorkspaceTurnManager {
       }
       return Err("Task.createWorkspaceTurn: owner workspace was archived during turn creation");
     }
-    if (targetIsAgentWorkspace) {
-      await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, record.status);
-    }
-
     if (agentValidationError != null) {
       // Deferred post-create validation failure: the record above keeps the created
       // workspace owner-owned (retryable via mode="existing"); settle the handle as a
@@ -1371,6 +1459,7 @@ export class WorkspaceTurnManager {
         error: agentValidationError,
       };
       await this.settleWorkspaceTurn({
+        cause: { kind: "creation-validation-failure" },
         record,
         next,
         waiterSettlement: { status: "error", error: new Error(agentValidationError) },
@@ -1390,6 +1479,12 @@ export class WorkspaceTurnManager {
         if (this.isTerminalWorkspaceTurnStatus(current.status)) {
           throw new Error(current.error ?? "Workspace turn was canceled before stream start");
         }
+        if (targetIsAgentWorkspace) {
+          const claimed = await this.desktopInputCoordinator.withAdmission(targetWorkspaceId, () =>
+            this.persistAgentTaskExecutionState(targetWorkspaceId, handleId, "running", true)
+          );
+          if (!claimed) throw new Error("Workspace turn was superseded before stream start");
+        }
         if (current.status !== "running") {
           await this.taskHandleStore.upsertWorkspaceTurn({
             ...current,
@@ -1398,7 +1493,6 @@ export class WorkspaceTurnManager {
           });
         }
         if (targetIsAgentWorkspace) {
-          await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, "running");
           // A stopped queued child keeps its only copy of the initial brief in taskPrompt. Once the
           // continuation accepts the replayed prompt, history owns that brief and the config copy can go.
           await this.taskHost.editWorkspaceEntry(
@@ -1474,6 +1568,7 @@ export class WorkspaceTurnManager {
             error: reason,
           };
           await this.settleWorkspaceTurn({
+            cause: { kind: "launch-canceled" },
             record: current,
             next,
             waiterSettlement: { status: "error", error: new Error(reason) },
@@ -1498,6 +1593,7 @@ export class WorkspaceTurnManager {
             error,
           };
           await this.settleWorkspaceTurn({
+            cause: { kind: "send-failure" },
             record: current,
             next,
             waiterSettlement: { status: "error", error: new Error(error) },
@@ -1516,6 +1612,7 @@ export class WorkspaceTurnManager {
         error,
       };
       await this.settleWorkspaceTurn({
+        cause: { kind: "send-failure" },
         record,
         next,
         waiterSettlement: { status: "error", error: new Error(error) },
@@ -2082,7 +2179,31 @@ export class WorkspaceTurnManager {
     await markDirectParentResultDelivered();
   }
 
+  private assertWorkspaceTurnSettlementCause(cause: WorkspaceTurnSettlementCause): void {
+    assert(
+      cause != null &&
+        typeof cause.kind === "string" &&
+        Object.hasOwn(WORKSPACE_TURN_SETTLEMENT_CAUSES, cause.kind),
+      "Workspace turn settlement requires a recognized cause"
+    );
+    if (cause.kind === "manual-supersession") {
+      assert(
+        typeof cause.messageId === "string" && cause.messageId.trim().length > 0,
+        "Manual supersession requires the superseding input messageId"
+      );
+    } else if (cause.kind === "uncorrelated-conservative-fallback") {
+      assert(
+        cause.reason === "history-read-failed" ||
+          cause.reason === "missing-stream-end" ||
+          cause.reason === "missing-turn-anchor" ||
+          cause.reason === "invalid-manual-input-id",
+        "Uncorrelated conservative fallback requires a recognized reason"
+      );
+    }
+  }
+
   private async settleWorkspaceTurn(params: {
+    cause: WorkspaceTurnSettlementCause;
     record: WorkspaceTurnTaskHandleRecord;
     next: WorkspaceTurnTaskHandleRecord;
     waiterSettlement:
@@ -2131,6 +2252,7 @@ export class WorkspaceTurnManager {
         settledRecord?: WorkspaceTurnTaskHandleRecord;
         foregroundWaiterWorkspaceIds?: Set<string>;
       } | null> => {
+        this.assertWorkspaceTurnSettlementCause(params.cause);
         const current = await this.taskHandleStore.getWorkspaceTurn(
           params.record.ownerWorkspaceId,
           params.record.handleId
@@ -2272,6 +2394,26 @@ export class WorkspaceTurnManager {
           active.ownerWorkspaceId === params.record.ownerWorkspaceId
         ) {
           this.activeWorkspaceTurnHandleByWorkspaceId.delete(params.record.workspaceId);
+        }
+        // Incremental agent_report updates from this execution were queued behind the owner's
+        // busy turn (reportAgentProgress routes them to the continuation owner). This terminal
+        // outcome supersedes them; left queued, each would later dispatch as a stale "in
+        // progress" turn. Drop them before waiters resolve so an owner whose task_await just
+        // returned cannot be cut at its next step boundary by an update it already outran.
+        // skipCancelCallbacks: when the owner itself runs as a delegated turn, each queued report
+        // carries continuation callbacks that would settle that live turn as interrupted.
+        const queuedProgressRemoval = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
+          params.record.ownerWorkspaceId,
+          agentReportProgressDedupePrefix(params.record.workspaceId, params.record.handleId),
+          { cancelReason: AGENT_REPORT_PROGRESS_SUPERSEDED_REASON, skipCancelCallbacks: true }
+        );
+        if (!queuedProgressRemoval.success) {
+          log.warn("Failed to remove queued incremental sub-agent reports at settlement", {
+            ownerWorkspaceId: params.record.ownerWorkspaceId,
+            childWorkspaceId: params.record.workspaceId,
+            handleId: params.record.handleId,
+            error: queuedProgressRemoval.error,
+          });
         }
         const foregroundWaiterWorkspaceIds = this.settleWorkspaceTurnWaiters(
           params.record.handleId,
@@ -2869,6 +3011,15 @@ export class WorkspaceTurnManager {
           ? { deferredMessageIds: options.deferredMessageIds }
           : {}),
       };
+      // Re-admission can fail if another child now controls this desktop. Do not revive the
+      // handle, erase terminal attention, or register it live until its durable mirror reserves it.
+      const taskEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), record.workspaceId);
+      if (taskEntry?.workspace.parentWorkspaceId != null) {
+        const claimed = await this.desktopInputCoordinator.withAdmission(record.workspaceId, () =>
+          this.persistAgentTaskExecutionState(record.workspaceId, record.handleId, "running", true)
+        );
+        if (!claimed) return current;
+      }
       delete next.error;
       // The revived turn's next terminal transition is a new outcome; re-arm its wake-up.
       // The notification tombstone must go too: enqueueIfAbsent would otherwise treat the
@@ -2987,6 +3138,8 @@ export class WorkspaceTurnManager {
           status: "interrupted",
           updatedAt: getIsoNow(),
         };
+        // Keep explicit stop's latch/mirror ordering in this lock, not the central helper.
+        this.assertWorkspaceTurnSettlementCause({ kind: "explicit-interrupt" });
         await this.taskHandleStore.upsertWorkspaceTurn(next);
         interruptedRecord = next;
         // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
@@ -3832,6 +3985,7 @@ export class WorkspaceTurnManager {
     const recovered = await this.recoverTerminalWorkspaceTurnFromHistory(record);
     if (recovered != null) {
       await this.settleWorkspaceTurn({
+        cause: { kind: "stale-history-recovery" },
         record,
         next: recovered,
         waiterSettlement:
@@ -3861,6 +4015,7 @@ export class WorkspaceTurnManager {
       error: WORKSPACE_TURN_STALE_RESTART_ERROR,
     };
     await this.settleWorkspaceTurn({
+      cause: { kind: "stale-restart" },
       record,
       next,
       waiterSettlement: {
@@ -4217,37 +4372,27 @@ export class WorkspaceTurnManager {
     };
   }
 
-  private async isStreamEndBeforeWorkspaceTurnPrompt(
+  private isWorkspaceTurnAnchorForRecord(
     record: WorkspaceTurnTaskHandleRecord,
-    event: StreamEndEvent
-  ): Promise<boolean> {
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
-    if (!historyResult.success) {
-      log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
-        workspaceId: event.workspaceId,
-        handleId: record.handleId,
-        error: historyResult.error,
-      });
-      return false;
+    message: MuxMessage
+  ): boolean {
+    const muxMetadata = message.metadata?.muxMetadata;
+    if (muxMetadata?.type === "workspace-turn-task") {
+      return (
+        muxMetadata.taskHandleId === record.handleId &&
+        muxMetadata.ownerWorkspaceId === record.ownerWorkspaceId &&
+        muxMetadata.turnId === record.turnId
+      );
     }
-
-    let streamEndIndex = -1;
-    let promptIndex = -1;
-    for (const [index, message] of historyResult.data.entries()) {
-      if (message.id === event.messageId) {
-        streamEndIndex = index;
-      }
-      const metadata = this.getWorkspaceTurnMetadataFromValue(message.metadata?.muxMetadata);
-      if (
-        metadata?.taskHandleId === record.handleId &&
-        metadata.ownerWorkspaceId === record.ownerWorkspaceId &&
-        metadata.turnId === record.turnId
-      ) {
-        promptIndex = index;
-      }
+    if (muxMetadata?.type === "compaction-summary") {
+      const preserved = muxMetadata.pendingFollowUp?.workspaceTurnMetadata;
+      return (
+        preserved?.taskHandleId === record.handleId &&
+        preserved.ownerWorkspaceId === record.ownerWorkspaceId &&
+        preserved.turnId === record.turnId
+      );
     }
-
-    return streamEndIndex !== -1 && promptIndex !== -1 && streamEndIndex < promptIndex;
+    return false;
   }
 
   private async interruptWorkspaceTurnFromUncorrelatedStreamEnd(
@@ -4281,7 +4426,39 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    if (await this.isStreamEndBeforeWorkspaceTurnPrompt(record, event)) {
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(event.workspaceId);
+    if (!historyResult.success) {
+      log.warn("Could not compare uncorrelated stream-end history for workspace turn", {
+        workspaceId: event.workspaceId,
+        handleId: record.handleId,
+        error: historyResult.error,
+      });
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event, {
+        kind: "uncorrelated-conservative-fallback",
+        reason: "history-read-failed",
+      });
+      return true;
+    }
+
+    let streamEndIndex = -1;
+    let turnAnchorIndex = -1;
+    for (const [index, message] of historyResult.data.entries()) {
+      if (message.id === event.messageId) {
+        streamEndIndex = index;
+      }
+      if (this.isWorkspaceTurnAnchorForRecord(record, message)) {
+        turnAnchorIndex = index;
+      }
+    }
+
+    if (streamEndIndex === -1 || turnAnchorIndex === -1) {
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(record, event, {
+        kind: "uncorrelated-conservative-fallback",
+        reason: streamEndIndex === -1 ? "missing-stream-end" : "missing-turn-anchor",
+      });
+      return true;
+    }
+    if (streamEndIndex < turnAnchorIndex) {
       log.debug("Ignoring stale uncorrelated stream-end before queued workspace turn prompt", {
         workspaceId: event.workspaceId,
         taskHandleId: record.handleId,
@@ -4290,6 +4467,31 @@ export class WorkspaceTurnManager {
       return true;
     }
 
+    const manualSupersessionInput = historyResult.data
+      .slice(turnAnchorIndex + 1, streamEndIndex)
+      .find(isManualChildWorkspaceInput);
+    if (manualSupersessionInput) {
+      // Readable JSON can still contain a malformed message ID. Preserve conservative
+      // interruption without inventing manual evidence or letting corrupt history strand waiters.
+      await this.settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
+        record,
+        event,
+        coerceNonEmptyString(manualSupersessionInput.id) != null
+          ? { kind: "manual-supersession", messageId: manualSupersessionInput.id }
+          : { kind: "uncorrelated-conservative-fallback", reason: "invalid-manual-input-id" }
+      );
+    }
+    return true;
+  }
+
+  private async settleWorkspaceTurnSupersededFromUncorrelatedStreamEnd(
+    record: WorkspaceTurnTaskHandleRecord,
+    event: StreamEndEvent,
+    cause: Extract<
+      WorkspaceTurnSettlementCause,
+      { kind: "manual-supersession" | "uncorrelated-conservative-fallback" }
+    >
+  ): Promise<void> {
     const error = "Workspace turn superseded by an uncorrelated workspace stream-end";
     const next: WorkspaceTurnTaskHandleRecord = {
       ...record,
@@ -4298,12 +4500,13 @@ export class WorkspaceTurnManager {
       messageId: event.messageId,
       error,
     };
+    delete next.deferredMessageIds;
     await this.settleWorkspaceTurn({
+      cause,
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
     });
-    return true;
   }
 
   /**
@@ -4320,9 +4523,6 @@ export class WorkspaceTurnManager {
         ...correlation,
       })
     ) {
-      return true;
-    }
-    if (this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)) {
       return true;
     }
     const activeStream = this.streamManager?.getStreamInfo(event.workspaceId);
@@ -4480,16 +4680,17 @@ export class WorkspaceTurnManager {
       return true;
     }
 
-    // A queued continuation can stop the in-flight stream at a tool boundary with
-    // finishReason "tool-calls" and continue the same delegated turn. Report
-    // wake-ups carry the exact correlation explicitly; bash-monitor wakes inherit
-    // it from history. Defer settlement until the continuation's terminal
-    // stream-end instead of reporting a false completion failure to the owner.
-    // Any other queued input (manual message, /compact) supersedes the turn and
-    // must settle the old outcome here.
+    // Parent guidance and report wake-ups continue the exact delegated turn. This includes
+    // turn-end guidance: don't publish an early report before the queued guidance runs.
+    // Uncorrelated bash-monitor wakes inherit only an open tool-boundary continuation;
+    // manual messages and /compact still supersede the old outcome.
     if (
-      event.metadata.finishReason === "tool-calls" &&
-      this.hasSameTurnContinuation(event, metadata)
+      (event.metadata.finishReason === "tool-calls" ||
+        event.metadata.finishReason === "stop" ||
+        event.metadata.finishReason == null) &&
+      (this.hasSameTurnContinuation(event, metadata) ||
+        (event.metadata.finishReason === "tool-calls" &&
+          this.workspaceService.hasPendingBashMonitorWakeContinuation(event.workspaceId)))
     ) {
       await this.markWorkspaceTurnStreamEndDeferred(event);
       return true;
@@ -4527,6 +4728,7 @@ export class WorkspaceTurnManager {
       }
     }
     await this.settleWorkspaceTurn({
+      cause: { kind: "correlated-stream-end" },
       record,
       next,
       waiterSettlement:
@@ -4569,6 +4771,7 @@ export class WorkspaceTurnManager {
       updatedAt: getIsoNow(),
     };
     await this.settleWorkspaceTurn({
+      cause: { kind: "user-stream-abort" },
       record,
       next,
       waiterSettlement: { status: "error", error: new Error("Workspace turn interrupted") },
@@ -4673,6 +4876,7 @@ export class WorkspaceTurnManager {
     };
     delete next.deferredMessageIds;
     await this.settleWorkspaceTurn({
+      cause: { kind: "continuation-failure" },
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(error) },
@@ -4734,6 +4938,7 @@ export class WorkspaceTurnManager {
       error: event.error,
     };
     await this.settleWorkspaceTurn({
+      cause: { kind: "terminal-stream-error" },
       record,
       next,
       waiterSettlement: { status: "error", error: new Error(event.error) },
@@ -4806,9 +5011,7 @@ export class WorkspaceTurnManager {
               : referenced;
         const record = selected?.record;
         if (record == null) {
-          if (task.taskExecutionId != null) {
-            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
-          }
+          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId, config);
           continue;
         }
 
@@ -4824,21 +5027,47 @@ export class WorkspaceTurnManager {
           continue;
         }
         if (normalized?.workspaceId !== task.id) {
-          if (task.taskExecutionId != null) {
-            await this.updateAgentTaskExecutionState(task.id, task.taskExecutionId, null);
-          }
+          await this.clearUnbackedAgentTaskExecutionMirror(task.id, task.taskExecutionId, config);
           continue;
         }
 
-        await this.taskHost.editWorkspaceEntry(
-          task.id,
-          (workspace) => {
-            workspace.taskExecutionId = normalized.handleId;
-            workspace.taskExecutionStatus = normalized.status;
-          },
-          { allowMissing: true }
-        );
-        await this.taskHost.emitWorkspaceMetadata(task.id);
+        if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
+          const taskId = task.id;
+          let claimed: boolean;
+          try {
+            claimed = await this.desktopInputCoordinator.withAdmission(taskId, () =>
+              this.persistAgentTaskExecutionState(
+                taskId,
+                normalized.handleId,
+                normalized.status,
+                true,
+                task.taskExecutionId
+              )
+            );
+          } catch (error) {
+            // Both durable activity sources must settle: leaving the pre-restart execution mirror
+            // active would reserve the desktop even after TaskService interrupts the task.
+            const message = getErrorMessage(error);
+            await this.settleWorkspaceTurn({
+              cause: { kind: "recovery-admission-failure" },
+              record: normalized,
+              next: { ...normalized, status: "error", updatedAt: getIsoNow(), error: message },
+              waiterSettlement: { status: "error", error: new Error(message) },
+            });
+            continue;
+          }
+          if (!claimed) continue;
+        } else {
+          await this.taskHost.editWorkspaceEntry(
+            task.id,
+            (workspace) => {
+              workspace.taskExecutionId = normalized.handleId;
+              workspace.taskExecutionStatus = normalized.status;
+            },
+            { allowMissing: true }
+          );
+          await this.taskHost.emitWorkspaceMetadata(task.id);
+        }
         if (isActiveWorkspaceTurnTaskStatus(normalized.status)) {
           this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
             handleId: normalized.handleId,
@@ -4861,18 +5090,71 @@ export class WorkspaceTurnManager {
     }
   }
 
+  /**
+   * Startup repair for an execution mirror with no backing handle record. With an ID the normal
+   * generation-guarded clear applies. Without one, the mirror is an orphan: every settlement path
+   * matches on taskExecutionId, so a stray active taskExecutionStatus could never settle — yet the
+   * desktop ledger reads it as live control of the owner's desktop. Only the mirror is dropped;
+   * the stable taskStatus is a separate activity source owned by TaskService recovery.
+   */
+  private async clearUnbackedAgentTaskExecutionMirror(
+    workspaceId: string,
+    taskExecutionId: string | undefined,
+    snapshot: ReturnType<Config["loadConfigOrDefault"]>
+  ): Promise<void> {
+    if (taskExecutionId != null) {
+      await this.updateAgentTaskExecutionState(workspaceId, taskExecutionId, null);
+      return;
+    }
+    // Decide from the startup snapshot so the common no-mirror case costs no config reload
+    // (initialize must not re-read config.json per completed-report task).
+    if (findWorkspaceEntry(snapshot, workspaceId)?.workspace.taskExecutionStatus == null) {
+      return;
+    }
+    let clearedOrphan = false;
+    await this.taskHost.editWorkspaceEntry(
+      workspaceId,
+      (workspace) => {
+        if (workspace.taskExecutionId != null || workspace.taskExecutionStatus == null) return;
+        delete workspace.taskExecutionStatus;
+        clearedOrphan = true;
+      },
+      { allowMissing: true }
+    );
+    if (clearedOrphan) {
+      await this.taskHost.emitWorkspaceMetadata(workspaceId);
+    }
+  }
+
   async updateAgentTaskExecutionState(
     workspaceId: string,
     handleId: string,
     status: WorkspaceTurnTaskStatus | null
   ): Promise<void> {
+    if (status != null && isActiveWorkspaceTurnTaskStatus(status)) {
+      await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
+        this.persistAgentTaskExecutionState(workspaceId, handleId, status)
+      );
+    } else {
+      await this.persistAgentTaskExecutionState(workspaceId, handleId, status);
+    }
+  }
+
+  private async persistAgentTaskExecutionState(
+    workspaceId: string,
+    handleId: string,
+    status: WorkspaceTurnTaskStatus | null,
+    allowNewExecution = false,
+    reconciledPreviousExecutionId?: string
+  ): Promise<boolean> {
     // editWorkspaceEntry reports `updated` for a mere existing workspace, so a queued/stale
     // handle B settling must not count as settlement for the DIFFERENT live handle A the mirror
     // points at — track whether the matching mirror was actually mutated.
     let settledMatchingMirror = false;
+    let claimedActiveMirror = false;
     const updated = await this.taskHost.editWorkspaceEntry(
       workspaceId,
-      (workspace) => {
+      (workspace, config) => {
         if (status == null) {
           if (workspace.taskExecutionId === handleId) {
             delete workspace.taskExecutionId;
@@ -4882,8 +5164,34 @@ export class WorkspaceTurnManager {
           return;
         }
         if (isActiveWorkspaceTurnTaskStatus(status)) {
+          const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+          // A delayed acceptance/recovery callback must not steal a newer continuation's mirror.
+          if (live != null && live.handleId !== handleId) return;
+          if (live == null) {
+            if (
+              !allowNewExecution &&
+              (workspace.taskExecutionId !== handleId ||
+                !isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus))
+            )
+              return;
+            if (
+              workspace.taskExecutionId !== handleId &&
+              isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus) &&
+              // Startup's timestamp-selected successor may replace the pointer it actually read,
+              // but never a different continuation published while reconciliation was suspended.
+              (reconciledPreviousExecutionId == null ||
+                workspace.taskExecutionId !== reconciledPreviousExecutionId)
+            )
+              return;
+          }
+          claimedActiveMirror = true;
           workspace.taskExecutionId = handleId;
           workspace.taskExecutionStatus = status;
+          // Cross-process/independent writes can land between the desktop gate's admission check
+          // and this transform. Re-validate against the config this transaction actually
+          // commits so a competing controller published meanwhile rejects the active mirror
+          // (terminal/clear branches stay ungated: releasing must always be allowed).
+          this.desktopInputCoordinator.assertAdmission(config, workspaceId);
           return;
         }
         if (workspace.taskExecutionId === handleId) {
@@ -4916,5 +5224,6 @@ export class WorkspaceTurnManager {
       }
       await this.taskHost.emitWorkspaceMetadata(workspaceId);
     }
+    return claimedActiveMirror || settledMatchingMirror;
   }
 }

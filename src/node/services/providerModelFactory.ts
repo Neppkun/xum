@@ -829,24 +829,6 @@ function parseAnthropicCacheTtl(value: unknown): AnthropicCacheTtl | undefined {
   return undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Model cost tracking
-// ---------------------------------------------------------------------------
-
-const MUX_MODEL_COSTS_INCLUDED = Symbol("mux:modelCostsIncluded");
-
-type LanguageModelWithMuxCostsIncluded = LanguageModel & {
-  [MUX_MODEL_COSTS_INCLUDED]?: true;
-};
-
-function markModelCostsIncluded(model: LanguageModel): void {
-  (model as LanguageModelWithMuxCostsIncluded)[MUX_MODEL_COSTS_INCLUDED] = true;
-}
-
-export function modelCostsIncluded(model: LanguageModel): boolean {
-  return (model as LanguageModelWithMuxCostsIncluded)[MUX_MODEL_COSTS_INCLUDED] === true;
-}
-
 const CODEX_ALLOWED_PARAMS = new Set([
   "model",
   "input",
@@ -1605,7 +1587,15 @@ export class ProviderModelFactory {
             .codexOauthDefaultAuth;
           const codexOauthDefaultAuth = codexOauthDefaultAuthRaw === "apiKey" ? "apiKey" : "oauth";
 
+          // Codex OAuth only serves the Responses API. Resolve the wire format
+          // before choosing credentials so Chat Completions falls back to the API
+          // key instead of sending the "codex-oauth" placeholder to api.openai.com.
+          const earlyWireFormat =
+            (providerConfig.wireFormat as string | undefined) ??
+            muxProviderOptions?.openai?.wireFormat;
+
           // Codex OAuth routing:
+          // - Chat Completions never routes through OAuth when an API key exists.
           // - Required models route through ChatGPT OAuth when connected.
           // - If OAuth is not connected, fall back to API key (if available).
           // - Allowed models route through OAuth only when:
@@ -1613,6 +1603,10 @@ export class ProviderModelFactory {
           //   - the user prefers OAuth when both are set.
           const shouldRouteThroughCodexOauth = (() => {
             if (!codexOauthAllowed || !storedCodexOauth) {
+              return false;
+            }
+
+            if (earlyWireFormat === "chatCompletions" && creds.isConfigured) {
               return false;
             }
 
@@ -1634,17 +1628,9 @@ export class ProviderModelFactory {
             return Err({ type: "api_key_not_found", provider: providerName });
           }
 
-          // chatCompletions mode requires a real API key — Codex OAuth only supports
-          // the Responses API endpoint. Block early with a clear error instead of
-          // sending requests with the "codex-oauth" placeholder key.
-          const earlyWireFormat =
-            (providerConfig.wireFormat as string | undefined) ??
-            muxProviderOptions?.openai?.wireFormat;
-          if (
-            shouldRouteThroughCodexOauth &&
-            earlyWireFormat === "chatCompletions" &&
-            !creds.isConfigured
-          ) {
+          // Chat Completions with OAuth only (no API key to fall back to): block
+          // early with a clear error instead of sending the placeholder key.
+          if (shouldRouteThroughCodexOauth && earlyWireFormat === "chatCompletions") {
             return Err({ type: "api_key_not_found", provider: providerName });
           }
 
@@ -1849,7 +1835,9 @@ export class ProviderModelFactory {
           // Skip Codex OAuth routing for chatCompletions — the Codex endpoint
           // only accepts Responses API format, so chat-completions requests would fail.
           if (shouldRouteThroughCodexOauth && effectiveWireFormat !== "chatCompletions") {
-            markModelCostsIncluded(model);
+            // OAuth can consume paid Business workspace credits. Keep API-equivalent cost estimates;
+            // authentication does not prove that usage is free.
+            // Apply this policy to new requests only. Do not migrate historical usage.
 
             // Codex OAuth requires store=false and must override any request-level
             // setting to avoid unresolved item_reference lookups.

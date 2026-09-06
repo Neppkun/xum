@@ -179,6 +179,7 @@ export const AppConfigOnDiskSchema = z
     defaultModel: z.string().optional(),
     advisorModelString: z.string().optional(),
     advisorThinkingLevel: ThinkingLevelSchema.optional(),
+    advisorReasoningMode: OpenAIReasoningModeSchema.optional(),
     advisorMaxUsesPerTurn: z.number().int().positive().nullable().optional(),
     advisorMaxOutputTokens: z.number().int().positive().nullable().optional(),
     hiddenModels: z.array(z.string()).optional(),
@@ -219,11 +220,7 @@ export type AppConfigMigrations = z.infer<typeof AppConfigMigrationsSchema>;
 export type AgentAiSubagentProfile = z.infer<typeof AgentAiSubagentProfileSchema>;
 export type AgentAiDefaultsEntry = z.infer<typeof AgentAiDefaultsEntrySchema>;
 export type AgentAiDefaults = z.infer<typeof AgentAiDefaultsSchema>;
-export type SubagentAiDefaultsEntry = z.infer<typeof SubagentAiDefaultsEntrySchema>;
 export type SubagentAiDefaults = z.infer<typeof SubagentAiDefaultsSchema>;
-export type GoalDefaultsConfig = z.infer<typeof GoalDefaultsSchema>;
-export type ModelFallbackTrigger = z.infer<typeof ModelFallbackTriggerSchema>;
-export type ModelFallbackEntry = z.infer<typeof ModelFallbackEntrySchema>;
 export type ModelFallbacks = z.infer<typeof ModelFallbacksSchema>;
 export type UpdateChannel = z.infer<typeof UpdateChannelSchema>;
 

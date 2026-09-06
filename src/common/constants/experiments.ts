@@ -1,3 +1,5 @@
+export const EXPERIMENTS_WRITE_TIMEOUT_MS = 10_000;
+
 /**
  * Experiments System
  *
@@ -18,12 +20,15 @@ export const EXPERIMENT_IDS = {
   DYNAMIC_WORKFLOWS: "dynamic-workflows",
   MEMORY: "memory",
   MEMORY_HOT_SET: "memory-hot-set",
+  MEMORY_INTUITION: "memory-intuition",
   MEMORY_CONSOLIDATION: "memory-consolidation",
   TOOL_SEARCH: "tool-search",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
+  CLAUDE_DESIGN_MCP: "claude-design-mcp",
   AGENT_PLUGINS: "agent-plugins",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   TIMELINE: "timeline",
+  CONTINUOUS_COMPACTION: "continuous-compaction",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
@@ -91,6 +96,21 @@ export interface ExperimentDefinition {
  * Use Record<ExperimentId, ExperimentDefinition> to ensure exhaustive coverage.
  */
 export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
+  [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: {
+    id: EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+    name: "Claude Design MCP",
+    description:
+      "Optionally reuse Claude Code credentials read-only for Claude Design. Configure credential access separately in MCP settings; Claude Code owns login, consent, and refresh.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: {
+    id: EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+    name: "Continuous Compaction",
+    description: "Compact older context between turns while preserving recent messages verbatim",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
     id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
     name: "Programmatic Tool Calling",
@@ -181,6 +201,13 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   // site; Settings nests it under the Agent Memory toggle). Without it, memories
   // stay pull-based like skills: index advertised in the memory tool description,
   // contents fetched on demand.
+  [EXPERIMENT_IDS.MEMORY_INTUITION]: {
+    id: EXPERIMENT_IDS.MEMORY_INTUITION,
+    name: "Memory Intuition",
+    description: "Recall relevant memories with a bounded, read-only intuition agent",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
   [EXPERIMENT_IDS.MEMORY_HOT_SET]: {
     id: EXPERIMENT_IDS.MEMORY_HOT_SET,
     name: "Memory Hot Set",

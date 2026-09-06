@@ -1,3 +1,4 @@
+import type { TurnCompletion } from "./streamManager";
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
 import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
@@ -939,6 +940,64 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
 
       expect(await dispatch(new AbortController().signal)).toBe("in-flight");
       expect(queuedModes).toEqual(["tool-end", "tool-end"]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("superseding queued sub-agent progress skips its continuation-failure callbacks", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "superseded-progress-owner";
+    await config.addWorkspace("/tmp/superseded-progress-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "superseded-progress-project",
+      projectPath: "/tmp/superseded-progress-project",
+      runtimeConfig: { type: "local" },
+    });
+    const session = service.getOrCreateSession(workspaceId);
+    const options: SendMessageOptions = { model: "gpt-4", agentId: "exec" };
+    try {
+      // A progress report queued into an owner that runs as a delegated turn carries callbacks
+      // that settle that turn as interrupted; supersession by the terminal report must not fire them.
+      const progressCanceled = mock(() => undefined);
+      const wakeCanceled = mock(() => undefined);
+      expect(
+        session.queueMessage("progress", options, {
+          synthetic: true,
+          agentInitiated: true,
+          dedupeKey: "agent-report:child:wst_1:call-1",
+          removableDedupeKey: true,
+          onCanceled: progressCanceled,
+        })
+      ).toBe("tool-end");
+      expect(
+        session.queueMessage("wake", options, {
+          synthetic: true,
+          agentInitiated: true,
+          dedupeKey: "bash-monitor-wake:owner:1",
+          removableDedupeKey: true,
+          onCanceled: wakeCanceled,
+        })
+      ).toBe("tool-end");
+
+      expect(
+        service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, "agent-report:child:wst_1:", {
+          cancelReason: "superseded",
+          skipCancelCallbacks: true,
+        })
+      ).toEqual(Ok(1));
+      // Withdrawal (the default) still notifies, so wake bookkeeping keeps working.
+      expect(
+        service.removeQueuedMessagesByDedupeKeyPrefix(workspaceId, "bash-monitor-wake:", {
+          cancelReason: "withdrawn",
+        })
+      ).toEqual(Ok(1));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(progressCanceled).not.toHaveBeenCalled();
+      expect(wakeCanceled).toHaveBeenCalledWith("withdrawn");
+      expect(session.hasQueuedMessages()).toBe(false);
     } finally {
       await cleanup();
     }
@@ -9206,6 +9265,31 @@ describe("WorkspaceService sendMessage status clearing", () => {
     }
   });
 
+  test.each(["sendMessage", "resumeStream"] as const)(
+    "%s refuses the stream when desktop task admission fails",
+    async (operation) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
+      workspaceService.setAgentTaskIntegration(
+        makeAgentTaskIntegrationFake({
+          markInterruptedTaskRunning: mock(() =>
+            Promise.reject(new Error("Desktop is controlled by another child"))
+          ),
+          restoreInterruptedTaskAfterResumeFailure,
+        })
+      );
+      const options = { model: "openai:gpt-4o-mini", agentId: "exec" };
+      const result =
+        operation === "sendMessage"
+          ? await workspaceService.sendMessage("test-workspace", "hello", options)
+          : await workspaceService.resumeStream("test-workspace", options);
+      expect(result.success).toBe(false);
+      expect(fakeSession.sendMessage).not.toHaveBeenCalled();
+      expect(fakeSession.resumeStream).not.toHaveBeenCalled();
+      expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
+    }
+  );
+
   // Send outcome drives interrupted-task rollback: a successful send keeps the
   // restored running status; a failed or thrown send rolls it back.
   test.each([
@@ -9241,7 +9325,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     if (expectSuccess) {
       expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
     } else {
-      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+        "test-workspace",
+        undefined
+      );
     }
   });
 
@@ -9287,7 +9374,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(markInterruptedTaskRunning).toHaveBeenCalledWith("test-workspace");
 
     await startupFailureHandled.promise;
-    expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+    expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+      "test-workspace",
+      undefined
+    );
   });
 
   // Resume outcome drives interrupted-task rollback: only a resume that actually
@@ -9325,7 +9415,10 @@ describe("WorkspaceService sendMessage status clearing", () => {
     if (resumeOutcome === "started") {
       expect(restoreInterruptedTaskAfterResumeFailure).not.toHaveBeenCalled();
     } else {
-      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith("test-workspace");
+      expect(restoreInterruptedTaskAfterResumeFailure).toHaveBeenCalledWith(
+        "test-workspace",
+        undefined
+      );
     }
   });
 
@@ -9451,6 +9544,44 @@ describe("WorkspaceService sendMessage status clearing", () => {
         onCanceled: undefined,
         onAcceptedPreStreamFailure: undefined,
       })
+    );
+  });
+
+  test("judges a promoted progress report's correlation against the entries it stays behind", async () => {
+    fakeSession.hasQueuedOrDispatchingEntry.mockReturnValue(false);
+    const onCanceled = mock(() => undefined);
+    const muxMetadata = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_promoted_progress",
+      ownerWorkspaceId: "owner-workspace",
+      turnId: "turn-promoted-progress",
+    };
+
+    const result = await workspaceService.sendMessage(
+      "test-workspace",
+      "nested progress",
+      { model: "openai:gpt-4o-mini", agentId: "exec", muxMetadata },
+      {
+        synthetic: true,
+        agentInitiated: true,
+        workspaceTurnContinuation: true,
+        queueDedupeKey: "agent-report:child:call-1",
+        removableQueueDedupeKey: true,
+        promoteAheadOfHiddenTurnEnd: true,
+        onCanceled,
+      }
+    );
+
+    expect(result.success).toBe(true);
+    // The session excludes the hidden turn-end entries the promotion will overtake (e.g. a
+    // queued heartbeat) when deciding whether a predecessor supersedes this continuation.
+    expect(fakeSession.hasQueuedOrDispatchingEntry).toHaveBeenCalledWith(muxMetadata, {
+      promoteAheadOfHiddenTurnEnd: true,
+    });
+    expect(fakeSession.queueMessage).toHaveBeenCalledWith(
+      "nested progress",
+      expect.objectContaining({ muxMetadata }),
+      expect.objectContaining({ onCanceled, promoteAheadOfHiddenTurnEnd: true })
     );
   });
 
@@ -13013,16 +13144,27 @@ describe("WorkspaceService remove desktop session cleanup", () => {
   });
 
   test("remove() closes desktop sessions on success", async () => {
-    const close = mock(() => Promise.resolve(undefined));
+    let guard: ((workspaceId: string) => boolean) | undefined;
+    const guardDuringClose: { value?: boolean } = {};
+    const close = mock(() => {
+      // Desktop startups consult this guard synchronously; a borrower bridge connecting between
+      // the close and the awaited config deletion must be refused just like during archive.
+      guardDuringClose.value = guard?.(workspaceId);
+      return Promise.resolve(undefined);
+    });
     const desktopSessionManager = {
       close,
-      setWorkspaceArchiveGuard: () => undefined,
+      setWorkspaceArchiveGuard: (next: (workspaceId: string) => boolean) => {
+        guard = next;
+      },
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
+    expect(guard?.(workspaceId)).toBe(false);
 
     const result = await workspaceService.remove(workspaceId);
 
     expect(result.success).toBe(true);
+    expect(guardDuringClose.value).toBe(true);
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
   });
@@ -13341,6 +13483,44 @@ describe("WorkspaceService setPinned", () => {
     expect(emittedMetadata[1].metadata?.pinnedAt).toBeUndefined();
   });
 
+  test("corrupted boundary pinnedAt on another chat cannot block pinning", async () => {
+    // A parseable boundary timestamp has no representable +1ms successor; the
+    // global monotonic scan must ignore it rather than fail every future pin.
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = "+275760-09-13T00:00:00.000Z";
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const pinnedAt = getEntry(rootId)?.pinnedAt;
+    expect(pinnedAt).toBeDefined();
+    // The assigned timestamp is a normal near-now value, not a successor of
+    // the corrupted boundary.
+    expect(new Date(pinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
+  test("pinning heals a saturated boundary timestamp so keys stay unique", async () => {
+    // An existing pin at the sane cap has no strictly-greater sane successor;
+    // the write path renumbers pins instead of minting a duplicate key.
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = saneMax;
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const rootPinnedAt = getEntry(rootId)?.pinnedAt;
+    const otherPinnedAt = getEntry(otherRootId)?.pinnedAt;
+    expect(rootPinnedAt).toBeDefined();
+    expect(otherPinnedAt).toBeDefined();
+    expect(rootPinnedAt).not.toBe(otherPinnedAt);
+    // The healed pin sorts before the new pin and both are near-now values.
+    expect(new Date(otherPinnedAt ?? "").getTime()).toBeLessThan(
+      new Date(rootPinnedAt ?? "").getTime()
+    );
+    expect(new Date(rootPinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
   test("pin-when-pinned and unpin-when-unpinned are no-ops without event churn", async () => {
     const first = await workspaceService.setPinned(rootId, true);
     expect(first.success).toBe(true);
@@ -13576,9 +13756,10 @@ describe("WorkspaceService reorderPinned", () => {
     expect(emittedMetadata).toHaveLength(0);
   });
 
-  test("drops stale/unpinned/duplicate ids and appends omitted pins in current order", async () => {
+  test("drops stale/unpinned/duplicate ids and keeps omitted pins in place", async () => {
     // Client sends duplicates, an unpinned id, a sub-agent, an archived chat,
-    // and a ghost id, and omits B and C entirely.
+    // and a ghost id, and omits B entirely: C and A swap within the slots
+    // they occupy while omitted B keeps its position.
     const result = await workspaceService.reorderPinned([
       idC,
       idC,
@@ -13586,10 +13767,10 @@ describe("WorkspaceService reorderPinned", () => {
       childId,
       archivedId,
       "ws-ghost",
+      idA,
     ]);
     expect(result.success).toBe(true);
-    // C first, then omitted pins A, B keep their relative order.
-    expect(pinnedOrder()).toEqual([idC, idA, idB]);
+    expect(pinnedOrder()).toEqual([idC, idB, idA]);
     // Ineligible ids never gain pinnedAt.
     expect(getEntry(unpinnedId)?.pinnedAt).toBeUndefined();
     expect(getEntry(childId)?.pinnedAt).toBeUndefined();
@@ -13631,6 +13812,152 @@ describe("WorkspaceService reorderPinned", () => {
     const values = [idB, idC, idA].map((id) => Date.parse(getEntry(id)?.pinnedAt ?? ""));
     expect(values[0]).toBeLessThan(values[1]);
     expect(values[1]).toBeLessThan(values[2]);
+  });
+});
+
+describe("WorkspaceService reorderPinned across projects", () => {
+  const projectA = "/tmp/project-a";
+  const projectB = "/tmp/project-b";
+  const idA1 = "ws-a1";
+  const idA2 = "ws-a2";
+  const idA3 = "ws-a3";
+  const idB1 = "ws-b1";
+  const idB2 = "ws-b2";
+
+  let workspaceService: WorkspaceService;
+  let configState: ProjectsConfig;
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+
+  const findEntry = (id: string) => {
+    for (const [projectPath, project] of configState.projects) {
+      const entry = project.workspaces.find((w) => w.id === id);
+      if (entry) return { projectPath, entry };
+    }
+    return undefined;
+  };
+
+  /** Pinned ids across all projects in effective order (pinnedAt asc), as the flat sidebar sorts them. */
+  const globalPinnedOrder = () =>
+    [...configState.projects.values()]
+      .flatMap((project) => project.workspaces)
+      .filter((w) => w.id && w.pinnedAt && !w.parentWorkspaceId && !w.archivedAt)
+      .sort((a, b) => Date.parse(a.pinnedAt ?? "") - Date.parse(b.pinnedAt ?? ""))
+      .map((w) => w.id);
+
+  beforeEach(async () => {
+    // Interleaved global pin order: a1, b1, a2, b2.
+    configState = {
+      projects: new Map([
+        [
+          projectA,
+          {
+            workspaces: [
+              { path: `${projectA}/${idA1}`, id: idA1, pinnedAt: "2026-01-01T00:00:00.000Z" },
+              { path: `${projectA}/${idA2}`, id: idA2, pinnedAt: "2026-01-01T00:00:20.000Z" },
+              { path: `${projectA}/${idA3}`, id: idA3 },
+            ],
+          },
+        ],
+        [
+          projectB,
+          {
+            workspaces: [
+              { path: `${projectB}/${idB1}`, id: idB1, pinnedAt: "2026-01-01T00:00:10.000Z" },
+              { path: `${projectB}/${idB2}`, id: idB2, pinnedAt: "2026-01-01T00:00:30.000Z" },
+            ],
+          },
+        ],
+      ]),
+    };
+
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      findWorkspace: mock((id: string) => {
+        const found = findEntry(id);
+        if (!found) return null;
+        return {
+          projectPath: found.projectPath,
+          workspacePath: found.entry.path,
+          parentWorkspaceId: found.entry.parentWorkspaceId,
+        };
+      }),
+      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
+        configState = fn(configState);
+        return Promise.resolve();
+      }),
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+      loadConfigOrDefault: mock(() => configState),
+    };
+
+    workspaceService = createWorkspaceServiceForTest({
+      config: mockConfig,
+      historyService,
+    });
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("persists a flat-mode reorder spanning project buckets", async () => {
+    const maxBefore = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+
+    // Drag b1 above a1 in the unified pinned block.
+    const result = await workspaceService.reorderPinned([idB1, idA1, idA2, idB2]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idB1, idA1, idA2, idB2]);
+
+    // The timestamp pool is re-dealt, not inflated.
+    const maxAfter = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+    expect(maxAfter).toBe(maxBefore);
+  });
+
+  test("setPinned appends after the global pinned max, not just its own bucket's", async () => {
+    // Give the other bucket the newest pin so a bucket-local max would sort the
+    // new pin above it in the flat sidebar's unified block.
+    const future = new Date(Date.now() + 60_000).toISOString();
+    findEntry(idB2)!.entry.pinnedAt = future;
+
+    expect((await workspaceService.setPinned(idA3, true)).success).toBe(true);
+    expect(globalPinnedOrder().at(-1)).toBe(idA3);
+  });
+
+  test("partial cross-bucket reorder keeps omitted pins in their global slots", async () => {
+    // The grouped multi-project section sends only its own pinned ids, which
+    // can live in different project buckets. Swapping b1 and a2 must not
+    // displace the ordinary pins a1 and b2 in the flat global order.
+    const a1Before = findEntry(idA1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idB1]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idA1, idA2, idB1, idB2]);
+    // The untouched slots keep their exact timestamps.
+    expect(findEntry(idA1)?.entry.pinnedAt).toBe(a1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
+  });
+
+  test("grouped-mode reorder of one bucket leaves other buckets' timestamps untouched", async () => {
+    const b1Before = findEntry(idB1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idA1]);
+    expect(result.success).toBe(true);
+
+    // Project A flipped within its own timestamp pool.
+    const a1 = Date.parse(findEntry(idA1)?.entry.pinnedAt ?? "");
+    const a2 = Date.parse(findEntry(idA2)?.entry.pinnedAt ?? "");
+    expect(a2).toBeLessThan(a1);
+    // Project B was not referenced, so its entries are byte-identical.
+    expect(findEntry(idB1)?.entry.pinnedAt).toBe(b1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
   });
 });
 
@@ -13739,6 +14066,33 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(editConfigSpy).not.toHaveBeenCalled();
   });
 
+  test.each([
+    ["shared", "interrupted", "owner"],
+    ["isolated", "queued", undefined],
+  ] as const)(
+    "archiving a %s queued child leaves its task status %s",
+    async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
+      const project = configState.projects.get(projectPath);
+      if (!project) throw new Error("project fixture must exist");
+      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
+      Object.assign(project.workspaces[1], {
+        parentWorkspaceId: "owner",
+        taskStatus: "queued",
+        taskPrompt: "brief",
+        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+      });
+
+      expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
+
+      // A shared child must not stay an active borrower of the owner's desktop while archived;
+      // the queued brief survives for the reawaken path.
+      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      expect(entry?.archivedAt).toBeTruthy();
+      expect(entry?.taskStatus).toBe(expectedStatus);
+      expect(entry?.taskPrompt).toBe("brief");
+    }
+  );
+
   test("returns Err and does not persist archivedAt when beforeArchive hook fails", async () => {
     const hooks = new WorkspaceLifecycleHooks();
     hooks.registerBeforeArchive(() => Promise.resolve(Err("hook failed")));
@@ -13844,17 +14198,31 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(closeWorkspaceSessions).not.toHaveBeenCalled();
   });
 
-  test("archive() closes desktop sessions on success", async () => {
-    const close = mock(() => Promise.resolve(undefined));
+  test("archive() releases desktop viewers before persisting the archived identity", async () => {
+    const started = createDeferred<void>();
+    const released = createDeferred<void>();
+    const close = mock(() => {
+      started.resolve();
+      return released.promise;
+    });
     const desktopSessionManager = {
       close,
       setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
-    const result = await workspaceService.archive(workspaceId);
+    const archiving = workspaceService.archive(workspaceId);
+    await started.promise;
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    try {
+      expect(entry?.archivedAt).toBeUndefined();
+    } finally {
+      released.resolve();
+    }
+    const result = await archiving;
 
     expect(result.success).toBe(true);
+    expect(entry?.archivedAt).toBeTruthy();
     expect(close).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledWith(workspaceId);
   });
@@ -14740,6 +15108,31 @@ describe("WorkspaceService unarchive lifecycle hooks", () => {
     await cleanupHistory();
   });
 
+  test.each([
+    ["shared", "interrupted", "owner"],
+    ["isolated", "queued", undefined],
+  ] as const)(
+    "unarchiving a legacy archived %s queued child leaves its task status %s",
+    async (_kind, expectedStatus, taskDesktopOwnerWorkspaceId) => {
+      const project = configState.projects.get(projectPath);
+      if (!project) throw new Error("project fixture must exist");
+      project.workspaces.unshift({ path: "/tmp/project/owner", id: "owner" });
+      Object.assign(project.workspaces[1], {
+        parentWorkspaceId: "owner",
+        taskStatus: "queued",
+        ...(taskDesktopOwnerWorkspaceId !== undefined ? { taskDesktopOwnerWorkspaceId } : {}),
+      });
+
+      expect(await workspaceService.unarchive(workspaceId)).toEqual(Ok(undefined));
+
+      // Records archived before archive-time settlement must not resurface as a second active
+      // controller in the same edit that makes them visible again.
+      const entry = project.workspaces.find((w) => w.id === workspaceId);
+      expect(entry?.unarchivedAt).toBeTruthy();
+      expect(entry?.taskStatus).toBe(expectedStatus);
+    }
+  );
+
   test("persists unarchivedAt and runs afterUnarchive hooks (best-effort)", async () => {
     const hooks = new WorkspaceLifecycleHooks();
 
@@ -15434,20 +15827,6 @@ describe("WorkspaceService unarchive snapshot restore", () => {
   });
 
   test("unarchive() returns Err when snapshot restore fails", async () => {
-    const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
-    workspaceService.setWorktreeArchiveSnapshotService({
-      preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
-      captureSnapshotForArchive: mock(() => Promise.resolve(Err("unused"))),
-      restoreSnapshotAfterUnarchive,
-      getUnsupportedUntrackedPaths: mock(() => Promise.resolve(Ok([]))),
-    });
-
-    const result = await workspaceService.unarchive(workspaceId);
-
-    expect(result).toEqual(Err("restore failed"));
-  });
-
-  test("unarchive() rolls back unarchivedAt when snapshot restore fails", async () => {
     const restoreSnapshotAfterUnarchive = mock(() => Promise.resolve(Err("restore failed")));
     workspaceService.setWorktreeArchiveSnapshotService({
       preflightSnapshotForArchive: mock(() => Promise.resolve(Ok(undefined))),
@@ -18007,6 +18386,100 @@ describe("WorkspaceService interruptStream", () => {
 
   afterEach(async () => {
     await cleanupHistory();
+  });
+
+  test("sendQueuedImmediately waits for interrupted accounting and terminal publication", async () => {
+    const workspaceId = "ws-interrupt-policy-barrier";
+    const completion = Promise.withResolvers<TurnCompletion>();
+    const accountingEntered = Promise.withResolvers<void>();
+    const releaseAccounting = Promise.withResolvers<void>();
+    const replacementStarted = Promise.withResolvers<void>();
+    const emitter = new EventEmitter();
+    const terminalOrder: string[] = [];
+    let streamCount = 0;
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter: emitter,
+      captureEvents: true,
+      aiServiceOverrides: {
+        streamMessage: mock(() => {
+          const messageId = `assistant-${++streamCount}`;
+          emitter.emit("stream-start", {
+            type: "stream-start",
+            workspaceId,
+            messageId,
+            model: "openai:gpt-4o",
+            startTime: Date.now(),
+          });
+          if (streamCount === 2) replacementStarted.resolve();
+          return Promise.resolve(
+            Ok({
+              messageId,
+              completion:
+                streamCount === 1
+                  ? completion.promise
+                  : new Promise<TurnCompletion>(() => undefined),
+            })
+          );
+        }),
+        stopStream: mock(() => {
+          const streamAbort = {
+            type: "stream-abort" as const,
+            workspaceId,
+            messageId: "assistant-1",
+            abortReason: "user" as const,
+          };
+          emitter.emit("stream-abort", streamAbort);
+          completion.resolve({ status: "aborted", abortReason: "user", streamAbort });
+          return Promise.resolve(Ok(undefined));
+        }),
+      },
+    });
+    const workspaceService = createWorkspaceServiceForTest({
+      config: h.config,
+      historyService: h.historyService,
+      aiService: h.aiService as AIService,
+      initStateManager: h.initStateManager,
+      backgroundProcessManager: h.backgroundProcessManager,
+    });
+    spyOn(workspaceService, "getOrCreateSession").mockReturnValue(h.session);
+    const policy = h.session as unknown as {
+      recordGoalAccountingFromUsage(input: unknown): Promise<void>;
+    };
+    spyOn(policy, "recordGoalAccountingFromUsage").mockImplementation(async () => {
+      accountingEntered.resolve();
+      await releaseAccounting.promise;
+    });
+    const dispatch = spyOn(h.session, "sendNextUserQueuedMessage");
+    h.session.onChatEvent(({ message }) => {
+      if (message.type === "stream-start" || message.type === "stream-abort")
+        terminalOrder.push(`${message.type}:${message.messageId}`);
+    });
+    let interrupt: Promise<unknown> | undefined;
+    try {
+      await h.session.sendMessage("source", { model: "openai:gpt-4o", agentId: "exec" });
+      h.session.queueMessage("queued replacement", { model: "openai:gpt-4o", agentId: "exec" });
+      interrupt = workspaceService.interruptStream(workspaceId, { sendQueuedImmediately: true });
+      await accountingEntered.promise;
+      // Drain the facade's Promise-only bookkeeping while terminal accounting is
+      // held by the explicit barrier; no elapsed-time assumption or timer is needed.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(dispatch).not.toHaveBeenCalled();
+      releaseAccounting.resolve();
+      await interrupt;
+      await replacementStarted.promise;
+      expect(terminalOrder).toEqual([
+        "stream-start:assistant-1",
+        "stream-abort:assistant-1",
+        "stream-start:assistant-2",
+      ]);
+      expect(h.session.isBusy()).toBe(true);
+    } finally {
+      releaseAccounting.resolve();
+      await interrupt;
+      h.session.dispose();
+      await h.cleanup();
+    }
   });
 
   test("sendQueuedImmediately clears hard-interrupt suppression before queued resend", async () => {

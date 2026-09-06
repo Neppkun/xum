@@ -2,6 +2,29 @@ import { describe, expect, test } from "bun:test";
 import { SendMessageOptionsSchema } from "./stream";
 
 describe("SendMessageOptions experiments", () => {
+  test.each([true, false, undefined])(
+    "round-trips memoryIntuition override %s without inventing defaults",
+    (memoryIntuition) => {
+      const parsed = SendMessageOptionsSchema.parse({
+        model: "openai:gpt-5.2",
+        agentId: "exec",
+        experiments: { memoryIntuition },
+      });
+      expect(parsed.experiments?.memoryIntuition).toBe(memoryIntuition);
+    }
+  );
+  test.each([true, false, undefined])(
+    "preserves the continuous compaction override without turning absence into opt-out (%s)",
+    (continuousCompaction) => {
+      const parsed = SendMessageOptionsSchema.parse({
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+        experiments: continuousCompaction === undefined ? {} : { continuousCompaction },
+      });
+      expect(parsed.experiments?.continuousCompaction).toBe(continuousCompaction);
+    }
+  );
+
   test("rlm round-trips through the send-options schema", () => {
     // Zod strips undeclared keys, so surviving a parse proves the flag is a
     // declared send-options field (not silently dropped en route to backend).

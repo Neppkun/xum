@@ -110,13 +110,13 @@ export const RuntimeStatusEventSchema = z.object({
   detail: z.string().optional(), // Human-readable status like "Starting Coder workspace..."
 });
 
-export const AutoCompactionTriggeredEventSchema = z.object({
+const AutoCompactionTriggeredEventSchema = z.object({
   type: z.literal("auto-compaction-triggered"),
   reason: z.enum(["on-send", "mid-stream", "idle"]),
   usagePercent: z.number(),
 });
 
-export const AutoCompactionCompletedEventSchema = z.object({
+const AutoCompactionCompletedEventSchema = z.object({
   type: z.literal("auto-compaction-completed"),
   newUsagePercent: z.number(),
 });
@@ -294,7 +294,7 @@ export const StreamEndEventSchema = z.object({
 
 export const StreamAbortReasonSchema = z.enum(["user", "startup", "system"]);
 
-export const StreamLifecyclePhaseSchema = z.enum([
+const StreamLifecyclePhaseSchema = z.enum([
   "idle",
   "preparing",
   "streaming",
@@ -672,7 +672,14 @@ export const RestoreToInputEventSchema = z.object({
 // All streaming events now have a `type` field for O(1) discriminated union lookup.
 // XumMessages (user/assistant chat messages) are emitted with type: "message"
 // when loading from history or sending new messages.
+export const PrefixSwapInvalidatedEventSchema = z.object({
+  type: z.literal("prefix-swap-invalidated"),
+  workspaceId: z.string(),
+  messageId: z.string(),
+});
+
 export const WorkspaceChatMessageSchema = z.discriminatedUnion("type", [
+  PrefixSwapInvalidatedEventSchema,
   // Stream lifecycle events
   HeartbeatEventSchema,
   CaughtUpMessageSchema,
@@ -807,9 +814,11 @@ export const ExperimentsSchema = z.preprocess(
     advisorTool: z.boolean().optional(),
     dynamicWorkflows: z.boolean().optional(),
     memory: z.boolean().optional(),
+    memoryIntuition: z.boolean().optional(),
     timeline: z.boolean().optional(),
     workspaceHeartbeats: z.boolean().optional(),
     toolSearch: z.boolean().optional(),
+    continuousCompaction: z.boolean().optional(),
   })
 );
 
@@ -911,6 +920,3 @@ export const SendMessageOptionsSchema = z.object({
   goalInterventionPolicy: GoalInterventionPolicySchema.nullish(),
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).nullish(),
 });
-
-// Re-export ChatUsageDisplaySchema for convenience
-export { ChatUsageDisplaySchema };

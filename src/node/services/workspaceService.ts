@@ -1,4 +1,8 @@
 import type { RestartBlocker } from "@/common/orpc/types";
+import {
+  DesktopInputCoordinator,
+  settleArchivedSharedDesktopTask,
+} from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
 import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
@@ -19,6 +23,7 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   comparePinnedOrder,
   isWorkspacePinned,
+  appendPinnedTimestamp,
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -2351,7 +2356,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
     ),
-    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir)
+    private readonly providersConfigStore = new ProvidersConfigStore(config.rootDir),
+    private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -2927,8 +2933,13 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     // Archive admission pairing for desktop startups (mirrors setTerminalService above):
     // ensureStarted checks this guard in the same synchronous block that registers its startup
     // promise, so whichever of {archive gate, desktop startup entry} runs first is observed by
-    // the other.
-    manager.setWorkspaceArchiveGuard((workspaceId) => this.archivingWorkspaces.has(workspaceId));
+    // the other. Removal latches removingWorkspaces before closing the desktop and only then
+    // awaits config deletion, so a borrower bridge connecting in that window must be refused
+    // by the same guard rather than start a session the removal never closes.
+    manager.setWorkspaceArchiveGuard(
+      (workspaceId) =>
+        this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)
+    );
   }
 
   private async closeDesktopSessionBestEffort(
@@ -3276,9 +3287,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
     }
 
-    // Archiving hides workspace UI; do not leave terminal PTYs or desktop sessions running headless.
+    // Archiving hides workspace UI; do not leave terminal PTYs running headless.
     this.terminalService?.closeWorkspaceSessions(workspaceId);
-    await this.closeDesktopSessionBestEffort(workspaceId, "archive");
   }
 
   /**
@@ -7508,6 +7518,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       const { projectPath, workspacePath } = workspace;
 
       let updated = false;
+      const healedIds: string[] = [];
       let validationError: string | undefined;
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);
@@ -7539,18 +7550,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           if (workspaceEntry.pinnedAt) {
             return config;
           }
-          // Server-generated monotonic timestamp: strictly greater than every existing
-          // pin in the project so rapid pins always append deterministically, even if
-          // the wall clock is skewed or several pins land within the same millisecond.
-          let pinnedAtMs = Date.now();
-          for (const entry of projectConfig.workspaces) {
-            if (!entry.pinnedAt) continue;
-            const existingMs = new Date(entry.pinnedAt).getTime();
-            if (Number.isFinite(existingMs) && existingMs >= pinnedAtMs) {
-              pinnedAtMs = existingMs + 1;
+          // Server-generated global monotonic timestamp, plus write-path
+          // healing when corrupted state saturates the sane key range; see
+          // appendPinnedTimestamp.
+          const pinnedEntries = Array.from(config.projects.values()).flatMap((project) =>
+            project.workspaces
+              .filter((entry) => entry.pinnedAt)
+              .map((entry) => ({ id: entry.id, pinnedAt: entry.pinnedAt }))
+          );
+          const { changed, pinnedAt } = appendPinnedTimestamp(pinnedEntries);
+          if (changed.size > 0) {
+            for (const project of config.projects.values()) {
+              for (const entry of project.workspaces) {
+                if (!entry.id) continue;
+                const healedPinnedAt = changed.get(entry.id);
+                if (healedPinnedAt !== undefined) {
+                  entry.pinnedAt = healedPinnedAt;
+                  healedIds.push(entry.id);
+                }
+              }
             }
           }
-          workspaceEntry.pinnedAt = new Date(pinnedAtMs).toISOString();
+          workspaceEntry.pinnedAt = pinnedAt;
           updated = true;
         } else if (workspaceEntry.pinnedAt) {
           delete workspaceEntry.pinnedAt;
@@ -7564,6 +7585,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(validationError);
       }
 
+      if (healedIds.length > 0) {
+        await this.emitCurrentWorkspaceMetadataBatch(healedIds);
+      }
       if (updated) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }
@@ -7575,11 +7599,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   }
 
   /**
-   * Reorder the pinned block of one project bucket. `workspaceIds` is the full
-   * desired pinned order for that bucket as the client sees it. Defensive
-   * contract: unknown/unpinned ids are dropped, currently-pinned ids omitted
-   * from the input keep their relative order and are appended, so concurrent
-   * pin/unpin from other clients is absorbed instead of erroring.
+   * Reorder a pinned block. `workspaceIds` is the full desired pinned order
+   * for that block as the client sees it: one project bucket in grouped mode,
+   * or the unified cross-project block in flat sidebar mode. The reorder
+   * scope is the union of config buckets referenced by the input ids, so a
+   * grouped drag never disturbs other buckets while a flat drag re-deals the
+   * whole unified block. Defensive contract: unknown/unpinned ids are
+   * dropped, and partial inputs (e.g. the grouped multi-project section sends
+   * only its own pins, which can span project buckets) permute the requested
+   * ids among the slots they already occupy while every omitted pin keeps its
+   * current position, so a section drag never shifts unrelated chats in the
+   * flat global order and concurrent pin/unpin from other clients is absorbed
+   * instead of erroring.
    *
    * Persistence model: pinnedAt is an ordering key, so reordering re-deals the
    * existing pool of pinnedAt timestamps onto the new order (see
@@ -7588,30 +7619,34 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
    */
   async reorderPinned(workspaceIds: string[]): Promise<Result<void>> {
     try {
-      // Derive the config bucket from the first resolvable id so clients never
-      // need internal bucket keys (e.g. the multi-project bucket). Nothing
-      // resolvable means the client acted on stale state: a benign no-op.
-      // Const (not narrowed let) so the editConfig closure sees type string.
-      const projectPath = workspaceIds
-        .map((id) => this.config.findWorkspace(id)?.projectPath)
-        .find((path) => path !== undefined);
-      if (projectPath === undefined) {
+      // Resolve buckets from the ids so clients never need internal bucket
+      // keys (e.g. the multi-project bucket). Nothing resolvable means the
+      // client acted on stale state: a benign no-op.
+      const projectPaths = new Set<string>();
+      for (const id of workspaceIds) {
+        const path = this.config.findWorkspace(id)?.projectPath;
+        if (path !== undefined) {
+          projectPaths.add(path);
+        }
+      }
+      if (projectPaths.size === 0) {
         return Ok(undefined);
       }
 
       const changedIds: string[] = [];
       await this.config.editConfig((config) => {
-        const projectConfig = config.projects.get(projectPath);
-        if (!projectConfig) {
-          return config;
-        }
+        const bucketConfigs = [...projectPaths]
+          .map((path) => config.projects.get(path))
+          .filter((bucket) => bucket !== undefined);
 
-        // Current pinned roots of the bucket, in effective pin order.
+        // Current pinned roots across the referenced buckets, in effective pin order.
         const pinnedEntries: Array<{ id: string; pinnedAt: string }> = [];
-        for (const entry of projectConfig.workspaces) {
-          if (!entry.id || !entry.pinnedAt) continue;
-          if (!isWorkspacePinned(entry)) continue;
-          pinnedEntries.push({ id: entry.id, pinnedAt: entry.pinnedAt });
+        for (const bucket of bucketConfigs) {
+          for (const entry of bucket.workspaces) {
+            if (!entry.id || !entry.pinnedAt) continue;
+            if (!isWorkspacePinned(entry)) continue;
+            pinnedEntries.push({ id: entry.id, pinnedAt: entry.pinnedAt });
+          }
         }
         if (pinnedEntries.length < 2) {
           return config;
@@ -7621,21 +7656,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         const currentSet = new Set(currentOrder);
 
         // Desired order: dedupe the input, keep only currently-pinned ids,
-        // then append omitted pins in their current relative order.
+        // then substitute the requested ids into the slots they currently
+        // occupy so omitted pins never move.
         const seen = new Set<string>();
-        const desiredOrder: string[] = [];
+        const requestedIds: string[] = [];
         for (const id of workspaceIds) {
           if (seen.has(id)) continue;
           seen.add(id);
           if (currentSet.has(id)) {
-            desiredOrder.push(id);
+            requestedIds.push(id);
           }
         }
-        for (const id of currentOrder) {
-          if (!seen.has(id)) {
-            desiredOrder.push(id);
-          }
-        }
+        const requestedSet = new Set(requestedIds);
+        let nextRequestedIndex = 0;
+        const desiredOrder = currentOrder.map((id) =>
+          requestedSet.has(id) ? requestedIds[nextRequestedIndex++] : id
+        );
         if (desiredOrder.every((id, index) => id === currentOrder[index])) {
           return config;
         }
@@ -7644,12 +7680,14 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           pinnedEntries.map((entry) => [entry.id, entry.pinnedAt])
         );
         const changes = reassignPinnedTimestamps(desiredOrder, currentPinnedAtById);
-        for (const entry of projectConfig.workspaces) {
-          if (!entry.id) continue;
-          const nextPinnedAt = changes.get(entry.id);
-          if (nextPinnedAt !== undefined) {
-            entry.pinnedAt = nextPinnedAt;
-            changedIds.push(entry.id);
+        for (const bucket of bucketConfigs) {
+          for (const entry of bucket.workspaces) {
+            if (!entry.id) continue;
+            const nextPinnedAt = changes.get(entry.id);
+            if (nextPinnedAt !== undefined) {
+              entry.pinnedAt = nextPinnedAt;
+              changedIds.push(entry.id);
+            }
           }
         }
         return config;
@@ -8702,6 +8740,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           });
         }
 
+        await this.closeDesktopSessionBestEffort(workspaceId, "archive");
         await this.stopLiveWorkspaceActivityForArchive(workspaceId);
 
         // Pass acknowledgedUntrackedPaths to capture so it re-verifies at capture time,
@@ -8721,6 +8760,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         capturedWorktreeSnapshot = captureResult.data;
       }
 
+      // Let borrowed viewers release input before archivedAt revokes their bridge identity.
+      if (!needsSnapshotCapture) await this.closeDesktopSessionBestEffort(workspaceId, "archive");
+
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);
         if (projectConfig) {
@@ -8730,6 +8772,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           if (workspaceEntry) {
             // Just set archivedAt - archived state is derived from archivedAt > unarchivedAt.
             workspaceEntry.archivedAt = new Date().toISOString();
+            // A shared-desktop child releases the owner's desktop in the same edit.
+            settleArchivedSharedDesktopTask(workspaceEntry);
             // Archiving clears the pin; unarchive does not restore it.
             delete workspaceEntry.pinnedAt;
             if (capturedWorktreeSnapshot) {
@@ -8899,6 +8943,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
               previousUnarchivedAt = workspaceEntry.unarchivedAt;
               persistedUnarchivedAt = new Date().toISOString();
               workspaceEntry.unarchivedAt = persistedUnarchivedAt;
+              // Records archived before archive-time settlement must reappear as interrupted,
+              // never as a competing active desktop controller.
+              settleArchivedSharedDesktopTask(workspaceEntry);
               didUnarchive = true;
             }
           }
@@ -10689,6 +10736,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     const authoredAtMs = Date.now();
 
     let resumedInterruptedTask = false;
+    let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
     let claimedAutoTitle = false;
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
@@ -10867,10 +10915,18 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         }
         return withoutCorrelation;
       };
+      // A promoted tool-end send (sub-agent progress) overtakes trailing hidden turn-end entries
+      // such as a queued heartbeat, so they must not count as superseding predecessors here — or
+      // the report would be stripped of the correlation it then dispatches ahead of them with.
+      const promotesAheadOfHiddenTurnEnd =
+        internal?.promoteAheadOfHiddenTurnEnd === true &&
+        (normalizedOptions.queueDispatchMode ?? "tool-end") === "tool-end";
       const getContinuationSendState = () => {
         const preserveCorrelation =
           !isWorkspaceTurnContinuation ||
-          !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata);
+          !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata, {
+            promoteAheadOfHiddenTurnEnd: promotesAheadOfHiddenTurnEnd,
+          });
         // Dropping callbacks on a superseded correlation protects the delegated-turn OWNER
         // (its onCanceled settles the owner's handle, which the superseded entry no longer
         // represents) — but a peer trigger's onCanceled is the sender's budget refund, tied to
@@ -11088,6 +11144,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
+            promoteAheadOfHiddenTurnEnd: internal?.promoteAheadOfHiddenTurnEnd,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             onCanceled: continuationSendState.onCanceled,
@@ -11142,23 +11199,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // config read inside markInterruptedTaskRunning would otherwise be flipped straight back
       // to running — after which every later probe sees an active status and admits the very
       // turn the stop was meant to prevent.
+      if (
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .taskDesktopOwnerWorkspaceId !== undefined
+      ) {
+        await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
+          Promise.resolve(undefined)
+        );
+      }
       if (internal?.admissionStale == null) {
-        try {
-          resumedInterruptedTask =
-            (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
-        } catch (error: unknown) {
-          log.error("Failed to restore interrupted task status before sendMessage", {
-            workspaceId,
-            error,
-          });
-        }
+        previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
+        resumedInterruptedTask =
+          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
       }
 
       const continuationSendState = getContinuationSendState();
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (restoreError: unknown) {
             log.error(
               "Failed to restore interrupted task status after accepted edit startup failure",
@@ -11235,7 +11297,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
               workspaceId,
@@ -11270,7 +11335,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       if (resumedInterruptedTask) {
         try {
-          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+            workspaceId,
+            previousTaskStatus
+          );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
             workspaceId,
@@ -11305,6 +11373,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     internal?: { allowQueuedAgentTask?: boolean; agentInitiated?: boolean }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     let resumedInterruptedTask = false;
+    let previousTaskStatus: ReturnType<AgentTaskIntegration["getAgentTaskStatus"]>;
     try {
       // Block streaming while workspace is being renamed to prevent path conflicts
       if (this.renamingWorkspaces.has(workspaceId)) {
@@ -11438,15 +11507,17 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
       // handling does not early-return on interrupted status.
-      try {
-        resumedInterruptedTask =
-          (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
-      } catch (error: unknown) {
-        log.error("Failed to restore interrupted task status before resumeStream", {
-          workspaceId,
-          error,
-        });
+      if (
+        findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
+          .taskDesktopOwnerWorkspaceId !== undefined
+      ) {
+        await this.desktopInputCoordinator.withAdmission(workspaceId, () =>
+          Promise.resolve(undefined)
+        );
       }
+      previousTaskStatus = this.agentTaskIntegration?.getAgentTaskStatus(workspaceId);
+      resumedInterruptedTask =
+        (await this.agentTaskIntegration?.markInterruptedTaskRunning(workspaceId)) ?? false;
 
       // Codex P1 (PRRT_kwDOPxxmWM6cSREO): resumeStream runs its own async
       // admission (a second pricing gate) during which the session still
@@ -11467,7 +11538,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         });
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
               workspaceId,
@@ -11483,7 +11557,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (!result.data.started) {
         if (resumedInterruptedTask) {
           try {
-            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+              workspaceId,
+              previousTaskStatus
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
               workspaceId,
@@ -11498,7 +11575,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     } catch (error) {
       if (resumedInterruptedTask) {
         try {
-          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure(
+            workspaceId,
+            previousTaskStatus
+          );
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {
             workspaceId,
@@ -11876,7 +11956,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   removeQueuedMessagesByDedupeKeyPrefix(
     workspaceId: string,
     prefix: string,
-    options?: { cancelReason?: string }
+    options?: { cancelReason?: string; skipCancelCallbacks?: boolean }
   ): Result<number> {
     try {
       const session = this.sessions.get(workspaceId.trim());
@@ -11886,7 +11966,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return Ok(
         session.removeQueuedMessagesByDedupeKeyPrefix(
           prefix,
-          options?.cancelReason ?? "Queued message superseded before dispatch."
+          options?.cancelReason ?? "Queued message superseded before dispatch.",
+          options?.skipCancelCallbacks === true ? { skipCancelCallbacks: true } : undefined
         )
       );
     } catch (error) {

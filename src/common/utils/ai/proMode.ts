@@ -3,7 +3,7 @@
  *
  * Mirrors the send path's provider-option gating so the UI never offers a toggle that
  * cannot affect the request:
- * - model must be pro-capable (the GPT-5.6 family — openaiSupportsProMode);
+ * - model must be pro-capable (see openaiSupportsProMode);
  * - pro mode is a Responses API field, so `wireFormat: "chatCompletions"` disables it;
  * - only the direct `openai:` route delivers the mode. Gateways hide it:
  *   non-passthrough ones use another provider schema, and mux-gateway currently
@@ -26,10 +26,7 @@ import {
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
-export interface ProModeAvailabilityOptions extends OpenAIDirectProviderOptionsAvailability {
-  /** Overrides the providersConfig-derived OpenAI wire format when provided. */
-  openaiWireFormat?: "responses" | "chatCompletions" | null;
-}
+export type ProModeAvailabilityOptions = OpenAIDirectProviderOptionsAvailability;
 
 export function openaiProModeAvailable(
   modelString: string,

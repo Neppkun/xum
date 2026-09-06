@@ -10,7 +10,9 @@ export interface ExperimentValues {
   advisorTool: boolean | undefined;
   dynamicWorkflows: boolean | undefined;
   memory: boolean | undefined;
+  memoryIntuition: boolean | undefined;
   toolSearch: boolean | undefined;
+  continuousCompaction: boolean | undefined;
 }
 
 export interface SendMessageOptionsInput {

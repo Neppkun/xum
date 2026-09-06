@@ -1,3 +1,4 @@
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 /**
  * oRPC router: procedure definitions only — behavior lives in services.
  *
@@ -101,6 +102,7 @@ import {
   subscribeMetadata,
   subscribeOpenSettings,
   subscribePolicyChanges,
+  subscribeDesignExperiment,
   subscribeProviderConfig,
   subscribeSshPrompts,
   subscribeTerminalActivity,
@@ -912,7 +914,9 @@ export const router = (authToken?: string) => {
       subscribeLogs: t
         .input(schemas.general.subscribeLogs.input)
         .output(schemas.general.subscribeLogs.output)
-        .handler(({ input, signal }) => subscribeLogs(input.level ?? "info", signal)),
+        .handler(({ context, input, signal }) =>
+          subscribeLogs(context, input.level ?? "info", signal)
+        ),
       restartApp: t
         .input(schemas.general.restartApp.input)
         .output(schemas.general.restartApp.output)
@@ -989,6 +993,14 @@ export const router = (authToken?: string) => {
         }),
     },
     mcp: {
+      designStatus: t
+        .input(schemas.mcp.designStatus.input)
+        .output(schemas.mcp.designStatus.output)
+        .handler(({ context }) => context.mcpConfigService.claudeDesign.getStatus()),
+      configureDesign: t
+        .input(schemas.mcp.configureDesign.input)
+        .output(schemas.mcp.configureDesign.output)
+        .handler(({ context, input }) => context.mcpConfigService.claudeDesign.configure(input)),
       list: t
         .input(schemas.mcp.list.input)
         .output(schemas.mcp.list.output)
@@ -2064,6 +2076,36 @@ export const router = (authToken?: string) => {
       },
     },
     desktop: {
+      watchViewer: t
+        .input(schemas.desktop.watchViewer.input)
+        .output(schemas.desktop.watchViewer.output)
+        .handler(({ context, input, signal }) =>
+          context.desktopSessionManager.watchViewer(input.workspaceId, signal)
+        ),
+      acknowledgeViewerRelease: t
+        .input(schemas.desktop.acknowledgeViewerRelease.input)
+        .output(schemas.desktop.acknowledgeViewerRelease.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.acknowledgeViewerRelease(input.viewerId)
+        ),
+      openWindow: t
+        .input(schemas.desktop.openWindow.input)
+        .output(schemas.desktop.openWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.openWindow(input.workspaceId, input.instanceId)
+        ),
+      closeWindow: t
+        .input(schemas.desktop.closeWindow.input)
+        .output(schemas.desktop.closeWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.closeWindow(input.workspaceId, input.instanceId)
+        ),
+      getWindow: t
+        .input(schemas.desktop.getWindow.input)
+        .output(schemas.desktop.getWindow.output)
+        .handler(({ context, input }) =>
+          context.desktopSessionManager.getWindow(input.workspaceId)
+        ),
       getPrereqStatus: t
         .input(schemas.desktop.getPrereqStatus.input)
         .output(schemas.desktop.getPrereqStatus.output)
@@ -2120,6 +2162,10 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => context.voiceService.transcribe(input.audioBase64)),
     },
     experiments: {
+      onDesignChange: t
+        .input(schemas.experiments.onDesignChange.input)
+        .output(schemas.experiments.onDesignChange.output)
+        .handler(({ context, signal }) => subscribeDesignExperiment(context, signal)),
       getOverrides: t
         .input(schemas.experiments.getOverrides.input)
         .output(schemas.experiments.getOverrides.output)
@@ -2129,6 +2175,9 @@ export const router = (authToken?: string) => {
         .output(schemas.experiments.setOverride.output)
         .handler(async ({ context, input }) => {
           await context.experimentsService.setOverride(input.experimentId, input.enabled);
+          if (input.experimentId === EXPERIMENT_IDS.CLAUDE_DESIGN_MCP) {
+            await context.mcpConfigService.claudeDesign.getStatus();
+          }
         }),
     },
     debug: {

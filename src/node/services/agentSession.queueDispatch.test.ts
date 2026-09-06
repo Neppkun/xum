@@ -1,3 +1,5 @@
+import type { StreamAbortEvent } from "@/common/types/stream";
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, mock, spyOn, test } from "bun:test";
 
 import type { MuxMessageMetadata } from "@/common/types/message";
@@ -36,10 +38,7 @@ function streamStartEvent(workspaceId: string): Record<string, unknown> {
   };
 }
 
-function streamAbortEvent(
-  workspaceId: string,
-  abortReason: "system" | "user"
-): Record<string, unknown> {
+function streamAbortEvent(workspaceId: string, abortReason: "system" | "user"): StreamAbortEvent {
   return {
     type: "stream-abort",
     workspaceId,
@@ -61,6 +60,112 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 500): Prom
 }
 
 describe("AgentSession queued message tool-call dispatch", () => {
+  test("a queued provider startup failure drains its successor after accepted-turn cleanup", async () => {
+    const successor = Promise.withResolvers<void>();
+    let calls = 0;
+    const streamMessage = mock(() => {
+      if (++calls === 1)
+        return Promise.resolve(
+          Err({ type: "api_key_not_found" as const, provider: "anthropic" as const })
+        );
+      successor.resolve();
+      return Promise.resolve(Ok(createStartedTurnHandle()));
+    });
+    const { session, cleanup } = await createAgentSessionHarness({
+      workspaceId: "queue-provider-startup-failure",
+      aiServiceOverrides: { streamMessage },
+    });
+    try {
+      session.queueMessage(
+        "failed startup",
+        { model: TEST_MODEL, agentId: "exec" },
+        { synthetic: true }
+      );
+      session.queueMessage("successor", { model: TEST_MODEL, agentId: "exec" });
+      session.sendQueuedMessages();
+      await successor.promise;
+      await session.waitForIdle();
+      expect(calls).toBe(2);
+      expect(session.hasQueuedMessages()).toBe(false);
+    } finally {
+      session.dispose();
+      await cleanup();
+    }
+  });
+
+  test.each(["returned error", "rejection"] as const)(
+    "reserves queued startup synchronously and drains after %s cleanup",
+    async (failureKind) => {
+      const workspaceId = `queue-prestart-${failureKind}`;
+      const failureEntered = Promise.withResolvers<void>();
+      const releaseFailure = Promise.withResolvers<void>();
+      const successorStarted = Promise.withResolvers<void>();
+      const streamMessage = mock(() => {
+        successorStarted.resolve();
+        return Promise.resolve(Ok(createStartedTurnHandle()));
+      });
+      const { session, historyService, cleanup } = await createAgentSessionHarness({
+        workspaceId,
+        aiServiceOverrides: { streamMessage },
+      });
+      const append = spyOn(historyService, "appendToHistory");
+      if (failureKind === "returned error") {
+        append.mockResolvedValueOnce(Err("disk unavailable"));
+      } else {
+        append.mockRejectedValueOnce(new Error("disk unavailable"));
+      }
+      const failures: unknown[] = [];
+
+      try {
+        session.queueMessage(
+          "failed head",
+          { model: TEST_MODEL, agentId: "exec" },
+          {
+            synthetic: true,
+            onAcceptedPreStreamFailure: async (error) => {
+              failures.push(error);
+              failureEntered.resolve();
+              await releaseFailure.promise;
+            },
+          }
+        );
+        session.queueMessage("surviving successor", { model: TEST_MODEL, agentId: "exec" });
+        session.sendQueuedMessages();
+
+        // Admission must cover the first await, or another caller can bypass this FIFO head.
+        expect(session.isBusy()).toBe(true);
+        expect(session.isPreparingTurn()).toBe(true);
+        expect(append).not.toHaveBeenCalled();
+
+        await failureEntered.promise;
+        expect(session.isBusy()).toBe(true);
+        expect(session.queuedMessageEntryCount()).toBe(1);
+        expect(streamMessage).not.toHaveBeenCalled();
+        expect(await historyService.getHistoryFromLatestBoundary(workspaceId)).toEqual(Ok([]));
+
+        // No stream-end will arrive for the failed head. Cleanup must finish before its
+        // successor persists, then the queue must make progress without an external nudge.
+        releaseFailure.resolve();
+        await successorStarted.promise;
+        await session.waitForIdle();
+        expect(failures).toHaveLength(1);
+        expect(streamMessage).toHaveBeenCalledTimes(1);
+        expect(session.hasQueuedMessages()).toBe(false);
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (!history.success) throw new Error(history.error);
+        expect(history.data).toMatchObject([
+          { role: "user", parts: [{ type: "text", text: "surviving successor" }] },
+        ]);
+      } finally {
+        releaseFailure.resolve();
+        append.mockRestore();
+        session.dispose();
+        await cleanup();
+      }
+    }
+  );
+
   test("counts only a different direct preparing send as a superseding predecessor", async () => {
     const sessionHolder: {
       current?: {
@@ -311,7 +416,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(stopStream).not.toHaveBeenCalled();
       expect(sendQueuedMessages).not.toHaveBeenCalled();
 
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -360,7 +465,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
         abortReason: "system",
       });
 
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
       const didDispatch = await waitForCondition(() => sendQueuedMessages.mock.calls.length > 0);
       expect(didDispatch).toBe(true);
       expect(sendQueuedMessages).toHaveBeenCalledTimes(1);
@@ -537,7 +642,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       // The next turn (e.g. a descendant-task terminal wake) starts and ends.
       aiEmitter.emit("stream-start", streamStartEvent(workspaceId));
-      aiEmitter.emit("stream-end", {
+      void runSessionTerminalPolicy(session, aiEmitter, {
         type: "stream-end",
         workspaceId,
         messageId: "assistant-1",
@@ -1181,7 +1286,7 @@ describe("AgentSession queued message tool-call dispatch", () => {
       const interruptResult = await session.interruptStream();
       expect(interruptResult.success).toBe(true);
       // The native soft-stop can still win the event race after the hard user interrupt.
-      aiEmitter.emit("stream-abort", streamAbortEvent(workspaceId, "system"));
+      void runSessionTerminalPolicy(session, aiEmitter, streamAbortEvent(workspaceId, "system"));
 
       await new Promise((resolve) => setTimeout(resolve, 25));
       expect(sendQueuedMessages).not.toHaveBeenCalled();

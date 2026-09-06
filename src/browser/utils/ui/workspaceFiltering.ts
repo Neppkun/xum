@@ -149,16 +149,6 @@ function hasDelegatedActivity(activity: WorkspaceDelegatedActivity): boolean {
   return activity.activeCount > 0 || activity.queuedCount > 0;
 }
 
-export function isSidebarSubAgentActive(workspace: FrontendWorkspaceMetadata): boolean {
-  return (
-    isActionableTaskExecutionStatus(workspace.taskExecutionStatus) ||
-    workspace.taskStatus === "queued" ||
-    workspace.taskStatus === "starting" ||
-    workspace.taskStatus === "running" ||
-    workspace.taskStatus === "awaiting_report"
-  );
-}
-
 export function isSidebarSubAgentRunning(
   workspace: FrontendWorkspaceMetadata,
   options: DelegatedActivityOptions = {}
@@ -932,6 +922,37 @@ function comparePinnedPlacement(
   return null;
 }
 
+function sortWorkspaceRows(
+  workspaces: FrontendWorkspaceMetadata[],
+  workspaceRecency: Record<string, number>
+): void {
+  workspaces.sort((a, b) => {
+    const pinnedPlacement = comparePinnedPlacement(a, b);
+    if (pinnedPlacement !== null) {
+      return pinnedPlacement;
+    }
+
+    const aTimestamp = workspaceRecency[a.id] ?? 0;
+    const bTimestamp = workspaceRecency[b.id] ?? 0;
+    if (aTimestamp !== bTimestamp) {
+      return bTimestamp - aTimestamp;
+    }
+
+    const aCreatedAt = parseTimestampMs(a.createdAt);
+    const bCreatedAt = parseTimestampMs(b.createdAt);
+    if (aCreatedAt !== bCreatedAt) {
+      return bCreatedAt - aCreatedAt;
+    }
+
+    const nameOrder = compareStringsAsc(a.name, b.name);
+    if (nameOrder !== 0) {
+      return nameOrder;
+    }
+
+    return compareStringsAsc(a.id, b.id);
+  });
+}
+
 /**
  * Build a map of project paths to sorted workspace metadata lists.
  * Includes both persisted workspaces (from config) and workspaces from
@@ -976,31 +997,7 @@ export function buildSortedWorkspacesByProject(
   // IMPORTANT: Include deterministic tie-breakers so Storybook visual snapshots can't
   // flip ordering when multiple workspaces have equal recency.
   for (const metadataList of result.values()) {
-    metadataList.sort((a, b) => {
-      const pinnedPlacement = comparePinnedPlacement(a, b);
-      if (pinnedPlacement !== null) {
-        return pinnedPlacement;
-      }
-
-      const aTimestamp = workspaceRecency[a.id] ?? 0;
-      const bTimestamp = workspaceRecency[b.id] ?? 0;
-      if (aTimestamp !== bTimestamp) {
-        return bTimestamp - aTimestamp;
-      }
-
-      const aCreatedAt = parseTimestampMs(a.createdAt);
-      const bCreatedAt = parseTimestampMs(b.createdAt);
-      if (aCreatedAt !== bCreatedAt) {
-        return bCreatedAt - aCreatedAt;
-      }
-
-      const nameOrder = compareStringsAsc(a.name, b.name);
-      if (nameOrder !== 0) {
-        return nameOrder;
-      }
-
-      return compareStringsAsc(a.id, b.id);
-    });
+    sortWorkspaceRows(metadataList, workspaceRecency);
   }
 
   // Ensure child workspaces appear directly below their parents.
@@ -1009,6 +1006,16 @@ export function buildSortedWorkspacesByProject(
   }
 
   return result;
+}
+
+/** Build one globally sorted workspace tree for the optional flat sidebar. */
+export function buildSortedWorkspacesFlat(
+  workspaces: FrontendWorkspaceMetadata[],
+  workspaceRecency: Record<string, number>
+): FrontendWorkspaceMetadata[] {
+  const rows = [...workspaces];
+  sortWorkspaceRows(rows, workspaceRecency);
+  return flattenWorkspaceTree(rows);
 }
 
 /**

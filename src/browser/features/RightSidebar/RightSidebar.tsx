@@ -46,6 +46,7 @@ import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
+  isDesktopViewportFocused,
 } from "@/browser/utils/ui/keybinds";
 import { SidebarCollapseButton } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
 import { cn } from "@/common/lib/utils";
@@ -58,7 +59,6 @@ import {
 } from "@/browser/stores/WorkspaceStore";
 import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
 import {
-  RIGHT_SIDEBAR_TABS,
   isTabType,
   isTerminalTab,
   getTerminalSessionId,
@@ -118,9 +118,6 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { SortableContext, rectSortingStrategy } from "@dnd-kit/sortable";
-
-// Re-export for consumers
-export type { ReviewStats };
 
 interface SidebarContainerProps {
   collapsed: boolean;
@@ -200,9 +197,6 @@ const SidebarContainer: React.FC<SidebarContainerProps> = ({
     </div>
   );
 };
-
-export { RIGHT_SIDEBAR_TABS, isTabType };
-export type { TabType };
 
 function getGoalSetErrorMessage(error: GoalSetError): string {
   if (error.type === "goal_conflict") {
@@ -1399,6 +1393,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // Keyboard shortcut for closing active terminal tab (Ctrl/Cmd+W)
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (!matchesKeybind(e, KEYBINDS.CLOSE_TAB)) return;
       // Always prevent platform default (Cmd/Ctrl+W closes window), even during dialogs.
       e.preventDefault();
