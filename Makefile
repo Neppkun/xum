@@ -494,7 +494,8 @@ ensure-mac-sharp-runtime-deps: node_modules/.installed
 
 dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
-	@if [ -n "$$CSC_LINK" ]; then \
+	@# Local builds may omit signing credentials; keep the check safe under bash -u.
+	@if [ -n "$${CSC_LINK:-}" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
 		bun x electron-builder --mac --x64 --arm64 --publish never; \
 	else \
