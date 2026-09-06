@@ -24,6 +24,10 @@ import {
 export class DesktopSessionManager {
   private readonly sessions = new Map<string, PortableDesktopSession>();
   private readonly startupPromises = new Map<string, Promise<PortableDesktopSession>>();
+
+  getSessionCount(): number {
+    return new Set([...this.sessions.keys(), ...this.startupPromises.keys()]).size;
+  }
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
 
   /**

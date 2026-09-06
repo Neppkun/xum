@@ -1,4 +1,6 @@
 import type { RestartBlocker } from "@/common/orpc/types";
+import { inFlightProcedureCount } from "@/node/orpc/inFlightProcedures";
+import { inProcessWorkflowWorkspaceCount } from "@/node/services/workflows/workflowArchiveAdmission";
 import { log } from "@/node/services/log";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
@@ -552,7 +554,11 @@ export class ServiceContainer {
     const blockers = this.workspaceService.collectRestartBlockers();
     const counts: Array<[RestartBlocker["kind"], number]> = [
       ["active-streams", this.streamManager.getActiveStreams().length],
+      ["workflows", inProcessWorkflowWorkspaceCount()],
+      ["projects", this.projectService.getMutationCount()],
+      ["requests", inFlightProcedureCount()],
       ["terminals", this.terminalService.getOpenSessionCount()],
+      ["desktop-sessions", this.desktopSessionManager.getSessionCount()],
       ["background-processes", this.backgroundProcessManager.getRunningProcessCount()],
     ];
     for (const [kind, count] of counts) {
@@ -600,6 +606,7 @@ export class ServiceContainer {
     // it, and nothing may dispatch through the provider/runtime services torn down below.
     shutdownStep("workspaceService.beginShutdown", () => this.workspaceService.beginShutdown());
     shutdownStep("terminalService.beginShutdown", () => this.terminalService.beginShutdown());
+    shutdownStep("projectService.beginShutdown", () => this.projectService.beginShutdown());
     await shutdownStep("updateService.beginShutdown", () => this.updateService.beginShutdown());
     const housekeepingSettled = this.startupHousekeepingSettled;
     if (housekeepingSettled != null) {

@@ -87,6 +87,7 @@ import {
   extractCookieValues,
   getFirstHeaderValue,
 } from "./authMiddleware";
+import { inFlightProcedureMiddleware } from "./inFlightProcedures";
 import { clearLogsForApi, getLogFilePath } from "@/node/services/log";
 
 import {
@@ -169,7 +170,10 @@ async function getCurrentServerAuthSessionId(context: ORPCContext): Promise<stri
 }
 
 export const router = (authToken?: string) => {
-  const t = os.$context<ORPCContext>().use(createAuthMiddleware(authToken));
+  const t = os
+    .$context<ORPCContext>()
+    .use(createAuthMiddleware(authToken))
+    .use(inFlightProcedureMiddleware);
 
   return t.router({
     tokenizer: {

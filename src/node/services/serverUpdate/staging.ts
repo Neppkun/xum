@@ -22,7 +22,7 @@ export function installCommand(
   const flags = {
     bun: ["add", "--ignore-scripts", "--exact"],
     npm: ["install", "--no-global", "--no-audit", "--no-fund", "--omit=dev", "--ignore-scripts"],
-    pnpm: ["add", "--ignore-scripts"],
+    pnpm: ["add", "--no-global", "--ignore-scripts"],
   } satisfies Record<InstallLayout["packageManager"], string[]>;
   return {
     file: layout.packageManager,

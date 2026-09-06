@@ -150,6 +150,33 @@ function createBrowserClient(
   };
 }
 
+async function reloadIfServerBuildChanged(
+  backendBaseUrl: string,
+  isCurrentConnection: () => boolean
+): Promise<void> {
+  try {
+    const response = await fetch(`${backendBaseUrl}/version`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(SERVER_VERSION_CHECK_TIMEOUT_MS),
+    });
+    const version: unknown = response.ok ? await response.json() : null;
+    if (
+      isCurrentConnection() &&
+      version &&
+      typeof version === "object" &&
+      "git_commit" in version &&
+      typeof version.git_commit === "string" &&
+      version.git_commit.length > 0 &&
+      (version.git_commit !== VERSION.git_commit ||
+        ("git_describe" in version && version.git_describe !== VERSION.git_describe))
+    ) {
+      window.location.reload();
+    }
+  } catch {
+    // Version discovery must not disturb an already reconnected client.
+  }
+}
+
 function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
   const [state, setState] = useState<ConnectionState>({ status: "connecting" });
   const [authToken, setAuthToken] = useState<string | null>(() => {
@@ -256,45 +283,14 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
         client.general
           .ping("auth-check")
-          .then(async () => {
-            // A reconnected socket may belong to a newer server than this loaded bundle. Only a
-            // bundle served by that server can be refreshed by reloading, so split-origin setups
-            // (VITE_BACKEND_URL, extension webviews) skip the probe.
-            const backendBaseUrl = getBrowserBackendBaseUrl();
-            if (
-              hasConnectedRef.current &&
-              connectionId === connectionIdRef.current &&
-              new URL(backendBaseUrl).origin === window.location.origin
-            ) {
-              try {
-                const response = await fetch(`${backendBaseUrl}/version`, {
-                  cache: "no-store",
-                  signal: AbortSignal.timeout(SERVER_VERSION_CHECK_TIMEOUT_MS),
-                });
-                const version: unknown = response.ok ? await response.json() : null;
-                if (
-                  connectionId === connectionIdRef.current &&
-                  version &&
-                  typeof version === "object" &&
-                  "git_commit" in version &&
-                  typeof version.git_commit === "string" &&
-                  version.git_commit.length > 0 &&
-                  (version.git_commit !== VERSION.git_commit ||
-                    ("git_describe" in version && version.git_describe !== VERSION.git_describe))
-                ) {
-                  window.location.reload();
-                  return;
-                }
-              } catch {
-                // Version discovery must not prevent reconnecting after a transient HTTP failure.
-              }
-            }
+          .then(() => {
             // Ignore stale connections (e.g., auth-check returned after a new connect()).
             if (connectionId !== connectionIdRef.current) {
               cleanup();
               return;
             }
 
+            const reconnected = hasConnectedRef.current;
             authRequiredRef.current = false;
             hasConnectedRef.current = true;
             reconnectAttemptRef.current = 0;
@@ -303,6 +299,17 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
             window.__ORPC_CLIENT__ = client;
             cleanupRef.current = cleanup;
             setState({ status: "connected", client, cleanup });
+            // A reconnected socket may belong to a newer server than this loaded bundle. The probe
+            // runs after the client is published so a slow /version never delays reconnection, and
+            // only a bundle served by that server can be refreshed by reloading, so split-origin
+            // setups (VITE_BACKEND_URL, extension webviews) skip it.
+            const backendBaseUrl = getBrowserBackendBaseUrl();
+            if (reconnected && new URL(backendBaseUrl).origin === window.location.origin) {
+              void reloadIfServerBuildChanged(
+                backendBaseUrl,
+                () => connectionId === connectionIdRef.current
+              );
+            }
           })
           .catch((err: unknown) => {
             if (connectionId !== connectionIdRef.current) {

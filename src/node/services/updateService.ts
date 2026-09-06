@@ -133,7 +133,7 @@ export class UpdateService {
     if (this.impl && this.currentStatus.type === "unsupported") return;
     // Let the implementation reject busy-state changes before persisting the preference, and
     // roll the runtime back if persistence fails so the two never disagree.
-    const previous = this.currentChannel;
+    const previous = this.impl?.getChannel() ?? this.currentChannel;
     if (this.impl) {
       this.impl.setChannel(channel);
     }

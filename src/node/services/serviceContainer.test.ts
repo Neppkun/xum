@@ -79,6 +79,7 @@ import {
   type AppTags,
 } from "@/node/services/di/tags";
 import { ServiceContainer } from "./serviceContainer";
+import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
 /**
  * Independent field → tag listing for every ORPC context field (the production
@@ -200,6 +201,12 @@ describe("ServiceContainer", () => {
     const processes = services.backgroundProcessManager as unknown as {
       processes: Map<string, { status: string; isForeground: boolean }>;
     };
+    const desktop = services.desktopSessionManager as unknown as {
+      sessions: Map<string, unknown>;
+      startupPromises: Map<string, Promise<unknown>>;
+    };
+    const project = services.projectService as unknown as { activeGitInits: Set<string> };
+    let releaseWorkflow: (() => void) | undefined;
     const workspace = services.workspaceService as unknown as {
       preflightSendCounts: Map<string, number>;
       preflightExecCounts: Map<string, number>;
@@ -218,6 +225,10 @@ describe("ServiceContainer", () => {
       workspace.archivingWorkspaces.add("archiving");
       workspace.archivingWorkspaces.add("removing");
       workspace.renamingWorkspaces.add("renaming");
+      releaseWorkflow = registerInProcessWorkflowRun("workflow-workspace");
+      desktop.sessions.set("desktop-live", {});
+      desktop.startupPromises.set("desktop-starting", new Promise(() => undefined));
+      project.activeGitInits.add("/tmp/new-project");
       terminals.pendingSessionCreations.set("terminal-starting", 2);
       processes.processes.set("running", { status: "running", isForeground: false });
       processes.processes.set("foreground", { status: "running", isForeground: true });
@@ -230,7 +241,10 @@ describe("ServiceContainer", () => {
         { kind: "workspace-lifecycle", count: 3 },
         { kind: "background-processes", count: 3 },
         { kind: "active-streams", count: 1 },
+        { kind: "workflows", count: 1 },
+        { kind: "projects", count: 1 },
         { kind: "terminals", count: 2 },
+        { kind: "desktop-sessions", count: 2 },
       ]);
     } finally {
       streams.workspaceStreams.clear();
@@ -243,6 +257,10 @@ describe("ServiceContainer", () => {
       workspace.removingWorkspaces.clear();
       workspace.archivingWorkspaces.clear();
       workspace.renamingWorkspaces.clear();
+      releaseWorkflow?.();
+      desktop.sessions.clear();
+      desktop.startupPromises.clear();
+      project.activeGitInits.clear();
     }
     expect(services.collectRestartBlockers()).toEqual([]);
   });
