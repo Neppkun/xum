@@ -10138,6 +10138,7 @@ describe("WorkspaceService pending auto-title", () => {
       expect(metadata?.title).toBe("Harden auth flow");
       expect(metadata?.pendingAutoTitle).toBeUndefined();
       expect(generateIdentitySpy.mock.calls[0]?.[0]).toBe("Continue with auth hardening");
+      expect(generateIdentitySpy.mock.calls[0]?.[5]).toEqual({ workspaceId });
     } finally {
       generateIdentitySpy.mockRestore();
     }
@@ -17458,6 +17459,7 @@ describe("WorkspaceService regenerateTitle", () => {
       const call = generateIdentitySpy.mock.calls[0];
       expect(call?.[3]).toBeUndefined();
       expect(call?.[4]).toBe("Fix CI");
+      expect(call?.[5]).toEqual({ workspaceId });
       expect(updateTitleSpy).toHaveBeenCalledWith(workspaceId, "Fix CI");
     } finally {
       updateTitleSpy.mockRestore();

@@ -912,11 +912,21 @@ export class TurnRequestBuilder {
         return resolved;
       }
 
-      const providersConfig = pinCoderInstanceProvidersConfig(
+      let providersConfig = pinCoderInstanceProvidersConfig(
         this.dependencies.providerService.getConfig(),
         options.rawModelString,
         resolved.data.coderSelectedInstance
       );
+      // Context-limit mirrors must use the account that the model selected.
+      if (providersConfig.openai && resolved.data.codexOauthAccountId != null) {
+        providersConfig = {
+          ...providersConfig,
+          openai: {
+            ...providersConfig.openai,
+            codexOauthDefaultAccountId: resolved.data.codexOauthAccountId,
+          },
+        };
+      }
       const minThinkingLevel = resolveMinimumThinkingLevel(
         options.rawModelString,
         options.minimumThinkingLevelOverride,

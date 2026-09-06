@@ -5,6 +5,8 @@
  * extract non-sensitive claims (e.g. ChatGPT-Account-Id) from OAuth responses.
  */
 
+import { CODEX_OAUTH_DEFAULT_ACCOUNT_ID } from "@/common/constants/codexOauthAccounts";
+
 export interface CodexOauthAuth {
   type: "oauth";
   /** OAuth access token (JWT). */
@@ -46,6 +48,52 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
   }
 
   return { type: "oauth", access, refresh, expires, accountId };
+}
+
+/** Read connected slots from an OpenAI provider config. */
+export function getCodexOauthAccounts(config: unknown): Array<{
+  id: string;
+  label: string;
+  auth: CodexOauthAuth;
+}> {
+  if (!isPlainObject(config)) return [];
+  const accounts: Array<{ id: string; label: string; auth: CodexOauthAuth }> = [];
+  const legacy = parseCodexOauthAuth(config.codexOauth);
+  if (legacy) {
+    accounts.push({
+      id: CODEX_OAUTH_DEFAULT_ACCOUNT_ID,
+      label:
+        typeof config.codexOauthLabel === "string" && config.codexOauthLabel.trim()
+          ? config.codexOauthLabel.trim()
+          : "Default",
+      auth: legacy,
+    });
+  }
+  if (isPlainObject(config.codexOauthAccounts)) {
+    for (const [id, entry] of Object.entries(config.codexOauthAccounts)) {
+      // The legacy slot owns this ID, even if malformed disk data repeats it.
+      if (id === CODEX_OAUTH_DEFAULT_ACCOUNT_ID || !isPlainObject(entry)) continue;
+      const auth = parseCodexOauthAuth(entry.auth);
+      if (!auth || typeof entry.label !== "string" || !entry.label.trim()) continue;
+      accounts.push({ id, label: entry.label.trim(), auth });
+    }
+  }
+  return accounts;
+}
+
+/** Resolve a local slot ID without substituting another connected account. */
+export function getCodexOauthAccountId(config: unknown, override?: string): string {
+  if (override !== undefined) return override;
+  if (isPlainObject(config) && typeof config.codexOauthDefaultAccountId === "string") {
+    return config.codexOauthDefaultAccountId;
+  }
+  return CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
+}
+
+/** Read the selected slot. Missing selections do not fall back to another slot. */
+export function getCodexOauthAuth(config: unknown, accountId?: string): CodexOauthAuth | null {
+  const selected = getCodexOauthAccountId(config, accountId);
+  return getCodexOauthAccounts(config).find((account) => account.id === selected)?.auth ?? null;
 }
 
 export function isCodexOauthAuthExpired(

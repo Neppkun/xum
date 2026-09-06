@@ -7,7 +7,7 @@ import {
   mapModelCreationError,
   mapNameGenerationError,
 } from "./workspaceTitleGenerator";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
 import type { AIService } from "./aiService";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 
@@ -82,6 +82,29 @@ describe("generateWorkspaceIdentity cleanup", () => {
   function createTitleAIService(model: LanguageModel): AIService {
     return { createModel: () => Promise.resolve(Ok(model)) } as unknown as AIService;
   }
+
+  test.each([{ workspaceId: "title-workspace" }, { projectPath: "/new-project" }])(
+    "preserves title account context across candidate failures: %j",
+    async (context) => {
+      const createModel = mock<AIService["createModel"]>(() =>
+        Promise.resolve(Err({ type: "oauth_not_connected", provider: "openai" }))
+      );
+      const aiService = { createModel } as unknown as AIService;
+      const result = await generateWorkspaceIdentity(
+        "Add setting",
+        ["openai:gpt-5.5", "openai:gpt-5.3-codex"],
+        aiService,
+        undefined,
+        undefined,
+        context
+      );
+      expect(result.success).toBe(false);
+      expect(createModel).toHaveBeenCalledTimes(2);
+      for (const call of createModel.mock.calls) {
+        expect(call[2]).toEqual({ ...context, agentInitiated: true });
+      }
+    }
+  );
 
   test("cleans up the model after a successful title stream", async () => {
     let cleanupCalls = 0;

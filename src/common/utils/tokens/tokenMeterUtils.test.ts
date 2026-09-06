@@ -76,6 +76,37 @@ describe("calculateTokenMeterData", () => {
     expect(result.totalPercentage).toBeCloseTo(1.1);
   });
 
+  test("uses the selected account rather than an unavailable global account", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        codexOauthDefaultAccountId: "missing",
+        codexOauthAccounts: [{ id: "work", label: "Work" }],
+      },
+    };
+    const globalMeter = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      providersConfig
+    );
+    const projectMeter = calculateTokenMeterData(
+      SAMPLE_USAGE,
+      "openai:gpt-5.5",
+      false,
+      false,
+      providersConfig,
+      { codexOauthAccountId: "work" }
+    );
+    expect(projectMeter.maxTokens).toBe(272_000);
+    expect(globalMeter.maxTokens).toBeGreaterThan(projectMeter.maxTokens!);
+    expect(projectMeter.totalPercentage).toBeGreaterThan(globalMeter.totalPercentage);
+  });
+
   test("uses the Codex OAuth cap for GPT-5.5 token meter percentages", () => {
     const result = calculateTokenMeterData(SAMPLE_USAGE, "openai:gpt-5.5", false, false, {
       openai: {

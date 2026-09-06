@@ -15,6 +15,7 @@ export interface OpenAIDirectProviderOptionsAvailability {
   providersConfig?: ProvidersConfigMap | null;
   /** Request-level OpenAI wire format; the stored config value wins when set. */
   openaiWireFormat?: OpenAIWireFormat | null;
+  codexOauthAccountId?: string;
 }
 
 export function openaiDirectProviderOptionsAvailable(
@@ -55,6 +56,7 @@ export function openaiDirectProviderOptionsAvailable(
     options?.providersConfig != null &&
     wouldRouteOpenAIThroughCodexOauth(normalized, options.providersConfig, {
       openaiWireFormat: options.openaiWireFormat,
+      codexOauthAccountId: options.codexOauthAccountId,
     })
   );
 }

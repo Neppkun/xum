@@ -1062,6 +1062,241 @@ describe("ProviderModelFactory GitHub Copilot", () => {
     });
   });
 
+  it("pins project Codex accounts across requests and rejects deleted slots", async () => {
+    await withTempConfig(async (config, factory, oauth, providersConfigStore) => {
+      const personal = {
+        type: "oauth" as const,
+        access: "personal-access",
+        refresh: "personal-refresh",
+        expires: Date.now() + 3_600_000,
+        accountId: "chatgpt-personal",
+      };
+      const work = { ...personal, access: "work-access", accountId: "chatgpt-work" };
+      providersConfigStore.saveProvidersConfig({
+        openai: {
+          apiKey: "api-key-must-not-win",
+          codexOauth: personal,
+          codexOauthAccounts: { work: { label: "Work", auth: work } },
+        },
+      });
+      await config.editConfig((current) => {
+        current.projects.set("/personal", {
+          codexOauthAccountId: "default",
+          workspaces: [{ id: "personal-ws", name: "personal", path: "/personal/ws" }],
+        });
+        current.projects.set("/work", {
+          codexOauthAccountId: "work",
+          workspaces: [{ id: "work-ws", name: "work", path: "/work/ws" }],
+        });
+        current.projects.set("/personal/sub", {
+          parentProjectPath: "/personal",
+          codexOauthAccountId: "work",
+          workspaces: [],
+        });
+        current.projects.get("/personal")!.workspaces.push({
+          id: "sub-ws",
+          name: "sub",
+          path: "/personal/sub-ws",
+          subProjectPath: "/personal/sub",
+        });
+        current.projects.set("_multi", {
+          workspaces: [
+            {
+              id: "multi-ws",
+              name: "multi",
+              path: "/multi/ws",
+              projects: [
+                { projectPath: "/work", projectName: "work" },
+                { projectPath: "/personal", projectName: "personal" },
+              ],
+            },
+          ],
+        });
+        return current;
+      });
+      oauth.codexOauthService = new CodexOauthService(
+        providersConfigStore,
+        new ProviderService(config, undefined, providersConfigStore)
+      );
+      const originalRegistry = PROVIDER_REGISTRY.openai;
+      const requests: Headers[] = [];
+      let capturedFetch: typeof fetch | undefined;
+      PROVIDER_REGISTRY.openai = async () => {
+        const module = await originalRegistry();
+        return {
+          ...module,
+          createOpenAI: (options) => {
+            capturedFetch = options?.fetch;
+            return module.createOpenAI(options);
+          },
+        };
+      };
+      const createFetch = async (context: { workspaceId?: string; projectPath?: string } = {}) => {
+        const stored = providersConfigStore.loadProvidersConfig() ?? {};
+        const result = await factory.createModel("openai:gpt-5.3-codex", undefined, {
+          ...context,
+          providersConfig: {
+            ...stored,
+            openai: {
+              ...stored.openai,
+              fetch: (_input: RequestInfo | URL, init?: RequestInit) => {
+                requests.push(new Headers(init?.headers));
+                return Promise.resolve(
+                  new Response("{}", { headers: { "content-type": "application/json" } })
+                );
+              },
+            },
+          },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success || !capturedFetch) throw new Error("Expected an OAuth model");
+        expect(modelCostsIncluded(result.data)).toBe(true);
+        return capturedFetch;
+      };
+      const send = (providerFetch: typeof fetch) =>
+        providerFetch("https://api.openai.com/v1/responses", {
+          method: "POST",
+          headers: { "ChatGPT-Account-Id": "stale-configured-account" },
+          body: JSON.stringify({ model: "gpt-5.3-codex", input: [] }),
+        });
+      try {
+        const personalFetch = await createFetch({ workspaceId: "personal-ws" });
+        const workFetch = await createFetch({ workspaceId: "work-ws" });
+        await send(personalFetch);
+        await send(workFetch);
+        expect(requests.map((headers) => headers.get("authorization"))).toEqual([
+          "Bearer personal-access",
+          "Bearer work-access",
+        ]);
+        expect(requests.map((headers) => headers.get("chatgpt-account-id"))).toEqual([
+          "chatgpt-personal",
+          "chatgpt-work",
+        ]);
+        for (const context of [
+          { workspaceId: "sub-ws" },
+          { workspaceId: "multi-ws" },
+          { projectPath: "/work" },
+        ]) {
+          await send(await createFetch(context));
+          expect(requests.at(-1)?.get("authorization")).toBe("Bearer work-access");
+        }
+        // Legacy requests use the default slot when no selection exists.
+        await send(await createFetch());
+        expect(requests.at(-1)?.get("authorization")).toBe("Bearer personal-access");
+
+        const updatedWork = { ...work, access: "work-refreshed", accountId: undefined };
+        providersConfigStore.saveProvidersConfig({
+          openai: {
+            codexOauth: personal,
+            codexOauthDefaultAccountId: "work",
+            codexOauthAccounts: { work: { label: "Work", auth: updatedWork } },
+          },
+        });
+        await config.editConfig((current) => {
+          current.projects.get("/work")!.codexOauthAccountId = "default";
+          return current;
+        });
+        await send(workFetch);
+        expect(requests.at(-1)?.get("authorization")).toBe("Bearer work-refreshed");
+        expect(requests.at(-1)?.has("chatgpt-account-id")).toBe(false);
+        await send(personalFetch);
+        expect(requests.at(-1)?.get("authorization")).toBe("Bearer personal-access");
+        await send(await createFetch());
+        expect(requests.at(-1)?.get("authorization")).toBe("Bearer work-refreshed");
+        await config.editConfig((current) => {
+          delete current.projects.get("/personal/sub")!.codexOauthAccountId;
+          return current;
+        });
+        await send(await createFetch({ workspaceId: "sub-ws" }));
+        expect(requests.at(-1)?.get("authorization")).toBe("Bearer work-refreshed");
+        const resolved = await factory.resolveAndCreateModel(
+          "openai:gpt-5.3-codex",
+          "off",
+          undefined,
+          {
+            workspaceId: "personal-ws",
+          }
+        );
+        expect(resolved.success).toBe(true);
+        if (resolved.success) expect(resolved.data.codexOauthAccountId).toBe("default");
+
+        providersConfigStore.saveProvidersConfig({
+          openai: {
+            apiKey: "api-key-must-not-win",
+            codexOauth: personal,
+            codexOauthDefaultAccountId: "work",
+          },
+        });
+        const sentCount = requests.length;
+        const rejected = await send(workFetch).then(
+          () => false,
+          () => true
+        );
+        expect(rejected).toBe(true);
+        expect(requests).toHaveLength(sentCount);
+        expect(await factory.createModel("openai:gpt-5.3-codex")).toMatchObject({
+          success: false,
+          error: { type: "oauth_not_connected" },
+        });
+      } finally {
+        PROVIDER_REGISTRY.openai = originalRegistry;
+      }
+    });
+  });
+
+  it("rejects explicit missing Codex selections without changing API-key precedence", async () => {
+    await withTempConfig(async (config, factory, _oauth, providersConfigStore) => {
+      await config.editConfig((current) => {
+        current.projects.set("/missing", { codexOauthAccountId: "deleted", workspaces: [] });
+        return current;
+      });
+      for (const selection of [undefined, { projectPath: "/missing" }]) {
+        providersConfigStore.saveProvidersConfig({
+          openai: {
+            apiKey: "test-key",
+            codexOauthDefaultAuth: "oauth",
+            ...(selection ? {} : { codexOauthDefaultAccountId: "deleted" }),
+          },
+        });
+        expect(
+          await factory.createModel("openai:gpt-5.3-codex", undefined, selection)
+        ).toMatchObject({
+          success: false,
+          error: { type: "oauth_not_connected" },
+        });
+        const chat = await factory.createModel(
+          "openai:gpt-5.3-codex",
+          {
+            openai: { wireFormat: "chatCompletions" },
+          },
+          selection
+        );
+        expect(chat.success).toBe(true);
+        if (chat.success) expect(modelCostsIncluded(chat.data)).toBe(false);
+      }
+      providersConfigStore.saveProvidersConfig({
+        openai: { apiKey: "test-key", codexOauthDefaultAuth: "apiKey" },
+      });
+      const api = await factory.createModel("openai:gpt-5.5", undefined, {
+        projectPath: "/missing",
+      });
+      expect(api.success).toBe(true);
+      if (api.success) expect(modelCostsIncluded(api.data)).toBe(false);
+      providersConfigStore.saveProvidersConfig({
+        openai: { codexOauthDefaultAccountId: "deleted" },
+        openrouter: { apiKey: "gateway-key" },
+      });
+      await saveRoutePriority(config, ["openrouter", "direct"]);
+      const gateway = await factory.resolveAndCreateModel("openai:gpt-5.5", "off", undefined, {
+        projectPath: "/missing",
+      });
+      expectSuccessfulRouteResult(gateway, {
+        effectiveModelString: "openrouter:openai/gpt-5.5",
+        routeProvider: "openrouter",
+      });
+    });
+  });
+
   it("normalizes Request bodies for the Codex OAuth responses endpoint", async () => {
     await withTempConfig(async (_config, factory, oauth, providersConfigStore) => {
       const originalOpenAIRegistry = PROVIDER_REGISTRY.openai;
@@ -1900,45 +2135,65 @@ describe("ProviderModelFactory routing", () => {
     });
   });
 
-  it("treats OpenAI as available for routing when only Codex OAuth is configured", async () => {
-    // Temporarily remove OPENAI_API_KEY so the test only succeeds via Codex OAuth,
-    // not by falling through to an env-var credential path.
-    const savedKey = process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_KEY;
-    try {
-      await withTempConfig(async (config, factory) => {
-        new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-          openai: {
-            // No apiKey — only Codex OAuth credentials.
-            codexOauth: {
-              type: "oauth",
-              access: "test-access-token",
-              refresh: "test-refresh-token",
-              expires: Date.now() + 60_000,
+  it.each(["default", "work"])(
+    "treats OpenAI as available with only the %s OAuth slot",
+    async (accountId) => {
+      // Temporarily remove OPENAI_API_KEY so the test only succeeds via Codex OAuth,
+      // not by falling through to an env-var credential path.
+      const savedKey = process.env.OPENAI_API_KEY;
+      delete process.env.OPENAI_API_KEY;
+      try {
+        await withTempConfig(async (config, factory) => {
+          new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+            openai: {
+              // No apiKey — only Codex OAuth credentials.
+              ...(accountId === "default"
+                ? {
+                    codexOauth: {
+                      type: "oauth" as const,
+                      access: "access",
+                      refresh: "refresh",
+                      expires: Date.now() + 60_000,
+                    },
+                  }
+                : {
+                    codexOauthDefaultAccountId: accountId,
+                    codexOauthAccounts: {
+                      [accountId]: {
+                        label: "Work",
+                        auth: {
+                          type: "oauth" as const,
+                          access: "access",
+                          refresh: "refresh",
+                          expires: Date.now() + 60_000,
+                        },
+                      },
+                    },
+                  }),
             },
-          },
-          openrouter: {
-            apiKey: "or-test",
-          },
-        });
+            openrouter: {
+              apiKey: "or-test",
+            },
+          });
 
-        await saveRoutePriority(config, ["direct", "openrouter"]);
+          await saveRoutePriority(config, ["direct", "openrouter"]);
 
-        // Direct OpenAI should win because Codex OAuth makes it available for routing.
-        // Use a model from CODEX_OAUTH_ALLOWED_MODELS so createModel can route through OAuth.
-        const result = await factory.resolveAndCreateModel("openai:gpt-5.2", "off");
-        expectSuccessfulRouteResult(result, {
-          effectiveModelString: "openai:gpt-5.2",
-          routeProvider: "openai",
-          routedThroughGateway: false,
+          // Direct OpenAI should win because Codex OAuth makes it available for routing.
+          // Use a model from CODEX_OAUTH_ALLOWED_MODELS so createModel can route through OAuth.
+          const result = await factory.resolveAndCreateModel("openai:gpt-5.2", "off");
+          expectSuccessfulRouteResult(result, {
+            effectiveModelString: "openai:gpt-5.2",
+            routeProvider: "openai",
+            routedThroughGateway: false,
+          });
         });
-      });
-    } finally {
-      if (savedKey !== undefined) {
-        process.env.OPENAI_API_KEY = savedKey;
+      } finally {
+        if (savedKey !== undefined) {
+          process.env.OPENAI_API_KEY = savedKey;
+        }
       }
     }
-  });
+  );
 
   it("leaves direct-provider model strings unchanged when direct routing wins", async () => {
     await withTempConfig(async (config, factory) => {

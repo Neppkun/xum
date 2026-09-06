@@ -168,24 +168,59 @@ export async function resolveProjectTrusted(
   return mainRepoDir != null && isProjectTrusted(realConfig, mainRepoDir);
 }
 
-/** Replace all run-root trust entries so removed grants cannot survive root reuse. */
+/** Replace run project settings so removed trust grants and account overrides cannot survive root reuse. */
 export async function replaceRunTrustProjects(
   realConfig: Config,
   targetConfig: Config
 ): Promise<void> {
   const trustOnlyProjects = new Map<string, ProjectConfig>();
   for (const [projectPath, projectConfig] of realConfig.loadConfigOrDefault().projects) {
-    if (projectConfig.trusted === undefined) {
+    if (projectConfig.trusted === undefined && projectConfig.codexOauthAccountId === undefined) {
       continue;
     }
 
     trustOnlyProjects.set(projectPath, {
       workspaces: [],
       trusted: projectConfig.trusted,
+      codexOauthAccountId: projectConfig.codexOauthAccountId,
     });
   }
 
   await targetConfig.editConfig(() => ({ projects: trustOnlyProjects }));
+}
+
+/** Copy the source project account onto the CLI workspace project. */
+export async function materializeCodexOauthAccount(
+  realConfig: Config,
+  targetConfig: Config,
+  projectDir: string,
+  targetProjectPath: string
+): Promise<void> {
+  const projects = realConfig.loadConfigOrDefault().projects;
+  let sourcePath: string | undefined = projects.has(projectDir) ? projectDir : undefined;
+  if (sourcePath === undefined) {
+    for (const [projectPath, project] of projects) {
+      const workspace = project.workspaces.find((entry) => entry.path === projectDir);
+      if (workspace) {
+        sourcePath =
+          workspace.projects?.[0]?.projectPath ?? workspace.subProjectPath ?? projectPath;
+        break;
+      }
+    }
+  }
+  sourcePath ??=
+    (await findMainRepoDir(projectDir)) ?? (await findGitRoot(projectDir)) ?? projectDir;
+  const accountId = projects.get(sourcePath)?.codexOauthAccountId;
+  await targetConfig.editConfig((config) => {
+    const project = config.projects.get(targetProjectPath) ?? { workspaces: [] };
+    if (accountId === undefined) {
+      delete project.codexOauthAccountId;
+    } else {
+      project.codexOauthAccountId = accountId;
+    }
+    config.projects.set(targetProjectPath, project);
+    return config;
+  });
 }
 
 /**

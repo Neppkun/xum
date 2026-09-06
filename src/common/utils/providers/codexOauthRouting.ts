@@ -12,6 +12,7 @@
 import { isCodexOauthAllowedModel, isCodexOauthRequiredModel } from "@/common/constants/codexOAuth";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { OpenAIWireFormat } from "@/common/types/providerOptions";
+import { CODEX_OAUTH_DEFAULT_ACCOUNT_ID } from "@/common/constants/codexOauthAccounts";
 
 /** Request-level inputs the stored providers config cannot carry. */
 export interface CodexOauthRoutingOptions {
@@ -20,6 +21,8 @@ export interface CodexOauthRoutingOptions {
    * The stored `openai.wireFormat` wins when set, matching providerModelFactory.
    */
   openaiWireFormat?: OpenAIWireFormat | null;
+  /** Local account slot selected for this request. */
+  codexOauthAccountId?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -33,25 +36,41 @@ function hasNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-export function hasCodexOauthTokens(config: unknown): boolean {
+export function hasCodexOauthTokens(config: unknown, accountId?: string): boolean {
   const record = asRecord(config);
   if (!record) {
     return false;
   }
 
-  if (record.codexOauthSet === true) {
+  const selectedId =
+    accountId ?? record.codexOauthDefaultAccountId ?? CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
+  if (Array.isArray(record.codexOauthAccounts)) {
+    return record.codexOauthAccounts.some(
+      (account: unknown) => asRecord(account)?.id === selectedId
+    );
+  }
+
+  // Old metadata contains only the legacy connection flag.
+  if (record.codexOauthSet === true && selectedId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID) {
     return true;
   }
 
-  // Backend compaction can receive raw providers.jsonc config in older tests/fallback paths.
-  // Detect the stored token shape without importing node-only OAuth parsing into common code.
-  const oauth = asRecord(record.codexOauth);
+  // Raw configs contain tokens. Never substitute another connected account.
+  const accounts = asRecord(record.codexOauthAccounts);
+  const selectedAccount = typeof selectedId === "string" ? asRecord(accounts?.[selectedId]) : null;
+  if (selectedId !== CODEX_OAUTH_DEFAULT_ACCOUNT_ID && !hasNonEmptyString(selectedAccount?.label)) {
+    return false;
+  }
+  const oauth = asRecord(
+    selectedId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID ? record.codexOauth : selectedAccount?.auth
+  );
   return (
     oauth?.type === "oauth" &&
     hasNonEmptyString(oauth.access) &&
     hasNonEmptyString(oauth.refresh) &&
     typeof oauth.expires === "number" &&
-    Number.isFinite(oauth.expires)
+    Number.isFinite(oauth.expires) &&
+    (oauth.accountId === undefined || hasNonEmptyString(oauth.accountId))
   );
 }
 
@@ -86,7 +105,7 @@ export function wouldRouteOpenAIThroughCodexOauth(
   if (!isCodexOauthAllowedModel(model, providersConfig ?? null)) {
     return false;
   }
-  if (!hasCodexOauthTokens(openAIConfig)) {
+  if (!hasCodexOauthTokens(openAIConfig, options?.codexOauthAccountId)) {
     return false;
   }
   // Codex OAuth serves only the Responses API. With Chat Completions selected,

@@ -165,6 +165,7 @@ import type {
 import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
 import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
+import { hasCodexOauthTokens } from "@/common/utils/providers/codexOauthRouting";
 import { useCreationWorkspace } from "./useCreationWorkspace";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
@@ -234,7 +235,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     [effectivePolicy]
   );
   const { variant } = props;
-  const { userProjects } = useProjectContext();
+  const { userProjects, getProjectConfig } = useProjectContext();
   const creationScope =
     variant === "creation"
       ? resolveWorkspaceCreationScope(props.projectPath, userProjects, props.pendingSubProjectPath)
@@ -505,7 +506,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     ensureModelInSettings,
     defaultModel,
     setDefaultModel,
-    codexOauthSet,
     requiresCodexOauth,
   } = useModelsFromSettings();
 
@@ -601,6 +601,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const usage = useWorkspaceUsage(workspaceIdForUsage);
   const { has1MContext } = useProviderOptions();
   const { config: providersConfig } = useProvidersConfig();
+  const accountProjectPath =
+    variant === "creation" ? creationParentProjectPath : selectedWorkspace?.projectPath;
+  const codexOauthAccountId = accountProjectPath
+    ? getProjectConfig(accountProjectPath)?.codexOauthAccountId
+    : undefined;
+  const codexOauthSet =
+    providersConfig == null
+      ? null
+      : hasCodexOauthTokens(providersConfig.openai, codexOauthAccountId);
   const lastUsage = usage?.liveUsage ?? usage?.lastContextUsage;
   // Token counts come from usage metadata, but context limits/1M eligibility should
   // follow the currently selected model unless a stream is actively running.
@@ -609,9 +618,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const use1M = has1MContext(contextDisplayModel);
   const contextUsageData = useMemo(() => {
     return lastUsage
-      ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig)
+      ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig, {
+          codexOauthAccountId,
+        })
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
-  }, [lastUsage, contextDisplayModel, use1M, providersConfig]);
+  }, [lastUsage, contextDisplayModel, use1M, providersConfig, codexOauthAccountId]);
   const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
     useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
   const autoCompactionProps = useMemo(
@@ -2765,7 +2776,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       className="flex shrink-0 items-center"
                       data-component="ThinkingSelectorGroup"
                     >
-                      <ThinkingSelector modelString={baseModel} />
+                      <ThinkingSelector
+                        modelString={baseModel}
+                        codexOauthAccountId={codexOauthAccountId}
+                      />
                     </div>
                   </div>
 

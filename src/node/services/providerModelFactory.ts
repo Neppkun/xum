@@ -19,7 +19,11 @@ import {
   isCodexOauthAllowedModel,
   isCodexOauthRequiredModel,
 } from "@/common/constants/codexOAuth";
-import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
+import {
+  getCodexOauthAccountId,
+  getCodexOauthAccounts,
+  getCodexOauthAuth,
+} from "@/node/utils/codexOauthAuth";
 import type { Config, ProviderConfig, ProvidersConfig } from "@/node/config";
 import { ProvidersConfigStore } from "@/node/config";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -1099,6 +1103,8 @@ export interface ResolveAndCreateModelResult {
    * retagged instance type diverging from the created fallback model.
    */
   coderSelectedInstance?: { name: string; type: string };
+  /** Local account slot pinned for request routing and context limits. */
+  codexOauthAccountId?: string;
   /** Whether the request is being routed through the Xum gateway. */
   routedThroughGateway: boolean;
   /** Route provider chosen by backend routing (direct provider or gateway). */
@@ -1108,6 +1114,10 @@ export interface ResolveAndCreateModelResult {
 interface CreateModelOptions {
   agentInitiated?: boolean;
   workspaceId?: string;
+  /** Project context for requests before workspace creation. */
+  projectPath?: string;
+  /** Account selection snapshot from resolveAndCreateModel. */
+  codexOauthSelection?: { accountId: string; explicit: boolean };
   routeContext?: RouteContext;
   /**
    * Providers-config snapshot to create the model from. Passed by
@@ -1192,6 +1202,31 @@ export class ProviderModelFactory {
     return forced ? { ...providerConfig, deploymentUrl: forced } : providerConfig;
   }
 
+  private resolveCodexOauthSelection(
+    providerConfig: ProviderConfigRaw,
+    opts?: CreateModelOptions
+  ): { accountId: string; explicit: boolean } {
+    if (opts?.codexOauthSelection) {
+      return opts.codexOauthSelection;
+    }
+    const workspace = opts?.workspaceId ? this.config.findWorkspace(opts.workspaceId) : null;
+    // Multi-project attribution wins. Single-project workspaces use their registered subproject.
+    const projectPath =
+      workspace?.projects?.[0]?.projectPath ??
+      workspace?.subProjectPath ??
+      workspace?.attributionProjectPath ??
+      workspace?.projectPath ??
+      opts?.projectPath;
+    const projectAccountId = projectPath
+      ? this.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
+      : undefined;
+    return {
+      accountId: getCodexOauthAccountId(providerConfig, projectAccountId),
+      explicit:
+        projectAccountId !== undefined || providerConfig.codexOauthDefaultAccountId !== undefined,
+    };
+  }
+
   private isProviderAvailableForRouting(
     provider: ProviderName,
     providersConfig: ProvidersConfig,
@@ -1206,9 +1241,7 @@ export class ProviderModelFactory {
 
     // OpenAI Codex OAuth is a valid credential path even without an API key;
     // routing should treat it as available so direct OpenAI routes are honored.
-    const hasCodexOauth =
-      provider === "openai" &&
-      parseCodexOauthAuth((providerConfig as { codexOauth?: unknown }).codexOauth) !== null;
+    const hasCodexOauth = provider === "openai" && getCodexOauthAccounts(providerConfig).length > 0;
 
     if (!credentials.isConfigured && !hasCodexOauth) {
       return false;
@@ -1284,11 +1317,7 @@ export class ProviderModelFactory {
   private createModelCoreEffect(
     modelString: string,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: {
-      agentInitiated?: boolean;
-      routeContext?: RouteContext;
-      providersConfig?: ProvidersConfig;
-    }
+    opts?: CreateModelOptions
   ): Effect.Effect<Result<LanguageModel, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -1568,17 +1597,16 @@ export class ProviderModelFactory {
           const codexOauthAllowed = isCodexOauthAllowedModel(fullModelId, providersConfig);
           const codexOauthRequired = isCodexOauthRequiredModel(fullModelId, providersConfig);
 
-          const storedCodexOauth = parseCodexOauthAuth(
-            (providerConfig as { codexOauth?: unknown }).codexOauth
-          );
+          // Pin the local slot, not the ChatGPT header ID, across refreshes and retries.
+          const selection = self.resolveCodexOauthSelection(providerConfig, opts);
+          const codexOauthAccountId = selection.accountId;
+          const storedCodexOauth = getCodexOauthAuth(providerConfig, codexOauthAccountId);
 
           // Resolve credentials from config + env so we can decide whether to
           // route through Codex OAuth or fall back to API key auth.
           const creds = resolveProviderCredentials("openai", providerConfig);
 
-          // When a model requires Codex OAuth but the user hasn't connected it,
-          // fall back to their API key instead of blocking entirely.  If the model
-          // truly only works through OAuth, OpenAI's API will return a clear error.
+          // Preserve the legacy API-key path when no OAuth account has been selected.
           if (codexOauthRequired && !storedCodexOauth && !creds.isConfigured) {
             return Err({ type: "oauth_not_connected", provider: providerName });
           }
@@ -1594,32 +1622,20 @@ export class ProviderModelFactory {
             (providerConfig.wireFormat as string | undefined) ??
             muxProviderOptions?.openai?.wireFormat;
 
-          // Codex OAuth routing:
-          // - Chat Completions never routes through OAuth when an API key exists.
-          // - Required models route through ChatGPT OAuth when connected.
-          // - If OAuth is not connected, fall back to API key (if available).
-          // - Allowed models route through OAuth only when:
-          //   - no API key is configured, OR
-          //   - the user prefers OAuth when both are set.
-          const shouldRouteThroughCodexOauth = (() => {
-            if (!codexOauthAllowed || !storedCodexOauth) {
-              return false;
-            }
+          // A missing selected slot must not switch billing to an API key or another account.
+          const prefersCodexOauth =
+            codexOauthAllowed &&
+            !(earlyWireFormat === "chatCompletions" && creds.isConfigured) &&
+            (codexOauthRequired || !creds.isConfigured || codexOauthDefaultAuth === "oauth");
+          if (
+            prefersCodexOauth &&
+            !storedCodexOauth &&
+            (selection.explicit || getCodexOauthAccounts(providerConfig).length > 0)
+          ) {
+            return Err({ type: "oauth_not_connected", provider: providerName });
+          }
 
-            if (earlyWireFormat === "chatCompletions" && creds.isConfigured) {
-              return false;
-            }
-
-            if (codexOauthRequired) {
-              return true;
-            }
-
-            if (!creds.isConfigured) {
-              return true;
-            }
-
-            return codexOauthDefaultAuth === "oauth";
-          })();
+          const shouldRouteThroughCodexOauth = prefersCodexOauth && storedCodexOauth !== null;
 
           // OAuth requests use a placeholder key and override auth headers in fetch().
           const resolvedApiKey = shouldRouteThroughCodexOauth ? undefined : creds.apiKey;
@@ -1734,7 +1750,7 @@ export class ProviderModelFactory {
                     throw new Error("Codex OAuth service not initialized");
                   }
 
-                  const authResult = await codexOauthService.getValidAuth();
+                  const authResult = await codexOauthService.getValidAuth(codexOauthAccountId);
                   if (!authResult.success) {
                     throw new Error(authResult.error);
                   }
@@ -1743,6 +1759,9 @@ export class ProviderModelFactory {
                   headers.set("Authorization", `Bearer ${authResult.data.access}`);
                   if (authResult.data.accountId) {
                     headers.set("ChatGPT-Account-Id", authResult.data.accountId);
+                  } else {
+                    // A configured header must not select another ChatGPT account.
+                    headers.delete("ChatGPT-Account-Id");
                   }
 
                   nextInput = CODEX_ENDPOINT;
@@ -2544,7 +2563,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "projectPath">
   ): Promise<Result<ResolveAndCreateModelResult, SendMessageError>> {
     return Effect.runPromise(
       this.resolveAndCreateModelEffect(modelString, thinkingLevel, muxProviderOptions, opts)
@@ -2555,7 +2574,7 @@ export class ProviderModelFactory {
     modelString: string,
     thinkingLevel: ThinkingLevel,
     muxProviderOptions?: MuxProviderOptions,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: Pick<CreateModelOptions, "agentInitiated" | "workspaceId" | "projectPath">
   ): Effect.Effect<Result<ResolveAndCreateModelResult, SendMessageError>> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
@@ -2790,8 +2809,13 @@ export class ProviderModelFactory {
         }
       }
 
+      const codexOauthSelection = self.resolveCodexOauthSelection(
+        providersConfigForShadowCheck.openai ?? {},
+        opts
+      );
       const modelResult = yield* self.createModelEffect(effectiveModelString, muxProviderOptions, {
         ...opts,
+        codexOauthSelection,
         routeContext,
         // ONE config snapshot for the whole resolve+create: the wire snapshot
         // above and the SDK model must come from the same providers.jsonc read,
@@ -2835,6 +2859,7 @@ export class ProviderModelFactory {
         wireProviderName,
         coderWire,
         coderSelectedInstance,
+        codexOauthAccountId: codexOauthSelection.accountId,
         routedThroughGateway,
         // Custom adapters are direct routes: the raw custom id is not a
         // ProviderName, and leaking it as routeProvider makes downstream

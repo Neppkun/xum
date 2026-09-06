@@ -4,7 +4,12 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
-import { materializeResolvedTrust, replaceRunTrustProjects, resolveProjectDir } from "./trust";
+import {
+  materializeCodexOauthAccount,
+  materializeResolvedTrust,
+  replaceRunTrustProjects,
+  resolveProjectDir,
+} from "./trust";
 
 const BUN_EXECUTABLE = process.execPath;
 const TRUST_ENTRY = path.join(import.meta.dir, "trust.ts");
@@ -97,6 +102,56 @@ describe("xum trust CLI", () => {
     expect(trustByPath.get(repo)).toBe(false);
     expect(trustByPath.get(worktree)).toBe(false);
   }, 15_000);
+
+  test("copies Codex overrides without requiring project trust", async () => {
+    using tmp = new DisposableTempDir("codex-project-copy");
+    const real = new Config(path.join(tmp.path, "real"));
+    const target = new Config(path.join(tmp.path, "target"));
+    const projectPath = path.join(tmp.path, "project");
+    await real.editConfig((config) => {
+      config.projects.set(projectPath, { workspaces: [], codexOauthAccountId: "work" });
+      return config;
+    });
+    await replaceRunTrustProjects(real, target);
+    expect(target.loadConfigOrDefault().projects.get(projectPath)).toMatchObject({
+      codexOauthAccountId: "work",
+      workspaces: [],
+    });
+    await real.editConfig((config) => {
+      config.projects.delete(projectPath);
+      return config;
+    });
+    await replaceRunTrustProjects(real, target);
+    expect(target.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+  });
+
+  test("materializes subproject accounts onto temporary CLI workspace projects", async () => {
+    using tmp = new DisposableTempDir("codex-worktree-copy");
+    const real = new Config(path.join(tmp.path, "real"));
+    const target = new Config(path.join(tmp.path, "target"));
+    const root = path.join(tmp.path, "project");
+    const subproject = path.join(root, "subproject");
+    const worktree = path.join(tmp.path, "checkout");
+    const cliProject = path.join(tmp.path, "cli-project");
+    await real.editConfig((config) => {
+      config.projects.set(root, {
+        codexOauthAccountId: "personal",
+        workspaces: [{ path: worktree, id: "test-account-workspace", subProjectPath: subproject }],
+      });
+      config.projects.set(subproject, { workspaces: [], codexOauthAccountId: "work" });
+      return config;
+    });
+    await materializeCodexOauthAccount(real, target, worktree, cliProject);
+    expect(target.loadConfigOrDefault().projects.get(cliProject)?.codexOauthAccountId).toBe("work");
+    await real.editConfig((config) => {
+      delete config.projects.get(subproject)!.codexOauthAccountId;
+      return config;
+    });
+    await materializeCodexOauthAccount(real, target, worktree, cliProject);
+    expect(
+      target.loadConfigOrDefault().projects.get(cliProject)?.codexOauthAccountId
+    ).toBeUndefined();
+  });
 
   test("replaceRunTrustProjects rebuilds config without foreign settings", async () => {
     using tmp = new DisposableTempDir("trust-replace-run");

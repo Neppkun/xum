@@ -76,6 +76,27 @@ describe("hasAnyConfiguredProvider", () => {
     expect(hasAnyConfiguredProvider(providers)).toBe(true);
   });
 
+  it("accepts an additional OAuth account even when the global selection is missing", () => {
+    expect(
+      hasAnyConfiguredProvider({
+        openai: {
+          codexOauthDefaultAccountId: "deleted",
+          codexOauthAccounts: {
+            work: {
+              label: "Work",
+              auth: {
+                type: "oauth",
+                access: "access",
+                refresh: "refresh",
+                expires: Date.now() + 60_000,
+              },
+            },
+          },
+        },
+      })
+    ).toBe(true);
+  });
+
   it("returns true for OpenAI Codex OAuth-only configuration", () => {
     const providers: ProvidersConfig = {
       openai: {

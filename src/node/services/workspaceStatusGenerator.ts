@@ -121,6 +121,7 @@ export function buildWorkspaceStatusPrompt(
 }
 
 export interface GenerateWorkspaceStatusOptions extends BuildWorkspaceStatusPromptOptions {
+  workspaceId?: string;
   /**
    * Best-effort cost telemetry: status generation bypasses StreamManager,
    * so the caller records the successful candidate's usage into
@@ -208,6 +209,7 @@ function generateWorkspaceStatusEffect(
       const modelResult = yield* Effect.promise(async () =>
         aiService.createModelWithPinnedMetadata(modelString, {
           agentInitiated: true,
+          workspaceId: options.workspaceId,
         })
       );
       if (!modelResult.success) {

@@ -2,6 +2,9 @@ import { describe, it, expect } from "bun:test";
 
 import {
   parseCodexOauthAuth,
+  getCodexOauthAccounts,
+  getCodexOauthAccountId,
+  getCodexOauthAuth,
   isCodexOauthAuthExpired,
   parseJwtClaims,
   extractAccountIdFromClaims,
@@ -236,5 +239,60 @@ describe("extractAccountIdFromTokens", () => {
     const idToken = fakeJwt({ sub: "user" });
     const accessToken = fakeJwt({ chatgpt_account_id: "from_access_token" });
     expect(extractAccountIdFromTokens({ accessToken, idToken })).toBe("from_access_token");
+  });
+});
+
+describe("Codex OAuth account slots", () => {
+  const legacy = { type: "oauth", access: "legacy", refresh: "legacy-refresh", expires: 1000 };
+  const work = {
+    type: "oauth",
+    access: "work",
+    refresh: "work-refresh",
+    expires: 2000,
+    accountId: "remote-chatgpt-id",
+  };
+
+  it("reads the legacy slot and named slots with separate local identities", () => {
+    const config = {
+      codexOauth: legacy,
+      codexOauthLabel: "Personal",
+      codexOauthAccounts: { work: { label: "Work", auth: work } },
+    };
+    expect(getCodexOauthAccounts(config).map(({ id, label }) => ({ id, label }))).toEqual([
+      { id: "default", label: "Personal" },
+      { id: "work", label: "Work" },
+    ]);
+    expect(getCodexOauthAuth(config, "work")?.accountId).toBe("remote-chatgpt-id");
+    expect(getCodexOauthAuth(config, "remote-chatgpt-id")).toBeNull();
+    expect(getCodexOauthAuth(config)?.access).toBe("legacy");
+  });
+
+  it("uses explicit selection before the global default and never substitutes missing slots", () => {
+    const config = {
+      codexOauth: legacy,
+      codexOauthAccounts: { work: { label: "Work", auth: work } },
+      codexOauthDefaultAccountId: "work",
+    };
+    expect(getCodexOauthAuth(config)?.access).toBe("work");
+    expect(getCodexOauthAuth(config, "default")?.access).toBe("legacy");
+    expect(getCodexOauthAuth(config, "missing")).toBeNull();
+    expect(getCodexOauthAuth({ ...config, codexOauthDefaultAccountId: "missing" })).toBeNull();
+    expect(getCodexOauthAccountId(undefined)).toBe("default");
+    expect(getCodexOauthAccountId(config, "missing")).toBe("missing");
+  });
+
+  it("filters malformed slots without accepting a duplicate legacy slot", () => {
+    const config = {
+      codexOauth: legacy,
+      codexOauthAccounts: {
+        default: { label: "Duplicate", auth: work },
+        broken: { label: "Broken", auth: {} },
+        blank: { label: " ", auth: work },
+        work: { label: "Work", auth: work },
+      },
+    };
+    expect(getCodexOauthAccounts(config).map((account) => account.id)).toEqual(["default", "work"]);
+    expect(getCodexOauthAccounts(null)).toEqual([]);
+    expect(getCodexOauthAccounts({ codexOauthAccounts: [] })).toEqual([]);
   });
 });

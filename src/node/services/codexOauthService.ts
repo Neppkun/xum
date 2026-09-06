@@ -25,7 +25,15 @@ import {
   CODEX_OAUTH_DEVICE_VERIFY_URL,
   CODEX_OAUTH_TOKEN_URL,
 } from "@/common/constants/codexOAuth";
-import type { ProvidersConfigStore } from "@/node/config";
+import {
+  CODEX_OAUTH_DEFAULT_ACCOUNT_ID,
+  CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH,
+  CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH,
+  CODEX_OAUTH_ACCOUNT_ID_PATTERN,
+  CODEX_OAUTH_RESERVED_ACCOUNT_IDS,
+  CODEX_OAUTH_REFRESH_TIMEOUT_MS,
+} from "@/common/constants/codexOauthAccounts";
+import { FileLeaseManager, type ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import { log } from "@/node/services/log";
@@ -33,6 +41,9 @@ import { sleepWithAbort } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import {
   extractAccountIdFromTokens,
+  getCodexOauthAccounts,
+  getCodexOauthAccountId,
+  getCodexOauthAuth,
   isCodexOauthAuthExpired,
   parseCodexOauthAuth,
   type CodexOauthAuth,
@@ -46,7 +57,22 @@ const DEFAULT_DESKTOP_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_DEVICE_TIMEOUT_MS = 15 * 60 * 1000;
 const COMPLETED_FLOW_TTL_MS = 60 * 1000;
 
+export interface CodexOauthLoginOptions {
+  label?: string;
+  accountId?: string;
+}
+
+interface AccountSelection {
+  accountId: string;
+  revision: number;
+  loginAttempt?: number;
+  auth: CodexOauthAuth | null;
+  label?: string;
+  selectAsDefault: boolean;
+}
+
 interface DeviceFlow {
+  destination: AccountSelection;
   flowId: string;
   deviceAuthId: string;
   userCode: string;
@@ -118,50 +144,102 @@ export class CodexOauthError extends Schema.TaggedError<CodexOauthError>()("Code
   reason: Schema.String,
 }) {}
 
+function isValidAccountId(accountId: string): boolean {
+  return (
+    accountId.length <= CODEX_OAUTH_ACCOUNT_ID_MAX_LENGTH &&
+    CODEX_OAUTH_ACCOUNT_ID_PATTERN.test(accountId) &&
+    !CODEX_OAUTH_RESERVED_ACCOUNT_IDS.has(accountId)
+  );
+}
+
+function isValidLabel(label: string): boolean {
+  return label.trim().length > 0 && label.trim().length <= CODEX_OAUTH_ACCOUNT_LABEL_MAX_LENGTH;
+}
+
+function matchesAuth(actual: CodexOauthAuth | null, expected: CodexOauthAuth | null): boolean {
+  if (!actual || !expected) return actual === expected;
+  return (
+    actual.access === expected.access &&
+    actual.refresh === expected.refresh &&
+    actual.expires === expected.expires &&
+    actual.accountId === expected.accountId
+  );
+}
+
 export class CodexOauthService {
   private readonly desktopFlows = new OAuthFlowManager();
   private readonly deviceFlows = new Map<string, DeviceFlow>();
 
-  private readonly refreshMutex = new AsyncMutex();
-
-  // In-memory cache so getValidAuth() skips disk reads when tokens are valid.
-  // Invalidated on every write (exchange, refresh, disconnect).
-  private cachedAuth: CodexOauthAuth | null = null;
+  private readonly refreshMutexes = new Map<string, AsyncMutex>();
+  private readonly accountRevisions = new Map<string, number>();
+  private readonly loginAttempts = new Map<string, number>();
 
   constructor(
     private readonly providersConfigStore: ProvidersConfigStore,
     private readonly providerService: ProviderService,
-    private readonly windowService?: WindowService
+    private readonly windowService?: WindowService,
+    private readonly fileLeaseManager = new FileLeaseManager(providersConfigStore.rootDir)
   ) {}
 
-  async disconnect(): Promise<Result<void, string>> {
-    return Effect.runPromise(this.disconnectEffect());
+  async disconnect(accountId?: string): Promise<Result<void, string>> {
+    return Effect.runPromise(this.disconnectEffect(accountId));
   }
 
-  /**
-   * Wire-shaped Effect surface for handlerGen router handlers. Uninterruptible
-   * (mirrors asAtomicMutation in providerService.ts): a client abort must not
-   * skip the persisted-credential clear after the in-memory cache was already
-   * invalidated.
-   */
-  disconnectEffect(): Effect.Effect<Result<void, string>> {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
-    const self = this;
-    return Effect.uninterruptible(
-      Effect.gen(function* () {
-        // Clear stored ChatGPT OAuth tokens so Codex-only models are hidden again.
-        self.cachedAuth = null;
-        // setConfigValue resolves with a wire Result; a rejection stays a
-        // defect, matching the previously un-caught await.
-        return yield* Effect.promise(() =>
-          self.providerService.setConfigValue("openai", ["codexOauth"], undefined)
+  // No argument retains legacy behavior. Account-aware callers pass the selected slot ID.
+  disconnectEffect(
+    accountId = CODEX_OAUTH_DEFAULT_ACCOUNT_ID
+  ): Effect.Effect<Result<void, string>> {
+    return Effect.suspend(() => {
+      if (!isValidAccountId(accountId))
+        return Effect.succeed(Err("Invalid Codex OAuth account ID"));
+      // Invalidate pending refreshes and logins before clearing this slot.
+      this.accountRevisions.set(accountId, this.getAccountRevision(accountId) + 1);
+      return this.updateConfigValueEffect(this.accountPath(accountId), () => ({
+        value: undefined,
+      }));
+    });
+  }
+
+  async setDefaultAccount(accountId: string): Promise<Result<void, string>> {
+    return Effect.runPromise(this.setDefaultAccountEffect(accountId));
+  }
+
+  setDefaultAccountEffect(accountId: string): Effect.Effect<Result<void, string>> {
+    return Effect.suspend(() => {
+      if (!isValidAccountId(accountId))
+        return Effect.succeed(Err("Invalid Codex OAuth account ID"));
+      return this.updateConfigValueEffect(["codexOauthDefaultAccountId"], () =>
+        this.readStoredAuth(accountId) ? { value: accountId } : null
+      );
+    });
+  }
+
+  async renameAccount(accountId: string, label: string): Promise<Result<void, string>> {
+    return Effect.runPromise(this.renameAccountEffect(accountId, label));
+  }
+
+  renameAccountEffect(accountId: string, label: string): Effect.Effect<Result<void, string>> {
+    return Effect.suspend(() => {
+      if (!isValidAccountId(accountId))
+        return Effect.succeed(Err("Invalid Codex OAuth account ID"));
+      if (!isValidLabel(label)) return Effect.succeed(Err("Invalid Codex OAuth account label"));
+      if (accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID) {
+        return this.updateConfigValueEffect(["codexOauthLabel"], () =>
+          this.readStoredAuth(accountId) ? { value: label.trim() } : null
         );
-      })
-    );
+      }
+      return this.updateConfigValueEffect(this.accountPath(accountId), (current) =>
+        isPlainObject(current) && parseCodexOauthAuth(current.auth)
+          ? { value: { ...current, label: label.trim() } }
+          : null
+      );
+    });
   }
 
-  async startDesktopFlow(): Promise<Result<{ flowId: string; authorizeUrl: string }, string>> {
-    return Effect.runPromise(this.startDesktopFlowEffect());
+  async startDesktopFlow(
+    options?: CodexOauthLoginOptions
+  ): Promise<Result<{ flowId: string; authorizeUrl: string }, string>> {
+    return Effect.runPromise(this.startDesktopFlowEffect(options));
   }
 
   /**
@@ -172,19 +250,19 @@ export class CodexOauthService {
    * and local, so running it to completion on abort is cheap; an abandoned
    * flow still self-cleans via the registered timeout.
    */
-  startDesktopFlowEffect(): Effect.Effect<
-    Result<{ flowId: string; authorizeUrl: string }, string>
-  > {
-    return Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect()));
+  startDesktopFlowEffect(
+    options?: CodexOauthLoginOptions
+  ): Effect.Effect<Result<{ flowId: string; authorizeUrl: string }, string>> {
+    return Effect.uninterruptible(toWireResult(this.launchDesktopFlowEffect(options)));
   }
 
-  private launchDesktopFlowEffect(): Effect.Effect<
-    { flowId: string; authorizeUrl: string },
-    CodexOauthError
-  > {
+  private launchDesktopFlowEffect(
+    options?: CodexOauthLoginOptions
+  ): Effect.Effect<{ flowId: string; authorizeUrl: string }, CodexOauthError> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
+      const destination = yield* self.selectLoginDestination(options);
       const flowId = randomBase64Url();
 
       const codeVerifier = randomBase64Url();
@@ -233,6 +311,7 @@ export class CodexOauthService {
       // cancelled.
       Effect.runFork(
         self.desktopCallbackPipeline({
+          destination,
           flowId,
           redirectUri,
           codeVerifier,
@@ -254,6 +333,7 @@ export class CodexOauthService {
    * dangling on loopback.result.
    */
   private desktopCallbackPipeline(args: {
+    destination: AccountSelection;
     flowId: string;
     redirectUri: string;
     codeVerifier: string;
@@ -277,6 +357,8 @@ export class CodexOauthService {
 
       const exchangeResult: Result<void, string> = yield* toWireResult(
         self.handleDesktopCallbackAndExchange({
+          destination: args.destination,
+          isActive: () => self.desktopFlows.has(args.flowId),
           flowId: args.flowId,
           redirectUri: args.redirectUri,
           codeVerifier: args.codeVerifier,
@@ -338,7 +420,7 @@ export class CodexOauthService {
     );
   }
 
-  async startDeviceFlow(): Promise<
+  async startDeviceFlow(options?: CodexOauthLoginOptions): Promise<
     Result<
       {
         flowId: string;
@@ -349,7 +431,7 @@ export class CodexOauthService {
       string
     >
   > {
-    return Effect.runPromise(this.startDeviceFlowEffect());
+    return Effect.runPromise(this.startDeviceFlowEffect(options));
   }
 
   /**
@@ -359,7 +441,9 @@ export class CodexOauthService {
    * flow record (and its expiry timeout) that lets callers re-attach or the
    * flow self-clean.
    */
-  startDeviceFlowEffect(): Effect.Effect<
+  startDeviceFlowEffect(
+    options?: CodexOauthLoginOptions
+  ): Effect.Effect<
     Result<{ flowId: string; userCode: string; verifyUrl: string; intervalSeconds: number }, string>
   > {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
@@ -367,6 +451,7 @@ export class CodexOauthService {
     return Effect.uninterruptible(
       toWireResult(
         Effect.gen(function* () {
+          const destination = yield* self.selectLoginDestination(options);
           const flowId = randomBase64Url();
 
           const { deviceAuthId, userCode, intervalSeconds, expiresAtMs } =
@@ -387,6 +472,7 @@ export class CodexOauthService {
           }, timeoutMs);
 
           self.deviceFlows.set(flowId, {
+            destination,
             flowId,
             deviceAuthId,
             userCode,
@@ -503,42 +589,54 @@ export class CodexOauthService {
     );
   }
 
-  async getValidAuth(): Promise<Result<CodexOauthAuth, string>> {
-    return Effect.runPromise(this.getValidAuthEffect());
+  async getValidAuth(accountId?: string): Promise<Result<CodexOauthAuth, string>> {
+    return Effect.runPromise(this.getValidAuthEffect(accountId));
   }
 
-  getValidAuthEffect(): Effect.Effect<Result<CodexOauthAuth, string>> {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+  getValidAuthEffect(accountId?: string): Effect.Effect<Result<CodexOauthAuth, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect generators do not inherit this.
     const self = this;
     return Effect.gen(function* () {
-      const stored = self.readStoredAuth();
-      if (!stored) {
-        return Err("Codex OAuth is not configured");
-      }
+      // Resolve once. A default change must not switch an active request to another account.
+      const selectedId = getCodexOauthAccountId(self.readOpenaiConfig(), accountId);
+      if (!isValidAccountId(selectedId)) return Err("Invalid Codex OAuth account ID");
+      const revision = self.getAccountRevision(selectedId);
+      const stored = self.readStoredAuth(selectedId);
+      if (!stored) return Err(`Codex OAuth account "${selectedId}" is not configured`);
+      if (!isCodexOauthAuthExpired(stored)) return Ok(stored);
 
-      if (!isCodexOauthAuthExpired(stored)) {
-        return Ok(stored);
+      let mutex = self.refreshMutexes.get(selectedId);
+      if (!mutex) {
+        mutex = new AsyncMutex();
+        self.refreshMutexes.set(selectedId, mutex);
       }
-
-      // acquireUseRelease guarantees the mutex is released on every exit path
-      // (refresh success/failure, defects, interruption) — the Effect
-      // equivalent of the pre-Effect `await using` lock.
+      const refreshMutex = mutex;
       return yield* Effect.acquireUseRelease(
-        Effect.promise(() => self.refreshMutex.acquire()),
+        Effect.promise(() => refreshMutex.acquire()),
         () =>
-          Effect.gen(function* () {
-            // Re-read after acquiring lock in case another caller refreshed first.
-            const latest = self.readStoredAuth();
-            if (!latest) {
-              return Err("Codex OAuth is not configured");
-            }
-
-            if (!isCodexOauthAuthExpired(latest)) {
-              return Ok(latest);
-            }
-
-            return yield* toWireResult(self.refreshTokens(latest));
-          }),
+          // Hold the file lease through persistence. Other processes must adopt the rotated token.
+          Effect.tryPromise({
+            try: () =>
+              self.fileLeaseManager.withCodexOauthRefreshLock(selectedId, async () => {
+                if (revision !== self.getAccountRevision(selectedId)) {
+                  return Err("Codex OAuth account changed during the request");
+                }
+                const latest = self.readStoredAuth(selectedId);
+                if (!latest) return Err(`Codex OAuth account "${selectedId}" is not configured`);
+                if (!isCodexOauthAuthExpired(latest)) return Ok(latest);
+                return await Effect.runPromise(
+                  toWireResult(
+                    self.refreshTokens(
+                      { accountId: selectedId, revision, auth: latest, selectAsDefault: false },
+                      latest
+                    )
+                  )
+                );
+              }),
+            catch: (error) => getErrorMessage(error),
+          }).pipe(
+            Effect.catch((error) => Effect.succeed(Err(`Codex OAuth refresh failed: ${error}`)))
+          ),
         (lock) => Effect.promise(() => lock[Symbol.asyncDispose]())
       );
     });
@@ -562,35 +660,159 @@ export class CodexOauthService {
     this.deviceFlows.clear();
   }
 
-  private readStoredAuth(): CodexOauthAuth | null {
-    if (this.cachedAuth) {
-      return this.cachedAuth;
-    }
-    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
-    const openaiConfig = providersConfig.openai as Record<string, unknown> | undefined;
-    const auth = parseCodexOauthAuth(openaiConfig?.codexOauth);
-    this.cachedAuth = auth;
-    return auth;
+  private readOpenaiConfig(): unknown {
+    return this.providersConfigStore.loadProvidersConfig()?.openai;
   }
 
-  private persistAuth(auth: CodexOauthAuth): Effect.Effect<Result<void, string>> {
-    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+  private readStoredAuth(accountId: string): CodexOauthAuth | null {
+    // Read storage so another process cannot leave this service with stale credentials.
+    return getCodexOauthAuth(this.readOpenaiConfig(), accountId);
+  }
+
+  private getAccountRevision(accountId: string): number {
+    return this.accountRevisions.get(accountId) ?? 0;
+  }
+
+  private accountPath(accountId: string): string[] {
+    return accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID
+      ? ["codexOauth"]
+      : ["codexOauthAccounts", accountId];
+  }
+
+  private updateConfigValueEffect(
+    keyPath: string[],
+    update: (current: unknown) => { value: unknown } | null
+  ): Effect.Effect<Result<void, string>> {
+    return Effect.uninterruptible(
+      Effect.tryPromise({
+        try: () =>
+          this.providerService.updateConfigValue("openai", keyPath, update, {
+            enforcePolicy: true,
+          }),
+        catch: (error) => getErrorMessage(error),
+      }).pipe(
+        Effect.map((result): Result<void, string> => {
+          if (!result.success) return result;
+          return result.data.applied
+            ? Ok(undefined)
+            : Err("Codex OAuth account changed or is not configured");
+        }),
+        Effect.catch((error) => Effect.succeed(Err(error)))
+      )
+    );
+  }
+
+  private selectLoginDestination(
+    options?: CodexOauthLoginOptions
+  ): Effect.Effect<AccountSelection, CodexOauthError> {
+    return Effect.suspend(() => {
+      if (options?.accountId !== undefined && options.label !== undefined) {
+        return Effect.fail(
+          new CodexOauthError({ reason: "Specify an account ID or a label, not both" })
+        );
+      }
+      if (options?.label !== undefined && !isValidLabel(options.label)) {
+        return Effect.fail(new CodexOauthError({ reason: "Invalid Codex OAuth account label" }));
+      }
+      const accountId =
+        options?.accountId ??
+        (options?.label !== undefined ? crypto.randomUUID() : CODEX_OAUTH_DEFAULT_ACCOUNT_ID);
+      if (!isValidAccountId(accountId)) {
+        return Effect.fail(new CodexOauthError({ reason: "Invalid Codex OAuth account ID" }));
+      }
+      const auth = this.readStoredAuth(accountId);
+      if (options?.accountId !== undefined && !auth) {
+        return Effect.fail(
+          new CodexOauthError({ reason: "Codex OAuth account is not configured" })
+        );
+      }
+      // A failed or cancelled login must not discard a pending token rotation.
+      const revision = this.getAccountRevision(accountId);
+      const loginAttempt = (this.loginAttempts.get(accountId) ?? 0) + 1;
+      this.loginAttempts.set(accountId, loginAttempt);
+      return Effect.succeed({
+        accountId,
+        revision,
+        loginAttempt,
+        auth,
+        label: options?.label?.trim(),
+        selectAsDefault:
+          options?.label !== undefined &&
+          getCodexOauthAccounts(this.readOpenaiConfig()).length === 0,
+      });
+    });
+  }
+
+  private persistAuth(
+    selection: AccountSelection,
+    auth: CodexOauthAuth | undefined,
+    isActive: () => boolean = () => true
+  ): Effect.Effect<Result<void, string>> {
+    return this.updateConfigValueEffect(this.accountPath(selection.accountId), (current) => {
+      const legacy = selection.accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
+      const stored = parseCodexOauthAuth(
+        legacy ? current : isPlainObject(current) ? current.auth : undefined
+      );
+      // Compare under the file lock. Old refreshes must not restore deleted or reconnected slots.
+      if (
+        !isActive() ||
+        this.getAccountRevision(selection.accountId) !== selection.revision ||
+        !matchesAuth(stored, selection.auth)
+      )
+        return null;
+      if (legacy || auth === undefined) return { value: auth };
+      return {
+        value: {
+          ...(isPlainObject(current) ? current : {}),
+          label: isPlainObject(current) ? current.label : selection.label,
+          auth,
+        },
+      };
+    });
+  }
+
+  private persistLoginAuth(
+    selection: AccountSelection,
+    auth: CodexOauthAuth,
+    isActive: () => boolean
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect generators do not inherit this.
     const self = this;
     return Effect.gen(function* () {
-      // setConfigValue resolves with a wire Result; a rejection stays a
-      // defect, matching the previously un-caught await.
-      const result = yield* Effect.promise(() =>
-        self.providerService.setConfigValue("openai", ["codexOauth"], auth)
+      const result = yield* self.persistAuth(
+        selection,
+        auth,
+        () => isActive() && self.loginAttempts.get(selection.accountId) === selection.loginAttempt
       );
-      // Invalidate cache so the next readStoredAuth() picks up the persisted value from disk.
-      // We clear rather than set because setConfigValue may have side-effects (e.g. file-write
-      // failures) and we want the next read to be authoritative.
-      self.cachedAuth = null;
-      return result;
+      if (!result.success) return result;
+      self.accountRevisions.set(
+        selection.accountId,
+        self.getAccountRevision(selection.accountId) + 1
+      );
+      if (!selection.selectAsDefault) return result;
+      // Concurrent first logins share this default write. The first successful write wins.
+      const selected = yield* Effect.promise(() =>
+        self.providerService.updateConfigValue(
+          "openai",
+          ["codexOauthDefaultAccountId"],
+          (current) => {
+            const accounts = getCodexOauthAccounts(self.readOpenaiConfig());
+            return current === undefined &&
+              accounts.some((account) => account.id === selection.accountId) &&
+              !accounts.some((account) => account.id === CODEX_OAUTH_DEFAULT_ACCOUNT_ID)
+              ? { value: selection.accountId }
+              : null;
+          },
+          { enforcePolicy: true }
+        )
+      );
+      return selected.success ? Ok(undefined) : selected;
     });
   }
 
   private handleDesktopCallbackAndExchange(input: {
+    destination: AccountSelection;
+    isActive: () => boolean;
     flowId: string;
     redirectUri: string;
     codeVerifier: string;
@@ -618,7 +840,7 @@ export class CodexOauthService {
         codeVerifier: input.codeVerifier,
       });
 
-      const persistResult = yield* self.persistAuth(auth);
+      const persistResult = yield* self.persistLoginAuth(input.destination, auth, input.isActive);
       if (!persistResult.success) {
         return yield* Effect.fail(new CodexOauthError({ reason: persistResult.error }));
       }
@@ -712,7 +934,10 @@ export class CodexOauthService {
     });
   }
 
-  private refreshTokens(current: CodexOauthAuth): Effect.Effect<CodexOauthAuth, CodexOauthError> {
+  private refreshTokens(
+    selection: AccountSelection,
+    current: CodexOauthAuth
+  ): Effect.Effect<CodexOauthAuth, CodexOauthError> {
     // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
     const self = this;
     return Effect.gen(function* () {
@@ -724,6 +949,7 @@ export class CodexOauthService {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             body: buildCodexRefreshBody({ refreshToken: current.refresh }),
+            signal: AbortSignal.timeout(CODEX_OAUTH_REFRESH_TIMEOUT_MS),
           }),
         catch: (error) =>
           new CodexOauthError({
@@ -738,7 +964,7 @@ export class CodexOauthService {
         // requests fall back to the existing "not connected" behavior.
         if (isInvalidGrantError(errorText)) {
           log.debug("[Codex OAuth] Refresh token rejected; clearing stored auth");
-          const disconnectResult = yield* self.disconnectEffect();
+          const disconnectResult = yield* self.persistAuth(selection, undefined);
           if (!disconnectResult.success) {
             log.warn(
               `[Codex OAuth] Failed to clear stored auth after refresh failure: ${disconnectResult.error}`
@@ -782,7 +1008,9 @@ export class CodexOauthService {
         );
       }
 
-      const accountId = extractAccountIdFromTokens({ accessToken, idToken }) ?? current.accountId;
+      // Refresh cannot change the ChatGPT identity for this local slot.
+      const accountId =
+        current.accountId ?? extractAccountIdFromTokens({ accessToken, idToken }) ?? undefined;
 
       const next: CodexOauthAuth = {
         type: "oauth",
@@ -792,7 +1020,7 @@ export class CodexOauthService {
         accountId,
       };
 
-      const persistResult = yield* self.persistAuth(next);
+      const persistResult = yield* self.persistAuth(selection, next);
       if (!persistResult.success) {
         return yield* Effect.fail(new CodexOauthError({ reason: persistResult.error }));
       }
@@ -906,7 +1134,11 @@ export class CodexOauthService {
 
         const attempt = yield* self.pollDeviceTokenOnce(flow);
         if (attempt.kind === "success") {
-          const persistResult = yield* self.persistAuth(attempt.auth);
+          const persistResult = yield* self.persistLoginAuth(
+            flow.destination,
+            attempt.auth,
+            () => !flow.settled
+          );
           if (!persistResult.success) {
             yield* self.finishDeviceFlowEffect(flowId, Err(persistResult.error));
             return;

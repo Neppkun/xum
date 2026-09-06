@@ -23,7 +23,7 @@ import type {
   OpenAIProviderConfig,
 } from "@/common/config/schemas/providersConfig";
 import type { ProviderConfig, ProvidersConfig } from "@/node/config";
-import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
+import { getCodexOauthAccounts } from "@/node/utils/codexOauthAuth";
 import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
 import { normalizeCoderDeploymentUrl } from "@/common/constants/coderOAuth";
 
@@ -609,10 +609,7 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
     }
 
     // OpenAI Codex OAuth is a valid credential path even without apiKey.
-    if (
-      providerKey === "openai" &&
-      parseCodexOauthAuth((rawConfig as { codexOauth?: unknown }).codexOauth) !== null
-    ) {
+    if (providerKey === "openai" && getCodexOauthAccounts(rawConfig).length > 0) {
       return true;
     }
 

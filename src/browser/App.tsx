@@ -197,6 +197,7 @@ function AppInner() {
 
   const {
     userProjects,
+    getProjectConfig,
     refreshProjects,
     removeProject,
     openProjectCreateModal,
@@ -263,6 +264,10 @@ function AppInner() {
       )
     : null;
   const creationScopeId = creationScope ? getProjectScopeId(creationScope.projectPath) : null;
+  const accountProjectPath = selectedWorkspace?.projectPath ?? creationScope?.projectPath;
+  const codexOauthAccountId = accountProjectPath
+    ? getProjectConfig(accountProjectPath)?.codexOauthAccountId
+    : undefined;
 
   // History navigation (back/forward)
   const navigate = useNavigate();
@@ -690,9 +695,17 @@ function AppInner() {
     const provider = getFastModeProvider(model, {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      codexOauthAccountId,
     });
     return provider != null && providersConfig[provider]?.serviceTier === "priority";
-  }, [creationScopeId, getModelForWorkspace, getRouteForModel, providersConfig, selectedWorkspace]);
+  }, [
+    codexOauthAccountId,
+    creationScopeId,
+    getModelForWorkspace,
+    getRouteForModel,
+    providersConfig,
+    selectedWorkspace,
+  ]);
 
   const fastModeToggleInFlightRef = useRef(false);
   const toggleFastMode = useCallback(async () => {
@@ -707,6 +720,7 @@ function AppInner() {
     const provider = getFastModeProvider(model, {
       providersConfig,
       resolvedRouteProvider: getRouteForModel(normalizeToCanonical(model)),
+      codexOauthAccountId,
     });
     if (provider == null) {
       fastModeToggleInFlightRef.current = false;
@@ -736,6 +750,7 @@ function AppInner() {
     }
   }, [
     api,
+    codexOauthAccountId,
     creationScopeId,
     getModelForWorkspace,
     getRouteForModel,
@@ -984,6 +999,7 @@ function AppInner() {
     workspaceMetadata,
     selectedWorkspace,
     creationScopeId,
+    codexOauthAccountId,
     themePreference,
     getThinkingLevel: getThinkingLevelForWorkspace,
     onSetThinkingLevel: setThinkingLevelFromPalette,

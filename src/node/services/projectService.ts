@@ -1995,6 +1995,30 @@ export class ProjectService {
     });
   }
 
+  /** Select a Codex account, or inherit the global default with null. */
+  async setCodexOauthAccount(projectPath: string, accountId: string | null): Promise<Result<void>> {
+    const normalizedPath = stripTrailingSlashes(projectPath);
+    try {
+      let result: Result<void> = Err(`Project not found: ${normalizedPath}`);
+      // Edit fresh state so concurrent project settings remain intact.
+      await this.config.editConfig((config) => {
+        const project = config.projects.get(normalizedPath);
+        if (project) {
+          if (accountId === null) {
+            delete project.codexOauthAccountId;
+          } else {
+            project.codexOauthAccountId = accountId;
+          }
+          result = Ok(undefined);
+        }
+        return config;
+      });
+      return result;
+    } catch (error) {
+      return Err(`Failed to set Codex account for ${normalizedPath}: ${getErrorMessage(error)}`);
+    }
+  }
+
   async setCustomInstructions(
     projectPath: string,
     customInstructions: string | null | undefined

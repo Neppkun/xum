@@ -10,6 +10,7 @@ import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:te
 
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { AIService, resolveMuxProjectRootForHostFs } from "./aiService";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { discoverAvailableSubagentsForToolContext } from "./turnContextAssembler";
 import {
   normalizeAnthropicBaseURL,
@@ -302,6 +303,7 @@ function stubCommonStreamMessageDependencies(args: {
   metadata: WorkspaceMetadata;
   startStreamCalls?: TurnExecutionOptions[];
   routeProvider?: ProviderName;
+  codexOauthAccountId?: string;
   allTools?: Record<string, Tool>;
   workspacePathOverride?: string;
   historySequence?: number;
@@ -375,6 +377,7 @@ function stubCommonStreamMessageDependencies(args: {
           wireProviderName:
             args.canonicalProviderName ?? providerNameFromModelString(canonicalModelString),
           routedThroughGateway: false,
+          codexOauthAccountId: args.codexOauthAccountId,
           ...(args.routeProvider != null ? { routeProvider: args.routeProvider } : {}),
         },
       });
@@ -1087,6 +1090,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
     metadata: WorkspaceMetadata,
     options?: {
       routeProvider?: ProviderName;
+      codexOauthAccountId?: string;
       allTools?: Record<string, Tool>;
       postPolicyTools?: Record<string, Tool>;
       sessionUsageService?: SessionUsageService;
@@ -1122,6 +1126,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       metadata,
       startStreamCalls,
       routeProvider: options?.routeProvider,
+      codexOauthAccountId: options?.codexOauthAccountId,
       allTools: options?.allTools,
       effectiveModelString: options?.effectiveModelString,
       canonicalProviderName: options?.canonicalProviderName,
@@ -1166,6 +1171,52 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       getToolsForModelSpy,
     };
   }
+
+  it("pins the turn context limit to the model account rather than the global default", async () => {
+    using xumHome = new DisposableTempDir("ai-service-codex-account-snapshot");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+    const workspaceId = "account-snapshot";
+    const harness = createHarness(
+      xumHome.path,
+      createLocalWorkspaceMetadata(workspaceId, projectPath),
+      {
+        effectiveModelString: "openai:gpt-5.5",
+        codexOauthAccountId: "work",
+      }
+    );
+    new ProvidersConfigStore(harness.config.rootDir).saveProvidersConfig({
+      openai: {
+        apiKey: "test-key",
+        codexOauthDefaultAccountId: "missing",
+        codexOauthAccounts: {
+          work: {
+            label: "Work",
+            auth: {
+              type: "oauth",
+              access: "access",
+              refresh: "refresh",
+              expires: Date.now() + 60_000,
+            },
+          },
+        },
+      },
+    });
+    const result = await harness.service.streamMessage({
+      messages: [createMuxMessage("user", "user", "continue")],
+      workspaceId,
+      modelString: "openai:gpt-5.5",
+      thinkingLevel: "off",
+    });
+    expect(result.success).toBe(true);
+    const snapshot = harness.startStreamCalls[0]?.providersConfigSnapshot;
+    expect(snapshot?.openai?.codexOauthDefaultAccountId).toBe("work");
+    expect(getEffectiveContextLimit("openai:gpt-5.5", false, snapshot)).toBe(272_000);
+    expect(
+      new ProvidersConfigStore(harness.config.rootDir).loadProvidersConfig()?.openai
+        ?.codexOauthDefaultAccountId
+    ).toBe("missing");
+  });
 
   interface AdvisorRuntimeForTests {
     createModel: (modelString: string) => Promise<LanguageModel>;

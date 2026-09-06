@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
+import { Err } from "@/common/types/result";
+import type { AIService } from "./aiService";
 import { buildWorkspaceStatusPrompt, generateWorkspaceStatus } from "./workspaceStatusGenerator";
 
 describe("buildWorkspaceStatusPrompt", () => {
@@ -56,6 +58,24 @@ describe("buildWorkspaceStatusPrompt", () => {
 });
 
 describe("generateWorkspaceStatus error paths", () => {
+  test("preserves workspace account context across candidate failures", async () => {
+    const createModelWithPinnedMetadata = mock<AIService["createModelWithPinnedMetadata"]>(() =>
+      Promise.resolve(Err({ type: "oauth_not_connected", provider: "openai" }))
+    );
+    const aiService = { createModelWithPinnedMetadata } as unknown as AIService;
+    const result = await generateWorkspaceStatus(
+      "Run tests",
+      ["openai:gpt-5.5", "openai:gpt-5.3-codex"],
+      aiService,
+      { workspaceId: "status-workspace" }
+    );
+    expect(result.success).toBe(false);
+    expect(createModelWithPinnedMetadata).toHaveBeenCalledTimes(2);
+    for (const call of createModelWithPinnedMetadata.mock.calls) {
+      expect(call[1]).toEqual({ workspaceId: "status-workspace", agentInitiated: true });
+    }
+  });
+
   test("returns a configuration error when no candidates are provided", async () => {
     const fakeAiService = {
       // Asserting this never gets called is the real point of this test —

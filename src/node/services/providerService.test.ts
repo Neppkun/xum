@@ -314,6 +314,58 @@ describe("ProviderService.getConfig", () => {
     });
   });
 
+  it("exposes account labels without exposing credentials", () => {
+    withTempConfig((config, service) => {
+      const auth = {
+        type: "oauth",
+        access: "secret-access",
+        refresh: "secret-refresh",
+        expires: 12345,
+      };
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openai: {
+          codexOauth: auth,
+          codexOauthLabel: "Personal",
+          codexOauthAccounts: {
+            work: { label: "Work", auth },
+            broken: { label: "Broken", auth: {} },
+          },
+          codexOauthDefaultAccountId: "work",
+        },
+      });
+      const result = service.getConfig().openai;
+      expect(result.codexOauthSet).toBe(true);
+      expect(result.codexOauthAccounts).toEqual([
+        { id: "default", label: "Personal" },
+        { id: "work", label: "Work" },
+      ]);
+      expect(result.codexOauthDefaultAccountId).toBe("work");
+      expect(JSON.stringify(result)).not.toContain("secret-access");
+      expect(JSON.stringify(result)).not.toContain("secret-refresh");
+    });
+  });
+
+  it("reports named accounts as connected without legacy credentials", () => {
+    withTempConfig((config, service) => {
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openai: {
+          codexOauthAccounts: {
+            work: {
+              label: "Work",
+              auth: { type: "oauth", access: "access", refresh: "refresh", expires: 12345 },
+            },
+          },
+          codexOauthDefaultAccountId: "work",
+        },
+      });
+      expect(service.getConfig().openai).toMatchObject({
+        codexOauthSet: true,
+        isConfigured: true,
+        codexOauthAccounts: [{ id: "work", label: "Work" }],
+      });
+    });
+  });
+
   it("treats disabled OpenAI as unconfigured even when Codex OAuth tokens are stored", () => {
     withTempConfig((config, service) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
@@ -617,6 +669,31 @@ describe("ProviderService.getConfig", () => {
         if (!result.success) {
           expect(result.error).toContain("not allowed by policy");
         }
+      }
+    );
+  });
+
+  it("checks policy for account edits but retains internal credential cleanup", async () => {
+    await withTempPolicyProviderService(
+      { policy_format_version: "0.1", provider_access: [{ id: "anthropic" }] },
+      async (config, service) => {
+        const store = new ProvidersConfigStore(config.rootDir);
+        store.saveProvidersConfig({ openai: { codexOauthDefaultAccountId: "personal" } });
+        const denied = await service.updateConfigValue(
+          "openai",
+          ["codexOauthDefaultAccountId"],
+          () => ({ value: "work" }),
+          { enforcePolicy: true }
+        );
+        expect(denied.success).toBe(false);
+        expect(store.loadProvidersConfig()?.openai?.codexOauthDefaultAccountId).toBe("personal");
+        const cleaned = await service.updateConfigValue(
+          "openai",
+          ["codexOauthDefaultAccountId"],
+          () => ({ value: undefined })
+        );
+        expect(cleaned).toEqual({ success: true, data: { applied: true } });
+        expect(store.loadProvidersConfig()?.openai?.codexOauthDefaultAccountId).toBeUndefined();
       }
     );
   });

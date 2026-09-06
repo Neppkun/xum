@@ -543,6 +543,7 @@ export class AIService extends EventEmitter {
     opts?: {
       agentInitiated?: boolean;
       workspaceId?: string;
+      projectPath?: string;
       /** Snapshot pass-through (see ProviderModelFactory.createModel). */
       providersConfig?: ProvidersConfig;
     }
@@ -560,7 +561,7 @@ export class AIService extends EventEmitter {
    */
   async createModelWithPinnedMetadata(
     modelString: string,
-    opts?: { agentInitiated?: boolean; workspaceId?: string }
+    opts?: { agentInitiated?: boolean; workspaceId?: string; projectPath?: string }
   ): Promise<Result<{ model: LanguageModel; metadataModel: string }, SendMessageError>> {
     const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     const result = await this.providerModelFactory.createModel(modelString, undefined, {

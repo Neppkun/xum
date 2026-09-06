@@ -99,6 +99,7 @@ export interface BuildSourcesParams {
   } | null;
   /** Project-scoped preference ID used while a creation composer is active. */
   creationScopeId?: string | null;
+  codexOauthAccountId?: string;
   streamingModels?: Map<string, string>;
   // UI actions
   getThinkingLevel: (workspaceId: string) => ThinkingLevel;
@@ -1304,6 +1305,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       getFastModeProvider(providerOptionGateModel ?? "", {
         providersConfig: p.providersConfig,
         resolvedRouteProvider: providerOptionRoute,
+        codexOauthAccountId: p.codexOauthAccountId,
       }) != null
         ? {
             id: CommandIds.toggleFastMode(),
@@ -1416,6 +1418,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         openaiProModeAvailable(proGateModelString ?? "", {
           providersConfig: p.providersConfig,
           resolvedRouteProvider: currentModelRoute,
+          codexOauthAccountId: p.codexOauthAccountId,
         })
       ) {
         const proActive = p.getReasoningMode(workspaceId) === "pro";

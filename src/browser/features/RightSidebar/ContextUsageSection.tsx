@@ -1,4 +1,6 @@
 import React from "react";
+import { useProjectContext } from "@/browser/contexts/ProjectContext";
+import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useWorkspaceUsage } from "@/browser/stores/WorkspaceStore";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { AGENT_AI_DEFAULTS_KEY } from "@/common/constants/storage";
@@ -33,6 +35,12 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
   const { has1MContext } = useProviderOptions();
   const pendingSendOptions = useSendMessageOptions(workspaceId);
   const { config: providersConfig } = useProvidersConfig();
+  const { getProjectConfig } = useProjectContext();
+  const { workspaceMetadata } = useWorkspaceContext();
+  const projectPath = workspaceMetadata.get(workspaceId)?.projectPath;
+  const codexOauthAccountId = projectPath
+    ? getProjectConfig(projectPath)?.codexOauthAccountId
+    : undefined;
 
   // Token counts come from usage metadata, but context limits/1M eligibility should
   // follow the currently selected model unless a stream is actively running.
@@ -55,7 +63,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     contextDisplayModel,
     has1MContext(contextDisplayModel),
     false,
-    providersConfig
+    providersConfig,
+    { codexOauthAccountId }
   );
 
   // Warn when the compaction model can't fit the auto-compact threshold to avoid failures.
@@ -67,7 +76,8 @@ export const ContextUsageSection: React.FC<ContextUsageSectionProps> = ({ worksp
     const compactionMaxTokens = getEffectiveContextLimit(
       effectiveCompactionModel,
       has1MContext(effectiveCompactionModel),
-      providersConfig
+      providersConfig,
+      { codexOauthAccountId }
     );
 
     if (compactionMaxTokens && compactionMaxTokens < thresholdTokens) {
