@@ -24,6 +24,10 @@ import {
   type AgentSessionHarness,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { resolveCodexOauthRouting } from "@/common/utils/providers/codexOauthRouting";
+import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 
 const workspaceId = "continuous-session";
 const model = "openai:gpt-4o";
@@ -34,6 +38,12 @@ const sendOptions: SendMessageOptions = {
 };
 
 interface SessionInternals {
+  getContinuousCompactionContext: (
+    model: string,
+    options?: SendMessageOptions
+  ) => {
+    contextWindowTokens: number;
+  };
   continuousCompactor: ContinuousCompactor;
   activeStreamContext?: {
     modelString: string;
@@ -104,6 +114,81 @@ describe("AgentSession continuous compaction wiring", () => {
     }
     return harness;
   }
+
+  async function setWorkspaceAccountScope(
+    h: AgentSessionHarness,
+    scope: "root" | "subproject" | "multi" | "inherited"
+  ) {
+    const root = h.config.rootDir;
+    const subproject = root + "/sub";
+    await h.config.editConfig((cfg) => {
+      const workspace = {
+        id: workspaceId,
+        name: workspaceId,
+        path: root,
+        ...(scope !== "root" ? { subProjectPath: subproject } : {}),
+        ...(scope === "multi"
+          ? {
+              projects: [
+                { projectPath: subproject, projectName: "sub" },
+                { projectPath: root, projectName: "root" },
+              ],
+            }
+          : {}),
+      };
+      cfg.projects.set(root, {
+        codexOauthAccountId: scope === "root" || scope === "inherited" ? "missing" : undefined,
+        workspaces: scope === "multi" ? [] : [workspace],
+      });
+      cfg.projects.set(subproject, {
+        codexOauthAccountId: scope === "inherited" ? undefined : "missing-sub",
+        workspaces: [],
+      });
+      if (scope === "multi") {
+        cfg.projects.set(MULTI_PROJECT_CONFIG_KEY, { workspaces: [workspace] });
+      }
+      return cfg;
+    });
+  }
+
+  test.each(["root", "subproject", "multi", "inherited"] as const)(
+    "continuous limits use the %s account scope without changing API-key preference",
+    async (scope) => {
+      const h = await setup();
+      await setWorkspaceAccountScope(h, scope);
+      const providersConfig: ProvidersConfigMap = {
+        openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+      };
+      spyOn(h.aiService, "getProvidersConfig").mockReturnValue(providersConfig);
+      const scopedModel = "openai:gpt-5.5";
+      const accountId =
+        scope === "inherited" ? undefined : scope === "root" ? "missing" : "missing-sub";
+      // This fixture actually changes the route; API-key preference alone cannot select project OAuth.
+      expect(resolveCodexOauthRouting(scopedModel, providersConfig)).toBe("other");
+      expect(
+        resolveCodexOauthRouting(scopedModel, providersConfig, { codexOauthAccountId: accountId })
+      ).toBe(scope === "inherited" ? "other" : "missing-account");
+      const readLimit = (options?: SendMessageOptions) =>
+        internals(h.session).getContinuousCompactionContext(scopedModel, options)
+          .contextWindowTokens;
+      expect(readLimit()).toBe(scope === "inherited" ? 1_050_000 : 272_000);
+      expect(
+        readLimit({
+          ...sendOptions,
+          model: scopedModel,
+          providerOptions: { openai: { wireFormat: "chatCompletions" } },
+        })
+      ).toBe(1_050_000);
+      providersConfig.openai.codexOauthDefaultAuth = "apiKey";
+      expect(readLimit()).toBe(1_050_000);
+      delete providersConfig.openai.codexOauthDefaultAuth;
+      providersConfig.openai.codexOauthAccounts = [
+        { id: accountId ?? "default", label: "Reconnected" },
+      ];
+      providersConfig.openai.codexOauthSet = true;
+      expect(readLimit()).toBe(272_000);
+    }
+  );
 
   async function rows(h: AgentSessionHarness): Promise<MuxMessage[]> {
     const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
@@ -1087,6 +1172,38 @@ describe("AgentSession continuous compaction wiring", () => {
     });
     expect(create.mock.calls[0]?.[0]).toBe(model);
     expect(result?.model).toBe(model);
+  });
+
+  test("headless summaries reject a head above the workspace OAuth cap", async () => {
+    const { h, args } = await summarySetup();
+    await setWorkspaceAccountScope(h, "subproject");
+    spyOn(h.aiService, "getProvidersConfig").mockReturnValue({
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    });
+    const head = [
+      createMuxMessage("large-head", "user", "Important context to retain. ".repeat(40_000)),
+    ];
+    const headTokens = estimateMuxMessageTokens(head[0]);
+    expect(headTokens).toBeGreaterThan(272_000 * SUMMARIZER_INPUT_FRACTION);
+    expect(headTokens).toBeLessThan(1_050_000 * SUMMARIZER_INPUT_FRACTION);
+    const sdkModel = new MockLanguageModelV3({
+      doStream: () =>
+        Promise.resolve({ stream: simulateReadableStream({ chunks: modelChunks() }) }),
+    });
+    const create = spyOn(h.aiService, "createModelWithPinnedMetadata").mockResolvedValue(
+      Ok({ model: sdkModel, metadataModel: "openai:gpt-5.5" })
+    );
+    const result = await summarizeContinuousCompaction({
+      ...args,
+      head,
+      compactOptions: {
+        ...args.compactOptions,
+        model: "openai:gpt-5.5",
+        providerOptions: { openai: { wireFormat: "chatCompletions" } },
+      },
+    });
+    expect(result).toBeNull();
+    expect(create).not.toHaveBeenCalled();
   });
 
   test("returns null without calling a model when neither configured context can fit the head", async () => {

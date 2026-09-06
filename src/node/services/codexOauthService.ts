@@ -190,11 +190,20 @@ export class CodexOauthService {
     return Effect.suspend(() => {
       if (!isValidCodexOauthAccountId(accountId))
         return Effect.succeed(Err("Invalid Codex OAuth account ID"));
-      // Invalidate pending refreshes and logins before clearing this slot.
-      this.accountRevisions.set(accountId, this.getAccountRevision(accountId) + 1);
-      return this.updateConfigValueEffect(this.accountPath(accountId), () => ({
-        value: undefined,
-      }));
+      return this.withAccountMutationEffect(
+        accountId,
+        this.updateConfigValueEffect(this.accountPath(accountId), () => ({
+          value: undefined,
+        })).pipe(
+          Effect.map((result) => {
+            // Failed deletion must preserve active requests and logins. Fence stale writes before releasing the mutex.
+            if (result.success) {
+              this.accountRevisions.set(accountId, this.getAccountRevision(accountId) + 1);
+            }
+            return result;
+          })
+        )
+      );
     });
   }
 

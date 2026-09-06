@@ -99,8 +99,9 @@ export function CodexAccounts() {
   const showBrowser =
     isDesktop || ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
   const disabled = !api || busy;
+  // Rejected credentials remain listed, but they cannot provide OAuth precedence.
   const authEditable =
-    accounts.length > 0 && (openai?.apiKeySet === true || !!openai?.apiKeySource);
+    openai?.codexOauthSet === true && (openai.apiKeySet === true || !!openai.apiKeySource);
 
   // StrictMode replays mount effects before a pending login start can return.
   // Keep that start valid. A real unmount cancels its result when it arrives.

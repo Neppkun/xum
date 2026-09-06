@@ -18,6 +18,7 @@ const config = {
   rootDir: "/tmp",
   sessionsDir: "/tmp",
   srcDir: "/tmp",
+  findWorkspace: () => null,
   loadConfigOrDefault: () => ({}),
 } as unknown as Config;
 

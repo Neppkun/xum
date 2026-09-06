@@ -402,6 +402,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -661,6 +662,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({
         agentAiDefaults: { compact: { modelString: compactionModel } },
       }),
@@ -713,6 +715,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({
         agentAiDefaults: {
           compact: { modelString: "openai:gpt-5.5", thinkingLevel: "high" },
@@ -792,7 +795,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
-  test("threads providers config into pre-send and mid-stream compaction checks", async () => {
+  test("threads provider config and project routing into pre-send and mid-stream checks", async () => {
     const workspaceId = "ws-auto-compaction-providers-config";
 
     const { config, historyService, cleanup } = await createTestHistoryService();
@@ -809,6 +812,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       },
     };
     new ProvidersConfigStore(config.rootDir).saveProvidersConfig(providersConfig);
+    await config.editConfig((cfg) => {
+      cfg.projects.set(config.rootDir, {
+        codexOauthAccountId: "work",
+        workspaces: [{ id: workspaceId, name: workspaceId, path: config.rootDir }],
+      });
+      return cfg;
+    });
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((_history: MuxMessage[]) => {
@@ -892,11 +902,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(checkBeforeSend).toHaveBeenCalledTimes(1);
     expect(checkBeforeSend.mock.calls[0]?.[0]).toMatchObject({
       providersConfig,
+      codexOauthAccountId: "work",
     });
 
     expect(checkMidStream).toHaveBeenCalledTimes(1);
     expect(checkMidStream.mock.calls[0]?.[0]).toMatchObject({
       providersConfig,
+      codexOauthAccountId: "work",
     });
 
     session.dispose();
@@ -977,6 +989,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
@@ -1089,6 +1102,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 
@@ -1240,6 +1254,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       rootDir: "/tmp",
       sessionsDir: "/tmp",
       srcDir: "/tmp",
+      findWorkspace: () => null,
       loadConfigOrDefault: () => ({}),
     } as unknown as Config;
 

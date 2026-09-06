@@ -307,12 +307,12 @@ export const KeyboardCommandsPhone: AppStory = {
   play: KeyboardCommands.play,
 };
 
-function setupReconnectRequired() {
+function setupReconnectRequired(apiKeySet = false) {
   const client = setupAccounts();
   const providers: ProvidersConfigMap = {
     openai: {
-      apiKeySet: false,
-      isConfigured: false,
+      apiKeySet,
+      isConfigured: apiKeySet,
       isEnabled: true,
       codexOauthSet: false,
       codexOauthDefaultAccountId: "work",
@@ -365,15 +365,18 @@ export const ReconnectRequiredPhone: AppStory = {
 };
 
 export const ReconnectRestoresAccount: AppStory = {
-  render: () => <AppWithMocks setup={setupReconnectRequired} />,
+  render: () => <AppWithMocks setup={() => setupReconnectRequired(true)} />,
   play: async ({ canvasElement }) => {
     const controls = await checkReconnectRequired(canvasElement);
+    const preference = controls.getByRole("combobox", { name: "Default auth (when both are set)" });
+    await expect(preference).toBeDisabled();
     await userEvent.click(
       within(controls.getByRole("listitem", { name: "Work" })).getByRole("button", {
         name: "Reconnect",
       })
     );
     await controls.findByText("Connected", { exact: true });
+    await expect(preference).toBeEnabled();
     await expect(controls.queryByText("Reconnect required")).toBeNull();
     await expect(controls.getAllByRole("listitem")).toHaveLength(1);
     await expect(controls.getByRole("combobox", { name: "Global default account" })).toHaveValue(

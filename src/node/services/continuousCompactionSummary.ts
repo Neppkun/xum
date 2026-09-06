@@ -20,6 +20,7 @@ import {
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { getCodexOauthProjectPath } from "@/common/utils/providers/codexOauthRouting";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import type { Config } from "@/node/config";
@@ -54,10 +55,16 @@ export async function summarizeContinuousCompaction(args: {
   args.signal.throwIfAborted();
   const providersConfig = args.aiService.getProvidersConfig();
   let options = args.compactOptions;
+  const projectPath = getCodexOauthProjectPath(args.config.findWorkspace(args.workspaceId));
+  const codexOauthAccountId = projectPath
+    ? args.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
+    : undefined;
   const compactLimit = getEffectiveContextLimit(
     options.model,
     isAnthropic1MEffectivelyEnabled(options.model, options.providerOptions, providersConfig),
-    providersConfig
+    providersConfig,
+    // Headless model construction uses stored wire format, not request-level options.
+    { codexOauthAccountId }
   );
   const headTokens = args.head.reduce((total, row) => total + estimateMuxMessageTokens(row), 0);
   if (!compactLimit || headTokens > compactLimit * SUMMARIZER_INPUT_FRACTION) {

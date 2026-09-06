@@ -68,6 +68,7 @@ function createAgentSessionTestConfig(sessionDir = "/tmp"): Config {
     rootDir: sessionDir,
     sessionsDir: sessionDir,
     srcDir: sessionDir,
+    findWorkspace: () => null,
     loadConfigOrDefault: mock(() => ({})),
   } as unknown as Config;
 }

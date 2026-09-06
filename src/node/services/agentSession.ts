@@ -212,6 +212,10 @@ import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelM
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { ContinuousCompactor, type ContinuousCompactionContext } from "./continuousCompactor";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import {
+  getCodexOauthProjectPath,
+  type CodexOauthRoutingOptions,
+} from "@/common/utils/providers/codexOauthRouting";
 import { summarizeContinuousCompaction } from "./continuousCompactionSummary";
 
 type SessionCompactionContext = ContinuousCompactionContext & {
@@ -3709,7 +3713,7 @@ export class AgentSession {
           providersConfigForCompaction
         ),
         providersConfig: providersConfigForCompaction,
-        openaiWireFormat: optionsForStream.providerOptions?.openai?.wireFormat,
+        ...this.getCompactionRoutingOptions(optionsForStream),
       });
 
       const continuousContext = this.getContinuousCompactionContext(
@@ -4376,6 +4380,17 @@ export class AgentSession {
     return this.lastUsageState;
   }
 
+  private getCompactionRoutingOptions(options?: SendMessageOptions): CodexOauthRoutingOptions {
+    // Compaction must use the model factory's project scope, not the provider's global account alone.
+    const projectPath = getCodexOauthProjectPath(this.config.findWorkspace(this.workspaceId));
+    return {
+      codexOauthAccountId: projectPath
+        ? this.config.loadConfigOrDefault().projects.get(projectPath)?.codexOauthAccountId
+        : undefined,
+      openaiWireFormat: options?.providerOptions?.openai?.wireFormat,
+    };
+  }
+
   private getProvidersConfigSafe(): ProvidersConfigMap | null {
     try {
       // Prefer ProviderService's safe config view: it includes env/file API-key source
@@ -4884,7 +4899,8 @@ export class AgentSession {
         getEffectiveContextLimit(
           model,
           this.is1MContextEnabledForModel(model, options, providersConfig),
-          providersConfig
+          providersConfig,
+          this.getCompactionRoutingOptions(options)
         ) ?? 0,
       thresholdPercent: this.compactionMonitor.getThreshold() * 100,
       systemMessageTokens:
@@ -4921,6 +4937,7 @@ export class AgentSession {
           this.getProvidersConfigSafe()
         ),
         providersConfig: this.getProvidersConfigSafe(),
+        ...this.getCompactionRoutingOptions(options),
       });
       const result = await this.continuousCompactor.observe(usage.usagePercentage, {
         ...context,
@@ -5081,6 +5098,7 @@ export class AgentSession {
           context.providersConfig
         ),
         providersConfig: context.providersConfig,
+        ...this.getCompactionRoutingOptions(context.options),
       });
       if (pressure.shouldForceCompact) {
         await eventSpine.run("compaction.prepare", {
@@ -6753,7 +6771,7 @@ export class AgentSession {
           streamContext?.providersConfig ?? null
         ),
         providersConfig: streamContext?.providersConfig ?? null,
-        openaiWireFormat: streamOptions?.providerOptions?.openai?.wireFormat,
+        ...this.getCompactionRoutingOptions(streamOptions),
       });
 
       if (shouldInterruptForCompaction) {

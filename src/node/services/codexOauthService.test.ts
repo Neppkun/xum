@@ -145,10 +145,13 @@ function createMockWindowService(deps: MockDeps): Pick<WindowService, "focusMain
   };
 }
 
-function createService(deps: MockDeps): CodexOauthService {
+function createService(
+  deps: MockDeps,
+  providerService = createMockProviderService(deps)
+): CodexOauthService {
   return new CodexOauthService(
     createMockProvidersConfigStore(deps) as ProvidersConfigStore,
-    createMockProviderService(deps) as ProviderService,
+    providerService as ProviderService,
     createMockWindowService(deps) as WindowService
   );
 }
@@ -852,6 +855,58 @@ describe("CodexOauthService", () => {
       }
     );
 
+    it.each(["refresh", "disconnect"] as const)(
+      "serializes disconnect and refresh when %s persists first",
+      async (first) => {
+        deps.providersConfig = {
+          openai: { codexOauthAccounts: { work: { label: "Work", auth: expiredAuth() } } },
+        };
+        const provider = createMockProviderService(deps);
+        service = createService(deps, provider);
+        const entered = createDeferred<void>();
+        const release = createDeferred<void>();
+        const fetchStarted = createDeferred<void>();
+        const mutationOrder: string[] = [];
+        const originalUpdate = provider.updateConfigValue;
+        let calls = 0;
+        const update = spyOn(provider, "updateConfigValue").mockImplementation(async (...args) => {
+          const isFirst = ++calls === 1;
+          if (isFirst) {
+            entered.resolve(undefined);
+            await release.promise;
+          }
+          mutationOrder.push(isFirst ? first : first === "refresh" ? "disconnect" : "refresh");
+          return originalUpdate(...args);
+        });
+        mockFetch(() => {
+          fetchStarted.resolve(undefined);
+          return Promise.resolve(
+            mockRefreshResponse({ access_token: "rotated", expires_in: 3600 })
+          );
+        });
+        try {
+          const initial =
+            first === "refresh" ? service.getValidAuth("work") : service.disconnect("work");
+          await entered.promise;
+          const waiting =
+            first === "refresh" ? service.disconnect("work") : service.getValidAuth("work");
+          await fetchStarted.promise;
+          release.resolve(undefined);
+          const [initialResult, waitingResult] = await Promise.all([initial, waiting]);
+          const disconnected = first === "disconnect" ? initialResult : waitingResult;
+          expect(disconnected).toEqual(Ok(undefined));
+          expect(mutationOrder).toEqual(
+            first === "refresh" ? ["refresh", "disconnect"] : ["disconnect", "refresh"]
+          );
+          if (first === "disconnect") expect(waitingResult.success).toBe(false);
+          expect(getCodexOauthAuth(deps.providersConfig.openai, "work")).toBeNull();
+        } finally {
+          release.resolve(undefined);
+          update.mockRestore();
+        }
+      }
+    );
+
     it("does not restore a disconnected slot after refresh", async () => {
       const work = expiredAuth();
       const legacy = validAuth({ access: "legacy" });
@@ -1105,6 +1160,66 @@ describe("CodexOauthService", () => {
       );
       expect(await service.getValidAuth()).toEqual(Ok(work));
     });
+
+    it.each(["policy", "I/O"] as const)(
+      "keeps pending refresh and reconnect valid after a failed %s disconnect",
+      async (failure) => {
+        const initial = expiredAuth();
+        deps.providersConfig = {
+          openai: { codexOauthAccounts: { work: { label: "Work", auth: initial } } },
+        };
+        const provider = createMockProviderService(deps);
+        service = createService(deps, provider);
+        const refreshStarted = createDeferred<void>();
+        const loginStarted = createDeferred<void>();
+        const refreshResponse = createDeferred<Response>();
+        const loginResponse = createDeferred<Response>();
+        deviceFetch((init) => {
+          if (new URLSearchParams(requestBody(init)).get("grant_type") === "refresh_token") {
+            refreshStarted.resolve(undefined);
+            return refreshResponse.promise;
+          }
+          loginStarted.resolve(undefined);
+          return loginResponse.promise;
+        });
+        const flow = await service.startDeviceFlow({ accountId: "work" });
+        if (!flow.success) throw new Error(flow.error);
+        const login = service.waitForDeviceFlow(flow.data.flowId);
+        await loginStarted.promise;
+        const refresh = service.getValidAuth("work");
+        await refreshStarted.promise;
+        const update = spyOn(provider, "updateConfigValue");
+        if (failure === "policy") deps.policyDenied = true;
+        else update.mockRejectedValueOnce(new Error("Disk write failed"));
+        const disconnected = await service.disconnect("work");
+        const afterFailure = getCodexOauthAuth(deps.providersConfig.openai, "work");
+        deps.policyDenied = false;
+        update.mockRestore();
+        refreshResponse.resolve(
+          mockRefreshResponse({
+            access_token: "rotated",
+            refresh_token: "rotated-refresh",
+            expires_in: 3600,
+          })
+        );
+        const refreshed = await refresh;
+        loginResponse.resolve(
+          mockRefreshResponse({
+            access_token: "reconnected",
+            refresh_token: "reconnected-refresh",
+            expires_in: 3600,
+          })
+        );
+        const reconnected = await login;
+        expect(disconnected).toEqual(
+          Err(failure === "policy" ? "Provider edits are disabled" : "Disk write failed")
+        );
+        expect(afterFailure).toEqual(initial);
+        expect(refreshed).toMatchObject({ success: true, data: { access: "rotated" } });
+        expect(reconnected).toEqual(Ok(undefined));
+        expect(getCodexOauthAuth(deps.providersConfig.openai, "work")?.access).toBe("reconnected");
+      }
+    );
 
     it.each(["disconnect", "cancel"])("does not persist an exchange after %s", async (action) => {
       deps.providersConfig = {
