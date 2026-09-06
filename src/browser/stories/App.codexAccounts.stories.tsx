@@ -22,7 +22,7 @@ const browserLogin =
   fn<(input: Parameters<APIClient["codexOauth"]["startDesktopFlow"]>[0]) => void>();
 const generateTitle = fn<(input: Parameters<APIClient["nameGeneration"]["generate"]>[0]) => void>();
 
-function setupAccounts() {
+function setupAccounts(revokedWork = false) {
   expandLeftSidebar();
   startLogin.mockClear();
   browserLogin.mockClear();
@@ -34,19 +34,23 @@ function setupAccounts() {
   });
   selectWorkspace(workspace);
   const projects = groupWorkspacesByProject([workspace]);
+  const project = projects.get(workspace.projectPath);
+  if (project && revokedWork) project.codexOauthAccountId = "work";
   const providers: ProvidersConfigMap = {
     openai: {
       apiKeySet: true,
       isEnabled: true,
       isConfigured: true,
       codexOauthSet: true,
+      codexOauthDefaultAccountId: revokedWork ? "work" : undefined,
       codexOauthAccounts: [
         { id: "default", label: "Personal" },
-        { id: "work", label: "Work" },
+        { id: "work", label: "Work", reconnectRequired: revokedWork || undefined },
       ],
     },
   };
   let slot = 0;
+  let reconnectAccountId: string | undefined;
   const client = createMockORPCClient({
     projects,
     workspaces: [workspace],
@@ -55,6 +59,7 @@ function setupAccounts() {
   });
   const start: APIClient["codexOauth"]["startDeviceFlow"] = (input) => {
     startLogin(input);
+    reconnectAccountId = input?.accountId;
     if (input?.label) {
       providers.openai.codexOauthAccounts?.push({ id: "slot-" + ++slot, label: input.label });
     }
@@ -67,6 +72,13 @@ function setupAccounts() {
       })
     );
   };
+  const finishLogin = () => {
+    const account = providers.openai.codexOauthAccounts?.find(
+      (item) => item.id === reconnectAccountId
+    );
+    if (account) delete account.reconnectRequired;
+    return Promise.resolve(Ok(undefined));
+  };
   client.codexOauth = {
     startDeviceFlow: start,
     startDesktopFlow: async (input) => {
@@ -74,8 +86,8 @@ function setupAccounts() {
       await start(input);
       return Ok({ flowId: "login", authorizeUrl: "https://auth.openai.com/authorize" });
     },
-    waitForDeviceFlow: () => Promise.resolve(Ok(undefined)),
-    waitForDesktopFlow: () => Promise.resolve(Ok(undefined)),
+    waitForDeviceFlow: finishLogin,
+    waitForDesktopFlow: finishLogin,
     cancelDeviceFlow: () => Promise.resolve(),
     cancelDesktopFlow: () => Promise.resolve(),
     disconnect: (input) => {
@@ -305,6 +317,58 @@ export const KeyboardCommandsPhone: AppStory = {
   ...Phone,
   render: KeyboardCommands.render,
   play: KeyboardCommands.play,
+};
+
+async function exerciseRevokedSelections(canvasElement: HTMLElement) {
+  const section = await openAccounts(canvasElement);
+  const controls = within(section);
+  const global = controls.getByRole("combobox", { name: "Global default account" });
+  const project = controls.getByRole("combobox", { name: "/projects/my-app" });
+  const work = within(controls.getByRole("listitem", { name: "Work" }));
+  await expect(work.getByRole("button", { name: "Reconnect" })).toBeEnabled();
+
+  for (const select of [global, project]) {
+    // Stored selections stay visible, but revoked credentials cannot become new selections.
+    await expect(select).toHaveValue("work");
+    await expect(select).toHaveDisplayValue(/Work.*Reconnect required/);
+    const options = within(select);
+    await expect(options.getByRole("option", { name: "Personal" })).toBeEnabled();
+    await expect(options.getByRole("option", { name: /^Work/ })).toBeDisabled();
+    await userEvent.selectOptions(select, "default");
+    await waitFor(() => expect(select).toHaveValue("default"));
+    await waitFor(() => expect(select).toBeEnabled());
+    await userEvent.selectOptions(select, "work");
+    await expect(select).toHaveValue("default");
+  }
+  await expect(work.getByText("Reconnect required")).toBeVisible();
+  await expect(controls.getAllByRole("listitem")).toHaveLength(2);
+
+  await userEvent.click(work.getByRole("button", { name: "Reconnect" }));
+  await waitFor(() => expect(work.queryByText("Reconnect required")).toBeNull());
+  await expect(startLogin).toHaveBeenLastCalledWith({ accountId: "work" });
+  for (const select of [global, project]) {
+    await waitFor(() => expect(select).toBeEnabled());
+    await expect(within(select).getByRole("option", { name: "Work" })).toBeEnabled();
+    await userEvent.selectOptions(select, "work");
+    await waitFor(() => expect(select).toHaveValue("work"));
+  }
+  section.scrollIntoView({ block: "start" });
+  if (window.innerWidth < 768) {
+    await expect(section.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
+    await expect(section.scrollWidth).toBeLessThanOrEqual(section.clientWidth);
+  }
+}
+
+export const RevokedAccountSelections: AppStory = {
+  ...Desktop,
+  render: () => <AppWithMocks setup={() => setupAccounts(true)} />,
+  play: async ({ canvasElement }) => exerciseRevokedSelections(canvasElement),
+};
+
+export const RevokedAccountSelectionsPhone: AppStory = {
+  ...Phone,
+  render: RevokedAccountSelections.render,
+  play: RevokedAccountSelections.play,
 };
 
 function setupReconnectRequired(apiKeySet = false) {

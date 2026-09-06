@@ -1587,6 +1587,89 @@ describe("CodexOauthService", () => {
       }
     });
 
+    for (const startup of ["device", "desktop"] as const) {
+      it.each([undefined, "damaged-id"])(
+        `keeps legacy requests usable after failed ${startup} startup with ID %s`,
+        async (credentialId) => {
+          const auth = validAuth({ credentialId });
+          deps.providersConfig = { openai: { codexOauth: auth } };
+          if (startup === "device") {
+            mockFetch(() => Promise.reject(new Error("Device startup failed")));
+          } else {
+            spyOn(http, "createServer").mockImplementationOnce(() => {
+              throw new Error("Listener startup failed");
+            });
+          }
+          const result =
+            startup === "device"
+              ? await service.startDeviceFlow({ accountId: "default" })
+              : await service.startDesktopFlow({ accountId: "default" });
+          expect(result.success).toBe(false);
+          expect(deps.providersConfig.openai?.codexOauth).toEqual(auth);
+          expect((await service.getValidAuth("default", { credentialId: undefined })).success).toBe(
+            true
+          );
+        }
+      );
+    }
+
+    it("closes the listener when the credential changes before its ID write", async () => {
+      const { store, provider, first, second } = sharedServices(
+        validAuth({ credentialId: undefined })
+      );
+      const replacement = validAuth({ refresh: "replacement" });
+      const update = provider.updateProviderSection.bind(provider);
+      const write = spyOn(provider, "updateProviderSection").mockImplementationOnce(
+        (name, transform, options) => {
+          store.saveProvidersConfig({
+            openai: { codexOauthAccounts: { work: { label: "Work", auth: replacement } } },
+          });
+          return update(name, transform, options);
+        }
+      );
+      try {
+        expect((await first.startDesktopFlow({ accountId: "work" })).success).toBe(false);
+        expect(getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")).toEqual(replacement);
+        // A second bind proves failed startup releases the listener.
+        const retry = await first.startDesktopFlow({ accountId: "work" });
+        if (!retry.success) throw new Error(retry.error);
+        await first.cancelDesktopFlow(retry.data.flowId);
+      } finally {
+        write.mockRestore();
+        await first.dispose();
+        await second.dispose();
+      }
+    });
+
+    it("releases the listener when a legacy ID write fails", async () => {
+      const auth = validAuth({ credentialId: undefined });
+      deps.providersConfig = { openai: { codexOauth: auth } };
+      deps.policyDenied = true;
+      expect((await service.startDesktopFlow({ accountId: "default" })).success).toBe(false);
+      expect((await service.getValidAuth("default", { credentialId: undefined })).success).toBe(
+        true
+      );
+      expect(deps.providersConfig.openai?.codexOauth).toEqual(auth);
+      deps.policyDenied = false;
+      const retry = await service.startDesktopFlow({ accountId: "default" });
+      if (!retry.success) throw new Error(retry.error);
+      await service.cancelDesktopFlow(retry.data.flowId);
+    });
+
+    it("rejects a revoked account as a new global default", async () => {
+      deps.providersConfig = {
+        openai: {
+          codexOauth: validAuth(),
+          codexOauthDefaultAccountId: "default",
+          codexOauthAccounts: {
+            work: { label: "Work", auth: validAuth({ invalidReason: "invalid_grant" }) },
+          },
+        },
+      };
+      expect((await service.setDefaultAccount("work")).success).toBe(false);
+      expect(deps.providersConfig.openai?.codexOauthDefaultAccountId).toBe("default");
+    });
+
     it("keeps the active device login when a newer device startup fails", async () => {
       deps.providersConfig = { openai: { codexOauth: validAuth() } };
       deviceFetch();

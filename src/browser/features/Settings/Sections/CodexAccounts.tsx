@@ -28,6 +28,10 @@ const noAccounts: Account[] = [];
 const inputClassName =
   "bg-background border-border-light text-foreground w-full min-w-0 rounded border px-2 py-1.5 text-xs";
 
+function accountSelectionLabel(account: Account): string {
+  return account.reconnectRequired ? account.label + " (Reconnect required)" : account.label;
+}
+
 function AccountSelect(props: {
   label: string;
   value: string;
@@ -55,9 +59,10 @@ function AccountSelect(props: {
           <option value="">Inherit global default ({props.defaultLabel})</option>
         )}
         {missing && <option value={props.value}>Missing account ({props.value})</option>}
+        {/* Disabled options preserve stored selections without offering rejected credentials. */}
         {props.accounts.map((account) => (
-          <option key={account.id} value={account.id}>
-            {account.label}
+          <option key={account.id} value={account.id} disabled={account.reconnectRequired}>
+            {accountSelectionLabel(account)}
           </option>
         ))}
       </select>
@@ -93,8 +98,10 @@ export function CodexAccounts() {
   const accounts: Account[] =
     openai?.codexOauthAccounts ?? (openai?.codexOauthSet ? legacyAccounts : noAccounts);
   const defaultId = openai?.codexOauthDefaultAccountId ?? CODEX_OAUTH_DEFAULT_ACCOUNT_ID;
-  const defaultLabel =
-    accounts.find((account) => account.id === defaultId)?.label ?? `Missing account (${defaultId})`;
+  const defaultAccount = accounts.find((account) => account.id === defaultId);
+  const defaultLabel = defaultAccount
+    ? accountSelectionLabel(defaultAccount)
+    : `Missing account (${defaultId})`;
   const isDesktop = !!window.api;
   const showBrowser =
     isDesktop || ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
