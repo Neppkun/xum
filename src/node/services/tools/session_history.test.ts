@@ -1402,6 +1402,141 @@ describe("session_history real disk recovery", () => {
     expect(found[0].text).toBe(text.slice(180));
   });
 
+  test.each([1, 2, 3])(
+    "UTF-16 character pages preserve astral pairs with limit %s",
+    async (limit) => {
+      const text = "😀A🧑B🚀C😀";
+      const message = await append("astral-pages", text);
+      let offset: number | undefined = 0;
+      let recovered = "";
+      let count = 0;
+      while (offset !== undefined) {
+        const page = await call({
+          action: "read_item",
+          item_id: String(message.metadata!.historySequence),
+          offset_chars: offset,
+          limit_chars: limit,
+        });
+        expect(page.success).toBe(true);
+        expect(page.items).toHaveLength(1);
+        const item = page.items![0];
+        expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
+        expect(item.text.length).toBeGreaterThan(0);
+        recovered += item.text;
+        if (item.nextCharOffset !== undefined) {
+          expect(item.nextCharOffset).toBeGreaterThan(offset);
+          expect(item.nextCharOffset).toBe(recovered.length);
+        }
+        offset = item.nextCharOffset;
+        expect(++count).toBeLessThan(20);
+      }
+      expect(recovered).toBe(text);
+    }
+  );
+
+  test("manual offsets inside a surrogate pair round back and EOF offsets finish", async () => {
+    const message = await append("manual-astral-offset", "A😀B");
+    const inside = await call({
+      action: "read_item",
+      item_id: String(message.metadata!.historySequence),
+      offset_chars: 2,
+      limit_chars: 1,
+    });
+    expect(inside.items?.[0]?.text).toBe("😀");
+    expect(inside.items?.[0]?.nextCharOffset).toBe(3);
+    for (const offset of [4, 100]) {
+      const end = await call({
+        action: "read_item",
+        item_id: String(message.metadata!.historySequence),
+        offset_chars: offset,
+        limit_chars: 1,
+      });
+      expect(end.items?.[0]?.text).toBe("");
+      expect(end.items?.[0]?.nextCharOffset).toBeUndefined();
+      expect(end.nextCursor).toBeUndefined();
+      expect(end.exhausted).toBe(true);
+    }
+    const empty = await append("empty-page", "");
+    const end = await call({
+      action: "read_item",
+      item_id: String(empty.metadata!.historySequence),
+      limit_chars: 1,
+    });
+    expect(end.nextCursor).toBeUndefined();
+    expect(end.exhausted).toBe(true);
+  });
+
+  test("JSON-budget shrinking preserves emoji pairs and exact continuation offsets", async () => {
+    const text = '"\\'.repeat(100) + "😀".repeat(4501);
+    const message = await append("budget-astral", text);
+    let offset: number | undefined = 0;
+    let recovered = "";
+    let shrank = false;
+    while (offset !== undefined) {
+      const page = await call({
+        action: "read_item",
+        item_id: String(message.metadata!.historySequence),
+        offset_chars: offset,
+        limit_chars: 16000,
+      });
+      expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThanOrEqual(
+        SESSION_HISTORY_MAX_RESULT_BYTES
+      );
+      const item = page.items![0];
+      expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
+      expect(item.text.length).toBeGreaterThan(0);
+      recovered += item.text;
+      shrank ||= page.truncated === true;
+      if (item.nextCharOffset !== undefined) {
+        expect(item.nextCharOffset).toBeGreaterThan(offset);
+        expect(item.nextCharOffset).toBe(recovered.length);
+      }
+      offset = item.nextCharOffset;
+    }
+    expect(shrank).toBe(true);
+    expect(recovered).toBe(text);
+  });
+
+  test("search snippet boundaries cannot split surrogate pairs", async () => {
+    const starts = "x".repeat(100) + "😀" + "x".repeat(119) + "needle";
+    const ends = "needle" + "x".repeat(493) + "😀tail";
+    await append("astral-snippet-start", starts);
+    await append("astral-snippet-end", ends);
+    const found = (await pages({ action: "search", query: "needle" })).flatMap(
+      (page) => page.items ?? []
+    );
+    expect(found).toHaveLength(2);
+    for (const item of found) {
+      expect(Buffer.from(item.text, "utf8").toString("utf8")).toBe(item.text);
+      expect(item.text).toContain("needle");
+    }
+    expect(found[0].text).toBe(starts.slice(100));
+    expect(found[1].nextCharOffset).toBe(499);
+    expect(
+      (
+        await call({
+          action: "read_item",
+          item_id: found[1].itemId,
+          offset_chars: found[1].nextCharOffset,
+          limit_chars: 1,
+        })
+      ).items?.[0]?.text
+    ).toBe("😀");
+  });
+
+  test("already-unpaired stored surrogates are replaced only in output without shifting offsets", async () => {
+    const message = await append("unpaired-source", "\ud800A\udc00😀");
+    const before = await fs.readFile(chatPath);
+    const page = await call({
+      action: "read_item",
+      item_id: String(message.metadata!.historySequence),
+      limit_chars: 3,
+    });
+    expect(page.items?.[0]?.text).toBe("\ufffdA\ufffd");
+    expect(page.items?.[0]?.nextCharOffset).toBe(3);
+    expect(await fs.readFile(chatPath)).toEqual(before);
+  });
+
   test("default read returns 8000 fitting ASCII characters and snake-case inputs resume the remainder", async () => {
     const text = "a".repeat(8000) + "remaining".repeat(250);
     const message = await append("paged-item", text);

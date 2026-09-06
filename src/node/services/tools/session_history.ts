@@ -64,6 +64,14 @@ function historicalText(message: MuxMessage): string {
     .join("\n");
 }
 
+function surrogateSafeOffset(text: string, offset: number): number {
+  const previous = text.charCodeAt(offset - 1);
+  const current = text.charCodeAt(offset);
+  return previous >= 0xd800 && previous <= 0xdbff && current >= 0xdc00 && current <= 0xdfff
+    ? offset - 1
+    : offset;
+}
+
 export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration) => {
   const workspaceId = config.workspaceId;
   assert(workspaceId && workspaceId.trim().length > 0, "session_history requires workspaceId");
@@ -159,22 +167,36 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               args.item_id !== legacyItemId
             )
               return true;
-            const text = historicalText(message);
+            // Same-length replacements keep UTF-16 offsets stable for already
+            // damaged source strings without emitting unpaired surrogates.
+            const text = historicalText(message).replace(
+              /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+              "\uFFFD"
+            );
             if (!text) return true;
             const match = search ? (search.exec(text)?.index ?? -1) : 0;
             if (match < 0) return true;
             if (items.length >= limit) return false;
-            const start =
-              args.action === "read_item" ? (args.offset_chars ?? 0) : Math.max(0, match - 120);
+            // Manual offsets inside a pair round back to include that character.
+            const start = surrogateSafeOffset(
+              text,
+              Math.min(
+                text.length,
+                args.action === "read_item" ? (args.offset_chars ?? 0) : Math.max(0, match - 120)
+              )
+            );
             const requested =
               args.action === "read_item"
                 ? (args.limit_chars ?? SESSION_HISTORY_DEFAULT_READ_CHARS)
                 : SESSION_HISTORY_SEARCH_SNIPPET_CHARS;
+            let end = surrogateSafeOffset(text, Math.min(text.length, start + requested));
+            // A one-unit limit at an astral character must still make progress.
+            if (end === start && start < text.length) end = start + 2;
             const item = {
               itemId,
               windowId,
               role: message.role,
-              text: text.slice(start, start + requested),
+              text: text.slice(start, end),
               nextCharOffset: undefined as number | undefined,
             };
             items.push(item);
@@ -183,11 +205,15 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
               return false;
             }
             while (byteLength() > payloadBudget && item.text.length > 0) {
-              item.text = item.text.slice(0, Math.floor(item.text.length * 0.8));
+              end = surrogateSafeOffset(text, start + Math.floor((end - start) * 0.8));
+              item.text = text.slice(start, end);
               result.truncated = true;
             }
-            if (start + item.text.length < text.length)
-              item.nextCharOffset = start + item.text.length;
+            assert(
+              end > start || start === text.length,
+              "history character pages must make progress"
+            );
+            if (end < text.length) item.nextCharOffset = end;
             if (args.action === "read_item") foundItem = true;
             return true;
           },
