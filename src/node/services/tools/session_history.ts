@@ -19,11 +19,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import { Config } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
-import {
-  decodeHistoryCursor,
-  encodeHistoryCursor,
-  isHistoryIdentifierRepresentable,
-} from "@/node/services/historyCursor";
+import { decodeHistoryCursor, encodeHistoryCursor } from "@/node/services/historyCursor";
 
 export type SessionHistoryArgs = z.infer<typeof TOOL_DEFINITIONS.session_history.schema>;
 export type SessionHistoryResult = z.infer<typeof TOOL_DEFINITIONS.session_history.resultSchema>;
@@ -155,12 +151,6 @@ export const createSessionHistoryTool: ToolFactory = (config: ToolConfiguration)
             if (foundItem) return false;
             if (args.window_id != null && args.window_id !== windowId) return true;
             const legacyItemId = getHistoryItemId(message);
-            // Corrupt legacy IDs cannot be supplied back through the tool input
-            // or encoded safely. Consume them instead of retrying the same row.
-            if (!isHistoryIdentifierRepresentable(legacyItemId)) {
-              result.truncated = true;
-              return true;
-            }
             // Keep sequence and m:id inputs working, but return the exact row ID
             // so character paging never resolves a duplicate identity to another row.
             if (

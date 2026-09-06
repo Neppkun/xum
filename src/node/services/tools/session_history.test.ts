@@ -667,7 +667,7 @@ describe("session_history real disk recovery", () => {
     },
     { name: "JSON-expanded control-character ID", id: "\u0000".repeat(1000), sequence: undefined },
   ]) {
-    test(`search consumes ${scenario.name} without aliasing or blocking valid older items`, async () => {
+    test(`search and exact read recover ${scenario.name} without prefix aliasing`, async () => {
       const addressablePrefix = scenario.id.slice(0, 100);
       await appendTrackedHistory(
         chatPath,
@@ -684,7 +684,22 @@ describe("session_history real disk recovery", () => {
       const result = (await pages({ action: "search", query: "match", limit: 1 })).flatMap(
         (page) => page.items ?? []
       );
-      expect(result.map((item) => item.text)).toEqual(["match addressable prefix", "match later"]);
+      expect(result.map((item) => item.text)).toEqual([
+        "match unaddressable",
+        "match addressable prefix",
+        "match later",
+      ]);
+      expect(
+        (
+          await pages({
+            action: "read_item",
+            item_id: result[0].itemId,
+            window_id: result[0].windowId,
+          })
+        )
+          .flatMap((page) => page.items ?? [])
+          .map((item) => item.text)
+      ).toEqual(["match unaddressable"]);
       expect(
         (await pages({ action: "read_item", item_id: `m:${addressablePrefix}` }))
           .flatMap((page) => page.items ?? [])
