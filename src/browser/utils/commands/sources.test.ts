@@ -572,6 +572,30 @@ test("Codex account commands distinguish duplicate labels without changing accou
   }
 });
 
+const hiddenCodexProviders: Array<{
+  name: string;
+  providersConfig: Parameters<typeof buildCoreSources>[0]["providersConfig"];
+}> = [
+  { name: "loading metadata", providersConfig: undefined },
+  { name: "policy-hidden OpenAI", providersConfig: {} },
+  {
+    name: "a custom OpenAI shadow",
+    providersConfig: {
+      openai: { apiKeySet: true, isEnabled: true, isConfigured: true, isCustom: true },
+    },
+  },
+];
+
+test.each(hiddenCodexProviders)("Codex commands stay hidden with $name", ({ providersConfig }) => {
+  const commands = getActions({ onOpenSettings: mock(), providersConfig }).filter((action) =>
+    action.id.startsWith("providers:openai:codex:")
+  );
+  expect(commands.length).toBeGreaterThan(0);
+  for (const command of commands) {
+    expect(command.visible?.()).toBe(false);
+  }
+});
+
 test("Codex commands use legacy metadata and disable account operations without slots", async () => {
   const openai = { apiKeySet: false, isEnabled: true, isConfigured: true, codexOauthSet: true };
   const legacy = getActions({ onOpenSettings: mock(), providersConfig: { openai } });
@@ -581,7 +605,7 @@ test("Codex commands use legacy metadata and disable account operations without 
   expect((await field.getOptions({})).map((choice) => choice.id)).toEqual(["default"]);
   const disconnected = getActions({
     onOpenSettings: mock(),
-    providersConfig: { openai: { ...openai, codexOauthSet: false } },
+    providersConfig: { openai: { ...openai, isConfigured: false, codexOauthSet: false } },
   });
   for (const type of ["reconnect", "rename", "disconnect", "default"]) {
     expect(
@@ -590,15 +614,6 @@ test("Codex commands use legacy metadata and disable account operations without 
   }
   expect(
     disconnected.find((action) => action.id === "providers:openai:codex:add")?.visible?.()
-  ).toBe(true);
-  const shadowed = getActions({
-    onOpenSettings: mock(),
-    providersConfig: { openai: { ...openai, isCustom: true } },
-  });
-  expect(
-    shadowed
-      .filter((action) => action.id.startsWith("providers:openai:codex:"))
-      .every((action) => !action.visible?.())
   ).toBe(true);
 });
 

@@ -231,6 +231,32 @@ describe("CodexOauthService", () => {
       );
     }
 
+    it("does not let an invalid alias authorize a legacy snapshot", async () => {
+      const auth = validAuth();
+      for (const legacyCredentialId of [
+        auth.credentialId,
+        undefined,
+        null,
+        "invalid",
+        42,
+        "50e00a32-b964-4ce2-b131-6b53356ce2db",
+      ]) {
+        deps.providersConfig = { openai: { codexOauth: { ...auth, legacyCredentialId } } };
+        const pinned = await service.getValidAuth("default", { credentialId: undefined });
+        expect(pinned.success).toBe(legacyCredentialId === auth.credentialId);
+        expect(
+          (await service.getValidAuth("default", { credentialId: auth.credentialId })).success
+        ).toBe(true);
+        expect(
+          (
+            await service.getValidAuth("default", {
+              credentialId: "81df6409-6a24-4a19-950e-7daf7ef47c4e",
+            })
+          ).success
+        ).toBe(false);
+      }
+    });
+
     it("returns stored auth when token is not expired", async () => {
       const auth = validAuth();
       deps.providersConfig = { openai: { codexOauth: auth } };
@@ -1392,11 +1418,14 @@ describe("CodexOauthService", () => {
       expect(getCodexOauthAuth(deps.providersConfig.openai)?.access).toBe("access-device-2");
     });
 
-    function sharedServices(auth: CodexOauthAuth) {
+    function sharedServices(auth: CodexOauthAuth, accountId = "work") {
       const provider = new ProviderService(new Config(deps.rootDir));
       const store = provider.providersConfigStore;
       store.saveProvidersConfig({
-        openai: { codexOauthAccounts: { work: { label: "Work", credentials: auth } } },
+        openai:
+          accountId === "default"
+            ? { codexOauth: auth }
+            : { codexOauthAccounts: { [accountId]: { label: "Work", credentials: auth } } },
       });
       return {
         provider,
@@ -1433,6 +1462,96 @@ describe("CodexOauthService", () => {
         }
       }
     );
+
+    for (const kind of ["desktop", "device"] as const) {
+      it.each(["cancelled", "expired", "completed"] as const)(
+        "preserves pinned legacy identity until " + kind + " reconnect is %s",
+        async (terminal) => {
+          const { store, first, second } = sharedServices(
+            validAuth({ credentialId: undefined }),
+            "default"
+          );
+          const snapshot = {
+            credentialId: getCodexOauthAuth(store.loadProvidersConfig()?.openai, "default")
+              ?.credentialId,
+          };
+          expect(snapshot.credentialId).toBeUndefined();
+          deviceFetch();
+          try {
+            expect((await second.getValidAuth("default", snapshot)).success).toBe(true);
+            const flow =
+              kind === "desktop"
+                ? await first.startDesktopFlow({ accountId: "default" })
+                : await first.startDeviceFlow({ accountId: "default" });
+            if (!flow.success) throw new Error(flow.error);
+            const duringLogin = await second.getValidAuth("default", snapshot);
+            if (kind === "desktop") {
+              if (terminal === "cancelled") await first.cancelDesktopFlow(flow.data.flowId);
+              else if (terminal === "expired") {
+                expect(
+                  (await first.waitForDesktopFlow(flow.data.flowId, { timeoutMs: 0 })).success
+                ).toBe(false);
+              } else {
+                const callback = await originalFetch(
+                  "http://localhost:1455/auth/callback?code=code&state=" + flow.data.flowId
+                );
+                await callback.text();
+                expect(await first.waitForDesktopFlow(flow.data.flowId)).toEqual(Ok(undefined));
+              }
+            } else if (terminal === "cancelled") {
+              await first.cancelDeviceFlow(flow.data.flowId);
+            } else if (terminal === "expired") {
+              const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 120_000);
+              try {
+                expect((await first.waitForDeviceFlow(flow.data.flowId)).success).toBe(false);
+              } finally {
+                clock.mockRestore();
+              }
+            } else {
+              expect(await first.waitForDeviceFlow(flow.data.flowId)).toEqual(Ok(undefined));
+            }
+            expect(duringLogin.success).toBe(true);
+            const pinned = await second.getValidAuth("default", snapshot);
+            expect(pinned.success).toBe(terminal !== "completed");
+            expect((await second.getValidAuth("default")).success).toBe(true);
+          } finally {
+            await first.dispose();
+            await second.dispose();
+          }
+        }
+      );
+    }
+
+    it("preserves the legacy snapshot through backfill and cross-process token rotation", async () => {
+      const { store, first, second } = sharedServices(expiredAuth({ credentialId: undefined }));
+      const snapshot = { credentialId: undefined };
+      deviceFetch(() =>
+        Promise.resolve(
+          mockRefreshResponse({
+            access_token: "rotated",
+            refresh_token: "rotated-refresh",
+            expires_in: 3600,
+          })
+        )
+      );
+      try {
+        const flow = await first.startDeviceFlow({ accountId: "work" });
+        if (!flow.success) throw new Error(flow.error);
+        await first.cancelDeviceFlow(flow.data.flowId);
+        const result = await second.getValidAuth("work", snapshot);
+        expect(result).toMatchObject({
+          success: true,
+          data: { access: "rotated", refresh: "rotated-refresh" },
+        });
+        expect(
+          getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")?.credentialId
+        ).toBeDefined();
+        expect(await first.getValidAuth("work", snapshot)).toEqual(result);
+      } finally {
+        await first.dispose();
+        await second.dispose();
+      }
+    });
 
     it("reconnects a marked legacy credential that has no durable ID", async () => {
       deps.providersConfig = {
@@ -1559,22 +1678,25 @@ describe("CodexOauthService", () => {
       }
     });
 
-    it("lets the first completed cross-process reconnect invalidate the other login", async () => {
-      const { store, first, second } = sharedServices(validAuth());
-      deviceFetch();
-      try {
-        const older = await first.startDeviceFlow({ accountId: "work" });
-        const newer = await second.startDeviceFlow({ accountId: "work" });
-        if (!older.success || !newer.success) throw new Error("Login start failed");
-        expect(await first.waitForDeviceFlow(older.data.flowId)).toEqual(Ok(undefined));
-        const winner = getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work");
-        expect((await second.waitForDeviceFlow(newer.data.flowId)).success).toBe(false);
-        expect(getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")).toEqual(winner);
-      } finally {
-        await first.dispose();
-        await second.dispose();
+    it.each([undefined, "1c9c50b0-d777-4dd2-998c-09c156ba9754"])(
+      "lets the first completed reconnect replace credential %s",
+      async (credentialId) => {
+        const { store, first, second } = sharedServices(validAuth({ credentialId }));
+        deviceFetch();
+        try {
+          const older = await first.startDeviceFlow({ accountId: "work" });
+          const newer = await second.startDeviceFlow({ accountId: "work" });
+          if (!older.success || !newer.success) throw new Error("Login start failed");
+          expect(await first.waitForDeviceFlow(older.data.flowId)).toEqual(Ok(undefined));
+          const winner = getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work");
+          expect((await second.waitForDeviceFlow(newer.data.flowId)).success).toBe(false);
+          expect(getCodexOauthAuth(store.loadProvidersConfig()?.openai, "work")).toEqual(winner);
+        } finally {
+          await first.dispose();
+          await second.dispose();
+        }
       }
-    });
+    );
 
     it.each(["removed", "recreated", "older-client"])(
       "rejects stale login after external %s credentials",

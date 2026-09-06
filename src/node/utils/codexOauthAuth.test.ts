@@ -68,6 +68,36 @@ describe("parseCodexOauthAuth", () => {
     }
   });
 
+  it("retains only a legacy alias that matches the current credential ID", () => {
+    const credentialId = "1c9c50b0-d777-4dd2-998c-09c156ba9754";
+    const auth = {
+      type: "oauth",
+      access: "access",
+      refresh: "refresh",
+      expires: 1000,
+      credentialId,
+    };
+    for (const legacyCredentialId of [
+      credentialId,
+      undefined,
+      null,
+      "",
+      42,
+      "not-a-uuid",
+      "50e00a32-b964-4ce2-b131-6b53356ce2db",
+    ]) {
+      const parsed = parseCodexOauthAuth({ ...auth, legacyCredentialId });
+      expect(parsed?.access).toBe(auth.access);
+      expect(parsed?.legacyCredentialId).toBe(
+        legacyCredentialId === credentialId ? credentialId : undefined
+      );
+    }
+    expect(
+      parseCodexOauthAuth({ ...auth, credentialId: undefined, legacyCredentialId: credentialId })
+        ?.legacyCredentialId
+    ).toBeUndefined();
+  });
+
   it("preserves only the supported invalid credential marker", () => {
     const auth = { type: "oauth" as const, access: "access", refresh: "refresh", expires: 1000 };
     const marked = parseCodexOauthAuth({ ...auth, invalidReason: "invalid_grant" });

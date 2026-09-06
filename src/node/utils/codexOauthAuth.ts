@@ -20,6 +20,8 @@ export interface CodexOauthAuth {
   type: "oauth";
   /** Identifies this login across token rotations and processes. */
   credentialId?: string;
+  /** Matches a backfilled ID while requests still pin the original undefined identity. */
+  legacyCredentialId?: string;
   /** Blocks requests while retaining the login identity for reconnect. */
   invalidReason?: "invalid_grant";
   /** OAuth access token (JWT). */
@@ -51,6 +53,7 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
   const expires = value.expires;
   const accountId = value.accountId;
   const credentialId = credentialIdSchema.safeParse(value.credentialId);
+  const legacyCredentialId = credentialIdSchema.safeParse(value.legacyCredentialId);
   const invalidReason = value.invalidReason;
 
   if (type !== "oauth") return null;
@@ -72,6 +75,13 @@ export function parseCodexOauthAuth(value: unknown): CodexOauthAuth | null {
     accountId,
     // Treat a damaged optional ID as legacy state so reconnect can assign a valid ID.
     credentialId: credentialId.success ? credentialId.data : undefined,
+    // A mismatched or malformed alias must not authorize an old request.
+    legacyCredentialId:
+      credentialId.success &&
+      legacyCredentialId.success &&
+      credentialId.data === legacyCredentialId.data
+        ? legacyCredentialId.data
+        : undefined,
     invalidReason,
   };
 }

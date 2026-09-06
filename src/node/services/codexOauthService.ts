@@ -166,6 +166,7 @@ function matchesAuth(actual: CodexOauthAuth | null, expected: CodexOauthAuth | n
     actual.expires === expected.expires &&
     actual.accountId === expected.accountId &&
     actual.credentialId === expected.credentialId &&
+    actual.legacyCredentialId === expected.legacyCredentialId &&
     actual.invalidReason === expected.invalidReason
   );
 }
@@ -691,8 +692,12 @@ export class CodexOauthService {
     selection: Pick<AccountSelection, "accountId" | "credentialId" | "revision">
   ): Result<CodexOauthAuth, string> {
     if (!auth) return Err(`Codex OAuth account "${selection.accountId}" is not configured`);
+    const retainsLegacySnapshot =
+      selection.credentialId === undefined &&
+      auth.legacyCredentialId !== undefined &&
+      auth.legacyCredentialId === auth.credentialId;
     if (
-      auth.credentialId !== selection.credentialId ||
+      (auth.credentialId !== selection.credentialId && !retainsLegacySnapshot) ||
       this.getAccountRevision(selection.accountId) !== selection.revision
     ) {
       return Err("Codex OAuth account changed during the request");
@@ -831,7 +836,7 @@ export class CodexOauthService {
         };
         try {
           if (!initial.auth || initial.credentialId) return await prepare(initial);
-          // Successful reconnect startup establishes the legacy identity boundary; failed startup must leave active snapshots usable.
+          // Backfill an ID for cross-process reconnect checks without invalidating active legacy snapshots.
           // Hold rotations until startup and stamping finish.
           return await this.fileLeaseManager.withCodexOauthRefreshLock(
             initial.accountId,
@@ -869,7 +874,8 @@ export class CodexOauthService {
         ) {
           throw new Error("Codex OAuth account changed during login startup");
         }
-        selected = { ...current, credentialId: crypto.randomUUID() };
+        const credentialId = crypto.randomUUID();
+        selected = { ...current, credentialId, legacyCredentialId: credentialId };
         const next = { ...section };
         if (accountId === CODEX_OAUTH_DEFAULT_ACCOUNT_ID) {
           next.codexOauth = selected;
@@ -974,7 +980,13 @@ export class CodexOauthService {
     auth: CodexOauthAuth,
     isActive: () => boolean
   ): Effect.Effect<Result<void, string>> {
-    const nextAuth = { ...auth, credentialId: crypto.randomUUID(), invalidReason: undefined };
+    // Only successful authorization replaces identity. Cancelled logins retain the legacy alias.
+    const nextAuth = {
+      ...auth,
+      credentialId: crypto.randomUUID(),
+      legacyCredentialId: undefined,
+      invalidReason: undefined,
+    };
     return this.withAccountMutationEffect(
       selection.accountId,
       this.configMutationEffect(() =>
@@ -1252,6 +1264,7 @@ export class CodexOauthService {
       const next: CodexOauthAuth = {
         type: "oauth",
         credentialId: current.credentialId,
+        legacyCredentialId: current.legacyCredentialId,
         access: accessToken,
         refresh: refreshToken ?? current.refresh,
         expires: Date.now() + Math.max(0, Math.floor(expiresIn * 1000)),

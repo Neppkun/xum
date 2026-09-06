@@ -1616,7 +1616,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
     const openSettings = p.onOpenSettings;
     const openCodexAction = (intent: CodexAccountSettingsIntent) =>
       openSettings("providers", { expandProvider: "openai", codexAccountAction: intent });
-    const codexVisible = () => p.providersConfig?.openai?.isCustom !== true;
+    const codexVisible = () => {
+      // Policy can omit OpenAI metadata. Custom providers do not expose built-in account controls.
+      const openai = p.providersConfig?.openai;
+      return openai != null && openai.isCustom !== true;
+    };
     const getCodexAccounts = () => {
       const openai = p.providersConfig?.openai;
       return (
