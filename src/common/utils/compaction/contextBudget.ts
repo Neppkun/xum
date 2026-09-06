@@ -31,7 +31,8 @@ export function getContextBudgetHardCeiling(modelContextLimit: number): number {
   );
 }
 
-/** Unknown limits are not unlimited: the caller logs that preflight could not be applied. */
+/** Heuristic-only check. Provider dispatch uses the node real-encoding adapter.
+ * Unknown limits are not unlimited: the caller logs that preflight could not be applied. */
 export function checkAssembledRequestBudget(
   payload: Parameters<typeof estimateAssembledRequestTokens>[0],
   options: { model: string; modelContextLimit: number | null | undefined }
@@ -50,13 +51,15 @@ export interface StepBudgetInput {
   outputTokens: number;
   toolResultChars: number;
   imageParts: number;
+  /** Real-encoding tool-output count, including media allowances, when available. */
+  toolResultTokens?: number;
   modelContextLimit: number | null | undefined;
   threshold: number;
   warningEmitted: boolean;
 }
 
 export interface StepBudgetEvaluation {
-  decision: "continue" | "warn" | "rollover";
+  decision: "continue" | "warn" | "rollover" | "block";
   flushOpportunity: boolean;
   projected: number;
   /** Undefined means unknown, not unlimited. The caller should log that limitation. */
@@ -70,6 +73,7 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.toolResultChars,
     input.imageParts,
     input.threshold,
+    input.toolResultTokens ?? 0,
   ]) {
     assert(
       Number.isFinite(value) && value >= 0,
@@ -81,6 +85,10 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     input.outputTokens +
     Math.ceil(input.toolResultChars / 4) +
     IMAGE_TOKEN_ESTIMATE * input.imageParts;
+  const hardProjected = Math.max(
+    projected,
+    input.contextTokens + input.outputTokens + (input.toolResultTokens ?? 0)
+  );
   const limit = input.modelContextLimit;
   const hardCeiling =
     limit != null && Number.isFinite(limit) && limit > 0
@@ -93,11 +101,16 @@ export function evaluateStepBudget(input: StepBudgetInput): StepBudgetEvaluation
     hardCeiling,
   };
   // The auto-compaction Off setting disables proactive rollover, not request preflight.
-  if (input.threshold >= 1 || hardCeiling === undefined || limit == null) return result;
-  if (
-    projected >= hardCeiling ||
-    projected >= limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100)
-  ) {
+  if (hardCeiling === undefined || limit == null) return result;
+  if (hardProjected >= hardCeiling) {
+    return {
+      ...result,
+      projected: hardProjected,
+      decision: input.threshold >= 1 ? "block" : "rollover",
+    };
+  }
+  if (input.threshold >= 1) return result;
+  if (projected >= limit * ((input.threshold * 100 + FORCE_COMPACTION_BUFFER_PERCENT) / 100)) {
     return { ...result, decision: "rollover", flushOpportunity: projected < hardCeiling };
   }
   if (
@@ -117,6 +130,16 @@ export function estimateToolResultSize(result: unknown): {
   toolResultChars: number;
   imageParts: number;
 } {
+  return measureBudgetContent(result);
+}
+
+function measureBudgetContent(
+  result: unknown,
+  textParts?: string[]
+): {
+  toolResultChars: number;
+  imageParts: number;
+} {
   let toolResultChars = 0;
   let imageParts = 0;
   const ancestors = new Set<object>();
@@ -127,12 +150,17 @@ export function estimateToolResultSize(result: unknown): {
     if (value == null) continue;
     if (typeof value === "string") {
       if (/^data:[^;,]+;base64,/i.test(value)) imageParts += 1;
-      else toolResultChars += value.length + 2;
+      else {
+        toolResultChars += value.length + 2;
+        textParts?.push(value);
+      }
       continue;
     }
     if (typeof value !== "object") {
-      if (typeof value === "number" || typeof value === "boolean")
+      if (typeof value === "number" || typeof value === "boolean") {
         toolResultChars += String(value).length;
+        textParts?.push(String(value));
+      }
       continue;
     }
     if (entry.leave) {
@@ -146,6 +174,7 @@ export function estimateToolResultSize(result: unknown): {
     }
     if (value instanceof URL) {
       toolResultChars += value.href.length;
+      textParts?.push(value.href);
       continue;
     }
     ancestors.add(value);
@@ -171,24 +200,42 @@ export function estimateToolResultSize(result: unknown): {
       // can contain both ordinary text and more media and must still be walked.
       if ((isMedia || displayOnly) && ["data", "url", "image", "image_url"].includes(key)) continue;
       toolResultChars += key.length + 4;
+      textParts?.push(key);
       stack.push({ value: child });
     }
   }
   return { toolResultChars, imageParts };
 }
 
-function estimateContentTokens(content: unknown): number {
-  const size = estimateToolResultSize(content);
-  return Math.ceil(size.toolResultChars / 3.5) + size.imageParts * IMAGE_TOKEN_ESTIMATE;
+export interface BudgetTokenCountInput {
+  text: string;
+  fixedTokens: number;
+  heuristicTokens: number;
 }
 
-export function estimateFreshRequestTokens(input: {
+/** The same media-byte exclusion used for step sizing, with text retained for real encoding. */
+export function prepareBudgetTokenCount(content: unknown): BudgetTokenCountInput {
+  const textParts: string[] = [];
+  const size = measureBudgetContent(content, textParts);
+  const fixedTokens = size.imageParts * IMAGE_TOKEN_ESTIMATE;
+  return {
+    text: textParts.join("\n"),
+    fixedTokens,
+    heuristicTokens: Math.ceil(size.toolResultChars / 3.5) + fixedTokens,
+  };
+}
+
+export interface FreshRequestBudgetInput {
   userText: string;
   attachments?: readonly unknown[];
   leadIn?: string;
   systemFloorTokens?: number;
   modelContextLimit?: number;
-}): number {
+}
+
+export function prepareFreshRequestTokenCount(
+  input: FreshRequestBudgetInput
+): BudgetTokenCountInput {
   if (input.modelContextLimit != null) {
     assert(
       Number.isFinite(input.modelContextLimit) && input.modelContextLimit > 0,
@@ -209,19 +256,35 @@ export function estimateFreshRequestTokens(input: {
     Number.isFinite(systemFloorTokens) && systemFloorTokens >= 0,
     "System token floor must be finite and nonnegative"
   );
-  return (
-    systemFloorTokens +
-    estimateContentTokens([input.userText, input.leadIn ?? "", ...(input.attachments ?? [])])
-  );
+  const content = prepareBudgetTokenCount([
+    input.userText,
+    input.leadIn ?? "",
+    ...(input.attachments ?? []),
+  ]);
+  return {
+    ...content,
+    fixedTokens: content.fixedTokens + systemFloorTokens,
+    heuristicTokens: content.heuristicTokens + systemFloorTokens,
+  };
 }
 
-/** Estimate the final wire payload, not just history: system and tool schemas count too. */
-export function estimateAssembledRequestTokens(payload: {
+export function estimateFreshRequestTokens(input: FreshRequestBudgetInput): number {
+  return prepareFreshRequestTokenCount(input).heuristicTokens;
+}
+
+export interface AssembledRequestBudgetInput {
   system?: unknown;
   tools?: Record<string, unknown>;
   messages: readonly unknown[];
-}): number {
-  let tokens = estimateContentTokens([payload.system, ...payload.messages]);
+}
+
+/** Estimate the final wire payload, not just history: system and tool schemas count too. */
+export function prepareAssembledRequestTokenCount(
+  payload: AssembledRequestBudgetInput
+): BudgetTokenCountInput {
+  const content = prepareBudgetTokenCount([payload.system, ...payload.messages]);
+  const textParts = [content.text];
+  let tokens = content.heuristicTokens;
   for (const [name, tool] of Object.entries(payload.tools ?? {})) {
     const record = tool as { description?: unknown; type?: unknown; id?: unknown; args?: unknown };
     const wireTool =
@@ -229,7 +292,13 @@ export function estimateAssembledRequestTokens(payload: {
         ? { name, id: record.id, args: record.args }
         : { name, description: record.description, parameters: extractToolJsonSchema(tool) };
     // Schemas are text, even if they describe image/data properties.
-    tokens += Math.ceil(JSON.stringify(wireTool).length / 3.5);
+    const schemaText = JSON.stringify(wireTool);
+    textParts.push(schemaText);
+    tokens += Math.ceil(schemaText.length / 3.5);
   }
-  return tokens;
+  return { text: textParts.join("\n"), fixedTokens: content.fixedTokens, heuristicTokens: tokens };
+}
+
+export function estimateAssembledRequestTokens(payload: AssembledRequestBudgetInput): number {
+  return prepareAssembledRequestTokenCount(payload).heuristicTokens;
 }

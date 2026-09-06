@@ -1,5 +1,5 @@
 import type { OnStepSettled } from "./streamManager";
-import { checkAssembledRequestBudget } from "@/common/utils/compaction/contextBudget";
+import { checkAssembledRequestBudgetForModel } from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
@@ -446,8 +446,9 @@ export async function assembleBudgetCheckedPromptPayload(
         model: options.modelString,
       });
     }
-    const exceeded = checkAssembledRequestBudget(payload, {
+    const exceeded = await checkAssembledRequestBudgetForModel(payload, {
       model: options.modelString,
+      metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
       modelContextLimit,
     });
     if (exceeded) throw new ContextBudgetExceededError(exceeded);

@@ -1104,6 +1104,79 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(await allRows(h))).toHaveLength(1);
   });
 
+  test("restart does not treat a fresh continuation's owned assistant payload as older context", async () => {
+    const original = await setup();
+    const rollover: ContextWindowRollover = {
+      type: "context-window-rollover",
+      rolloverId: "crashed-fresh-retry",
+      reason: "context-exceeded",
+      previousWindowId: "w:0",
+      flushOpportunity: false,
+      contextTokens: 127000,
+      maxTokens: 128000,
+    };
+    const payload = createMuxMessage(
+      "copied-family-payload",
+      "assistant",
+      "Accepted family payload",
+      { synthetic: true, uiVisible: false, muxMetadata: { type: "family-message" } }
+    );
+    const continuation = createMuxMessage(
+      "accepted-continuation",
+      "user",
+      "Continue the same request",
+      {
+        requestPreludeMessageIds: [payload.id],
+        muxMetadata: { type: "context-window-continuation", rolloverId: rollover.rolloverId },
+      }
+    );
+    expect(
+      (
+        await original.historyService.appendManyToHistory(workspaceId, [
+          ...createRolloverPrefix(rollover),
+          payload,
+          continuation,
+        ])
+      ).success
+    ).toBe(true);
+    original.session.dispose();
+    const resumed = await setup({ previous: original, failure: () => exceeded });
+    expect(await resumed.session.resumeStream(options)).toMatchObject({
+      success: false,
+      error: { type: "context_budget_blocked" },
+    });
+    expect(resumed.requests).toHaveLength(1);
+    expect(rolloverRows(await allRows(resumed))).toHaveLength(1);
+  });
+
+  test("damaged prelude ownership cannot hide real older conversation from emergency eligibility", async () => {
+    const h = await setup({
+      failure: async (attempt) => {
+        if (attempt !== 1) return undefined;
+        const rows = await allRows(h);
+        const user = rows.at(-1)!;
+        expect(
+          (
+            await h.historyService.updateHistory(workspaceId, {
+              ...user,
+              metadata: {
+                ...user.metadata,
+                requestPreludeMessageIds: rows.slice(0, -1).map((row) => row.id),
+              },
+            })
+          ).success
+        ).toBe(true);
+        return exceeded;
+      },
+    });
+    await seedHistory(h, 20_000);
+    expect((await h.session.sendMessage("Retry with real prior context", options)).success).toBe(
+      true
+    );
+    expect(h.requests).toHaveLength(2);
+    expect(rolloverRows(await allRows(h))).toHaveLength(1);
+  });
+
   test("preflight failure in an already fresh window does not reset or rebuild", async () => {
     const h = await setup({ failure: () => exceeded });
     const result = await h.session.sendMessage("Too large after assembly", options);
@@ -1815,13 +1888,48 @@ describe("AgentSession token-budget lifecycle", () => {
     h.session.setAutoCompactionThreshold(1);
     await seedHistory(h, 110_000);
     expect((await h.session.sendMessage("Manual only", options)).success).toBe(true);
-    expect(await h.requests[0].onStepSettled?.(step(127_000))).toBe("continue");
+    expect(await h.requests[0].onStepSettled?.(step(110_000))).toBe("continue");
     const rows = await allRows(h);
     expect(rolloverRows(rows)).toHaveLength(0);
     expect(rows.some((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")).toBe(
       false
     );
   });
+
+  test("auto-disabled settled hard block creates no warning, reset, or queued continuation", async () => {
+    const h = await setup();
+    h.session.setAutoCompactionThreshold(1);
+    expect((await h.session.sendMessage("Start this task", options)).success).toBe(true);
+    expect(
+      await h.requests[0].onStepSettled?.(
+        step(1000, { toolResultChars: 100, toolResultTokens: 130000 })
+      )
+    ).toBe("block");
+    expect(h.session.hasQueuedMessages()).toBe(false);
+    expect(rolloverRows(await allRows(h))).toHaveLength(0);
+    expect(
+      (await allRows(h)).some((row) => row.metadata?.muxMetadata?.type === "context-budget-warning")
+    ).toBe(false);
+    expect(h.requests).toHaveLength(1);
+  });
+
+  test.each(["漢".repeat(150000), "🦊".repeat(50000), "a0b1c2d3e4f5".repeat(12000)])(
+    "token-dense fresh input is blocked before provider dispatch and a fitting follow-up remains usable",
+    async (input) => {
+      const h = await setup();
+      h.session.setAutoCompactionThreshold(1);
+      expect(await h.session.sendMessage(input, options)).toMatchObject({
+        success: false,
+        error: { type: "context_budget_blocked" },
+      });
+      expect(h.requests).toHaveLength(0);
+      expect(rolloverRows(await allRows(h))).toHaveLength(0);
+      expect((await h.session.sendMessage("你好。Please continue briefly.", options)).success).toBe(
+        true
+      );
+      expect(h.requests).toHaveLength(1);
+    }
+  );
 
   test("auto-disabled still reports the hard preflight guard without resetting or retrying", async () => {
     const h = await setup({ failure: () => exceeded });

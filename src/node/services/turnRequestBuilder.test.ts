@@ -311,6 +311,34 @@ describe("TurnRequestBuilder assembled preflight", () => {
     expect(payload.messages.length).toBeGreaterThan(0);
   });
 
+  it.each(["漢".repeat(10000), "🦊".repeat(4000), "a0b1c2d3e4f5".repeat(1500)])(
+    "blocks token-dense assembled input that character estimation would admit",
+    async (text) => {
+      const request = {
+        ...options(),
+        systemMessage: "Short system",
+        tools: {},
+        history: [createMuxMessage("dense", "user", text)],
+      };
+      const error = await assembleBudgetCheckedPromptPayload(request, { enabled: true }).catch(
+        (error: unknown) => error
+      );
+      expect(error).toBeInstanceOf(ContextBudgetExceededError);
+      if (!(error instanceof ContextBudgetExceededError))
+        throw new Error("Expected dense request refusal");
+      expect(error.details.model).toBe(request.modelString);
+      expect(error.details.estimate).toBeGreaterThan(error.details.hardCeiling);
+      const fitting = await assembleBudgetCheckedPromptPayload(
+        {
+          ...request,
+          history: [createMuxMessage("small", "user", "你好，简短问题。 Explain this function.")],
+        },
+        { enabled: true }
+      );
+      expect(fitting.messages.length).toBeGreaterThan(0);
+    }
+  );
+
   it("leaves legacy behavior unchanged when the effective budget flag is disabled", async () => {
     const payload = await assembleBudgetCheckedPromptPayload(options(), { enabled: false });
     expect(payload.messages.length).toBeGreaterThan(0);

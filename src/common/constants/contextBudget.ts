@@ -31,3 +31,8 @@ export const SESSION_HISTORY_SEARCH_SNIPPET_CHARS = 500;
 export const SESSION_HISTORY_RESET_NEEDLE = '"contextBoundaryKind":"reset"';
 // Each marker character can occupy six raw characters as a JSON Unicode escape.
 export const SESSION_HISTORY_RESET_PROBE_CHARS = SESSION_HISTORY_RESET_NEEDLE.length * 6;
+
+// Allow for provider message/tool envelopes beyond encoded visible text.
+export const REQUEST_FRAMING_TOKENS = 8;
+export const BUDGET_TOKEN_COUNT_CHUNK_CHARS = 4096;
+export const BUDGET_TOKEN_CHUNK_SLACK = 8;

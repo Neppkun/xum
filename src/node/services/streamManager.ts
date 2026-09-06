@@ -1,5 +1,6 @@
 import { estimateToolResultSize } from "@/common/utils/compaction/contextBudget";
-import { ContextBudgetExceededError } from "./contextBudgetError";
+import { ContextBudgetExceededError, ContextBudgetBlockedError } from "./contextBudgetError";
+import { estimateToolResultTokensForModel } from "./contextBudgetCounting";
 import {
   applyCacheControl,
   getAnthropicCacheTtl,
@@ -250,11 +251,14 @@ export interface SettledStepBudget {
   providerMetadata?: Record<string, unknown>;
   toolResultChars: number;
   imageParts: number;
+  toolResultTokens?: number;
   sessionHistoryAvailable: boolean;
   memoryWritable: boolean;
 }
 
-export type OnStepSettled = (step: SettledStepBudget) => Promise<"continue" | "warn" | "rollover">;
+export type OnStepSettled = (
+  step: SettledStepBudget
+) => Promise<"continue" | "warn" | "rollover" | "block">;
 
 interface StreamRequestOptions {
   model: LanguageModel;
@@ -309,6 +313,7 @@ interface StepMessageTracker {
 }
 interface StreamRequestConfig {
   cacheEnabled?: boolean;
+  budgetMetadataModel?: string;
   model: LanguageModel;
   modelString: string;
   messages: ModelMessage[];
@@ -2219,6 +2224,7 @@ export class StreamManager {
       messages,
       system,
       cacheEnabled: supportsAnthropicCache(modelString, requestProvidersConfig),
+      budgetMetadataModel: resolveModelForMetadata(modelString, requestProvidersConfig),
       // Keep provider-level parallel tool planning enabled, but serialize sibling
       // execute() handlers inside this stream so shared mutable state cannot race.
       tools: withSequentialExecution(tools, onToolExecutionStart),
@@ -2250,6 +2256,7 @@ export class StreamManager {
       | "modelString"
       | "tools"
       | "contextBudgetMemoryWritable"
+      | "budgetMetadataModel"
     >
   ): Array<ReturnType<typeof stepCountIs>> {
     // Completion-tool stop check: completion/routing tools use explicit
@@ -2299,15 +2306,26 @@ export class StreamManager {
       async ({ steps }) => {
         const step = steps.at(-1);
         if (request.onStepSettled && step && !(await hasSuccessfulRequiredToolResult({ steps }))) {
-          const size = estimateToolResultSize(step.toolResults.map((result) => result.output));
+          const outputs = step.toolResults.map((result) => result.output);
+          const size = estimateToolResultSize(outputs);
+          const toolResultTokens = await estimateToolResultTokensForModel(outputs, {
+            model: request.modelString,
+            metadataModel: request.budgetMetadataModel,
+          });
           const decision = await request.onStepSettled({
             model: request.modelString,
             usage: normalizeUsage(step.usage),
             providerMetadata: step.providerMetadata,
             ...size,
+            toolResultTokens,
             sessionHistoryAvailable: request.tools?.session_history != null,
             memoryWritable: request.contextBudgetMemoryWritable === true,
           });
+          // All siblings have settled: stop before another provider step without discarding results.
+          if (decision === "block")
+            throw new ContextBudgetBlockedError(
+              "The settled tool results exceed the context budget. Use /compact or start a new context before continuing."
+            );
           // Budget stops are authoritative even when only a turn-end message is queued.
           if (decision !== "continue") return true;
         }
@@ -4511,6 +4529,14 @@ export class StreamManager {
       actualError = error.cause;
     }
 
+    if (actualError instanceof ContextBudgetBlockedError) {
+      return {
+        messageId: streamInfo.messageId,
+        error: actualError.message,
+        errorType: "context_budget_blocked",
+        acpPromptId: streamInfo.initialMetadata?.acpPromptId,
+      };
+    }
     if (actualError instanceof ContextBudgetExceededError) {
       return {
         messageId: streamInfo.messageId,
@@ -4926,7 +4952,8 @@ export class StreamManager {
    * Categorizes errors for better error handling (used for event emission)
    */
   private categorizeError(error: unknown): StreamErrorType {
-    if (error instanceof ContextBudgetExceededError) return "context_budget_blocked";
+    if (error instanceof ContextBudgetExceededError || error instanceof ContextBudgetBlockedError)
+      return "context_budget_blocked";
     if (error instanceof StreamTruncatedError) {
       return "stream_truncated";
     }

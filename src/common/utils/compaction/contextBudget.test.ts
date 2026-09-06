@@ -90,9 +90,9 @@ describe("step budget decisions", () => {
     }
   );
 
-  test("disabled auto-compaction suppresses proactive decisions even above the ceiling", () => {
+  test("disabled auto-compaction blocks the hard ceiling without proactive rollover", () => {
     expect(evaluate({ contextTokens: 1_000_000, threshold: 1 })).toMatchObject({
-      decision: "continue",
+      decision: "block",
       hardCeiling: 100_000 - OUTPUT_RESERVE_TOKENS,
     });
   });
@@ -197,6 +197,15 @@ describe("small-model context budgets", () => {
       });
     }
   );
+});
+
+test("measured dense tool tokens enforce the hard ceiling while ordinary proactive estimates remain conservative", () => {
+  expect(
+    evaluate({ threshold: 1, contextTokens: 1000, toolResultChars: 100, toolResultTokens: 100000 })
+  ).toMatchObject({ decision: "block", flushOpportunity: false });
+  expect(
+    evaluate({ contextTokens: 55000, toolResultChars: 20000, toolResultTokens: 10 }).decision
+  ).toBe("warn");
 });
 
 describe("request estimates", () => {

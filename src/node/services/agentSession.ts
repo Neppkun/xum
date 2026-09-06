@@ -1,3 +1,4 @@
+import { estimateFreshRequestTokensForModel } from "./contextBudgetCounting";
 import type { RequestAssemblySnapshot } from "./events/eventSpine";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
@@ -11,7 +12,6 @@ import {
 } from "@/common/constants/contextBudget";
 import {
   evaluateStepBudget,
-  estimateFreshRequestTokens,
   getContextBudgetHardCeiling,
 } from "@/common/utils/compaction/contextBudget";
 import {
@@ -4877,8 +4877,14 @@ export class AgentSession {
       if (!history.success) return Err(createUnknownSendMessageError(history.error));
       const user = history.data.findLast((row) => row.id === this.activeStreamUserMessageId);
       if (!user) return Ok(undefined);
+      const preludeIds = new Set(
+        getRequestPreludeMessageIds(user.metadata?.requestPreludeMessageIds)
+      );
       const priorRows = history.data.filter(
-        (row) => row !== user && !isSyntheticSnapshotUserMessage(row)
+        (row) =>
+          row !== user &&
+          !isSyntheticSnapshotUserMessage(row) &&
+          !(preludeIds.has(row.id) && row.role === "assistant" && row.metadata?.synthetic === true)
       );
       if (!hasRolloverEligibleMessages(priorRows)) return Ok(undefined);
       const maxTokens = getEffectiveContextLimit(
@@ -4916,9 +4922,6 @@ export class AgentSession {
       };
       // Snapshot/payload rows are part of the accepted request, not just its
       // fixed trigger. Preserve their roles and rebind server-owned ID references.
-      const preludeIds = new Set(
-        getRequestPreludeMessageIds(user.metadata?.requestPreludeMessageIds)
-      );
       const requestPrelude = [...preludeIds].flatMap((id) => {
         const row = history.data.findLast((message) => message.id === id);
         // Tolerant history parsing can drop a damaged snapshot or payload while
@@ -5080,9 +5083,16 @@ export class AgentSession {
       .map((part) => part.text)
       .join("\n");
     const attachments = userMessage.parts.filter((part) => part.type === "file");
+    const budgetModel = {
+      model: options.model,
+      metadataModel: resolveModelForMetadata(options.model, providersConfig),
+    };
+    const newRequestTokens = await estimateFreshRequestTokensForModel(
+      { userText, attachments, systemFloorTokens: 0, modelContextLimit: maxTokens },
+      budgetModel
+    );
     const decision = evaluateStepBudget({
-      contextTokens:
-        contextTokens + estimateFreshRequestTokens({ userText, attachments, systemFloorTokens: 0 }),
+      contextTokens: contextTokens + newRequestTokens,
       outputTokens: tokenCount(lastAssistant?.metadata?.contextUsage?.outputTokens) ?? 0,
       ...estimateLastStepToolResults(lastAssistant),
       modelContextLimit: maxTokens,
@@ -5113,12 +5123,15 @@ export class AgentSession {
     // Historical input usage includes user/history content, especially for compaction.
     // Without measured system+schema overhead, use the model-scaled fallback; the
     // assembled-request preflight remains authoritative for the actual prompt.
-    const freshEstimate = estimateFreshRequestTokens({
-      userText,
-      attachments,
-      leadIn: rollover ? buildLeadInText(rollover) : undefined,
-      modelContextLimit: maxTokens,
-    });
+    const freshEstimate = await estimateFreshRequestTokensForModel(
+      {
+        userText,
+        attachments,
+        leadIn: rollover ? buildLeadInText(rollover) : undefined,
+        modelContextLimit: maxTokens,
+      },
+      budgetModel
+    );
     if (freshEstimate >= getContextBudgetHardCeiling(maxTokens)) {
       return Err({
         type: "context_budget_blocked",
@@ -5175,15 +5188,10 @@ export class AgentSession {
 
   private async onContextBudgetStepSettled(
     step: SettledStepBudget
-  ): Promise<"continue" | "warn" | "rollover"> {
+  ): Promise<"continue" | "warn" | "rollover" | "block"> {
     const context = this.activeStreamContext;
     const generation = this.contextBudgetGeneration;
-    if (
-      !context?.options ||
-      !this.isTokenBudgetActive(context.options) ||
-      this.compactionMonitor.getThreshold() >= 1
-    )
-      return "continue";
+    if (!context?.options || !this.isTokenBudgetActive(context.options)) return "continue";
     // Fallbacks rebuild this callback's model binding; never use the requested primary's limit.
     context.modelString = step.model;
     this.contextBudgetMemoryWritable = step.memoryWritable;
@@ -5206,11 +5214,12 @@ export class AgentSession {
       outputTokens: step.usage?.outputTokens ?? 0,
       toolResultChars: step.toolResultChars,
       imageParts: step.imageParts,
+      toolResultTokens: step.toolResultTokens,
       modelContextLimit: maxTokens,
       threshold: this.compactionMonitor.getThreshold(),
       warningEmitted: this.contextBudgetWarningClaimed,
     });
-    if (decision.decision === "continue") return "continue";
+    if (decision.decision === "continue" || decision.decision === "block") return decision.decision;
     if (decision.decision === "rollover") {
       const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
       if (!history.success) throw new Error(history.error);

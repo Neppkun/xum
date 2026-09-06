@@ -9,3 +9,8 @@ export class ContextBudgetExceededError extends Error {
     this.name = "ContextBudgetExceededError";
   }
 }
+
+/** A settled hard stop is terminal, not a preflight rejection of the accepted request. */
+export class ContextBudgetBlockedError extends Error {
+  override name = "ContextBudgetBlockedError";
+}
