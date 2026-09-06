@@ -442,6 +442,66 @@ describe("WorkspaceTurnManager settlement authorization", () => {
     expect(await h.readRecord()).toMatchObject({ status: "running" });
   });
 
+  for (const internalResume of [false, true]) {
+    test.each([
+      { id: undefined, parts: [{ type: "text", text: "legacy continuation" }] },
+      { id: null, parts: [null] },
+      { id: 42, parts: undefined },
+      { id: "legacy-manual", parts: [null] },
+    ])(
+      `legacy compaction control evidence survives malformed IDs/parts (internal resume: ${internalResume}): %j`,
+      async (damaged) => {
+        const h = await startTurn();
+        await appendFile(
+          join(h.config.sessionsDir, h.workspaceId, CHAT_FILE_NAME),
+          JSON.stringify({
+            ...damaged,
+            role: "user",
+            metadata: {
+              synthetic: true,
+              cmuxMetadata: {
+                type: "compaction-request",
+                source: "auto-compaction",
+                parsed: {
+                  continueMessage: {
+                    text: "User follow-up",
+                    ...(internalResume ? { dispatchOptions: { source: "internal-resume" } } : {}),
+                  },
+                },
+              },
+            },
+          }) + "\n"
+        );
+        const provider = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+        expect(provider.success).toBe(true);
+        if (!provider.success) throw new Error(provider.error);
+        expect(provider.data.map((row) => row.id)).toEqual(["turn-anchor"]);
+        const control = await h.historyService.getControlEvidenceFromLatestBoundary(h.workspaceId);
+        expect(control.success).toBe(true);
+        if (!control.success) throw new Error(control.error);
+        expect(control.data.at(-1)?.id).toBe(damaged.id);
+        await h.appendWake(true);
+        const { causes } = observeCauseInsideLock(h.manager);
+        expect(await h.finish(h.uncorrelatedEnd)).toBe(true);
+        if (internalResume) {
+          expect(causes).not.toHaveBeenCalled();
+          expect(await h.readRecord()).toMatchObject({ status: "running" });
+          expect(h.waiterSettled()).toBe(false);
+        } else {
+          expect(causes).toHaveBeenCalledWith(
+            typeof damaged.id === "string"
+              ? { kind: "manual-supersession", messageId: damaged.id }
+              : { kind: "uncorrelated-conservative-fallback", reason: "invalid-manual-input-id" }
+          );
+          expect(await h.readRecord()).toMatchObject({ status: "interrupted" });
+          expect(await h.waiter).toBeInstanceOf(Error);
+        }
+        expect(control.data.at(-1)?.metadata).toHaveProperty("muxMetadata");
+        expect(control.data.at(-1)?.metadata).not.toHaveProperty("cmuxMetadata");
+      }
+    );
+  }
+
   test("compaction-summary control anchors retain manual ordering after the original anchor is archived", async () => {
     const h = await startTurn();
     await h.append(

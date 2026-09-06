@@ -359,16 +359,15 @@ export function readHistoryControlEvidenceFromLatestBoundary(
   paths: Record<HistoryArtifact, string>,
   skip: number
 ): Promise<HistoryControlRow[]> {
-  return readHistoryProjectionFromLatestBoundary(paths, skip, (value) => {
-    const row = isReadableHistoryMessage(value) ? normalizeLegacyMuxMetadata(value) : value;
+  return readHistoryProjectionFromLatestBoundary(paths, skip, (row) => {
     if (!isPlainObject(row)) return null;
     if (row.role !== "user" && row.role !== "assistant" && row.role !== "system") return null;
     // Damaged metadata cannot hide recognized control input or establish synthetic status.
-    return {
+    return normalizeLegacyMuxMetadata<HistoryControlRow>({
       ...("id" in row ? { id: row.id } : {}),
       role: row.role,
       ...(isPlainObject(row.metadata) ? { metadata: row.metadata } : {}),
-    };
+    });
   });
 }
 
