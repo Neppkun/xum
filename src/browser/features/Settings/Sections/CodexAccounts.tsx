@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type Ref } from "react";
+import { useEffect, useRef, useState, type Ref } from "react";
 import { useSettings, type CodexAccountSettingsIntent } from "@/browser/contexts/SettingsContext";
 import { Loader2 } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
@@ -120,16 +120,14 @@ export function CodexAccounts() {
     operation.catch((err: unknown) => setError(getErrorMessage(err)));
   }
 
-  const startRename = useCallback(
-    (account: Account) => {
-      if (rename?.id === account.id) {
-        renameRef.current?.focus();
-        return;
-      }
-      setRename(account);
-    },
-    [rename?.id]
-  );
+  /* eslint-disable react-hooks/exhaustive-deps -- React Compiler owns callback memoization. Keep the intent effect dependencies explicit. */
+  function startRename(account: Account) {
+    if (rename?.id === account.id) {
+      renameRef.current?.focus();
+      return;
+    }
+    setRename(account);
+  }
 
   async function saveName() {
     if (!api || !rename) return;
@@ -137,97 +135,90 @@ export function CodexAccounts() {
     if (await mutate(() => api.codexOauth.renameAccount(input))) setRename(null);
   }
 
-  const refreshState = useCallback(async () => {
+  async function refreshState() {
     await Promise.all([refresh(), refreshProjects()]);
-  }, [refresh, refreshProjects]);
+  }
 
-  const mutate = useCallback(
-    async (operation: () => Promise<Result<void, string>>) => {
-      setBusy(true);
-      setError(null);
-      try {
-        const result = await operation();
-        if (!result.success) {
-          setError(result.error);
-          return false;
-        }
-        await refreshState();
-        return true;
-      } catch (err) {
-        setError(getErrorMessage(err));
+  async function mutate(operation: () => Promise<Result<void, string>>) {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await operation();
+      if (!result.success) {
+        setError(result.error);
         return false;
-      } finally {
+      }
+      await refreshState();
+      return true;
+    } catch (err) {
+      setError(getErrorMessage(err));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function disconnect(accountId: string) {
+    if (!api) return;
+    runAction(mutate(() => api.codexOauth.disconnect({ accountId })));
+  }
+
+  async function connect(device: boolean, input: LoginInput) {
+    if (!api) return;
+    const attempt = ++attemptRef.current;
+    const isCurrent = () => mountedRef.current && attempt === attemptRef.current;
+    setLoginInProgress(true);
+    setBusy(true);
+    setError(null);
+    try {
+      let nextFlow: LoginFlow;
+      if (device || !showBrowser) {
+        const result = await api.codexOauth.startDeviceFlow(input);
+        if (!result.success) throw new Error(result.error);
+        const { flowId, userCode, verifyUrl } = result.data;
+        nextFlow = {
+          flowId,
+          userCode,
+          url: verifyUrl,
+          cancel: () => api.codexOauth.cancelDeviceFlow({ flowId }),
+        };
+      } else {
+        const result = await api.codexOauth.startDesktopFlow(input);
+        if (!result.success) throw new Error(result.error);
+        const { flowId, authorizeUrl } = result.data;
+        nextFlow = {
+          flowId,
+          url: authorizeUrl,
+          cancel: () => api.codexOauth.cancelDesktopFlow({ flowId }),
+        };
+      }
+      if (!isCurrent()) {
+        await nextFlow.cancel();
+        return;
+      }
+      flowRef.current = nextFlow;
+      setFlow(nextFlow);
+      const result =
+        nextFlow.userCode != null
+          ? await api.codexOauth.waitForDeviceFlow({ flowId: nextFlow.flowId })
+          : await api.codexOauth.waitForDesktopFlow({ flowId: nextFlow.flowId });
+      if (!isCurrent()) return;
+      if (!result.success) throw new Error(result.error);
+      setLabel("");
+      await refreshState();
+    } catch (err) {
+      if (isCurrent()) setError(getErrorMessage(err));
+    } finally {
+      if (isCurrent()) {
+        flowRef.current = null;
+        setFlow(null);
+        setLoginInProgress(false);
         setBusy(false);
       }
-    },
-    [refreshState]
-  );
+    }
+  }
 
-  const disconnect = useCallback(
-    (accountId: string) => {
-      if (!api) return;
-      runAction(mutate(() => api.codexOauth.disconnect({ accountId })));
-    },
-    [api, mutate]
-  );
-
-  const connect = useCallback(
-    async (device: boolean, input: LoginInput) => {
-      if (!api) return;
-      const attempt = ++attemptRef.current;
-      const isCurrent = () => mountedRef.current && attempt === attemptRef.current;
-      setLoginInProgress(true);
-      setBusy(true);
-      setError(null);
-      try {
-        let nextFlow: LoginFlow;
-        if (device || !showBrowser) {
-          const result = await api.codexOauth.startDeviceFlow(input);
-          if (!result.success) throw new Error(result.error);
-          const { flowId, userCode, verifyUrl } = result.data;
-          nextFlow = {
-            flowId,
-            userCode,
-            url: verifyUrl,
-            cancel: () => api.codexOauth.cancelDeviceFlow({ flowId }),
-          };
-        } else {
-          const result = await api.codexOauth.startDesktopFlow(input);
-          if (!result.success) throw new Error(result.error);
-          const { flowId, authorizeUrl } = result.data;
-          nextFlow = {
-            flowId,
-            url: authorizeUrl,
-            cancel: () => api.codexOauth.cancelDesktopFlow({ flowId }),
-          };
-        }
-        if (!isCurrent()) {
-          await nextFlow.cancel();
-          return;
-        }
-        flowRef.current = nextFlow;
-        setFlow(nextFlow);
-        const result =
-          nextFlow.userCode != null
-            ? await api.codexOauth.waitForDeviceFlow({ flowId: nextFlow.flowId })
-            : await api.codexOauth.waitForDesktopFlow({ flowId: nextFlow.flowId });
-        if (!isCurrent()) return;
-        if (!result.success) throw new Error(result.error);
-        setLabel("");
-        await refreshState();
-      } catch (err) {
-        if (isCurrent()) setError(getErrorMessage(err));
-      } finally {
-        if (isCurrent()) {
-          flowRef.current = null;
-          setFlow(null);
-          setLoginInProgress(false);
-          setBusy(false);
-        }
-      }
-    },
-    [api, showBrowser, refreshState]
-  );
+  /* eslint-enable react-hooks/exhaustive-deps */
 
   async function cancel() {
     attemptRef.current++;
