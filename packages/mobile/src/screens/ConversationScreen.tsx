@@ -14,6 +14,8 @@ import {
   ArrowDown,
   ArrowUp,
   ChevronDown,
+  ClipboardList,
+  Settings,
   GitCompareArrows,
   ChevronLeft,
   Square,
@@ -33,10 +35,17 @@ import { DEFAULT_THINKING_LEVEL } from "../../../../src/common/types/thinking";
 
 // RN Web reports scrollHeight, which cannot shrink a fixed-height textarea and
 // can expand hidden stack screens. Let the browser size content; native uses its intrinsic measurement.
-const webInputSizing = { fieldSizing: "content", height: "auto" } as const;
+// Focus belongs on the rounded composer. Browser "auto" outlines can still paint at zero width.
+const webInputSizing = {
+  fieldSizing: "content",
+  height: "auto",
+  outlineStyle: "solid",
+  outlineWidth: 0,
+} as const;
 
 export function ConversationScreen(props: {
   client: MobileClient;
+  serverLabel: string;
   workspace: FrontendWorkspaceMetadata;
   signal: AbortSignal;
   connected: boolean;
@@ -47,6 +56,7 @@ export function ConversationScreen(props: {
   draft: string;
   onDraftChange: (value: SetStateAction<string>) => void;
   onChanges: () => void;
+  onSettings: () => void;
 }) {
   const { transcript, settings, error, loadOlder, loadingOlder, historyError } = useConversation(
     props.client,
@@ -55,6 +65,7 @@ export function ConversationScreen(props: {
   );
   const draft = props.draft;
   const setDraft = props.onDraftChange;
+  const [inputFocused, setInputFocused] = useState(false);
   const [inputHeight, setInputHeight] = useState(44);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -79,6 +90,7 @@ export function ConversationScreen(props: {
   const ready =
     props.connected && !props.signal.aborted && transcript.caughtUp && !error && settings !== null;
   const running = ready && transcript.streaming;
+  const expanded = inputFocused || draft.length > 0 || running || showSettings !== null;
 
   async function send() {
     if (!ready || !options?.model || !draft.trim() || pending.current || running) return;
@@ -156,28 +168,32 @@ export function ConversationScreen(props: {
       behavior={Platform.OS === "ios" ? "padding" : "height"}
     >
       <View style={styles.header}>
-        <IconButton
-          label="Back to workspaces"
-          icon={ChevronLeft}
-          color={colors.text}
-          onPress={props.onBack}
-        />
+        <View style={styles.headerActions}>
+          <IconButton
+            label="Back to workspaces"
+            icon={ChevronLeft}
+            color={colors.text}
+            onPress={props.onBack}
+          />
+        </View>
         <View style={{ flex: 1, minWidth: 0 }}>
-          <Text style={styles.title} numberOfLines={1}>
+          <Text accessibilityRole="header" style={styles.title} numberOfLines={1}>
             {props.workspace.title ?? props.workspace.name}
           </Text>
           <Text style={styles.subtitle} numberOfLines={1}>
-            {props.workspace.kind === "scratch"
-              ? "Scratch chat"
-              : `${props.workspace.projectName} / ${props.workspace.name}`}
+            {props.workspace.kind === "scratch" ? "Scratch chat" : props.workspace.projectName} ·{" "}
+            {props.serverLabel}
           </Text>
         </View>
-        <IconButton
-          label="View changes"
-          icon={GitCompareArrows}
-          onPress={props.onChanges}
-          disabled={props.workspace.kind === "scratch"}
-        />
+        <View style={styles.headerActions}>
+          <IconButton
+            label="View changes"
+            icon={GitCompareArrows}
+            onPress={props.onChanges}
+            disabled={props.workspace.kind === "scratch"}
+          />
+          <IconButton label="Connection settings" icon={Settings} onPress={props.onSettings} />
+        </View>
       </View>
       <FlatList
         ref={list}
@@ -264,7 +280,55 @@ export function ConversationScreen(props: {
             {actionError}
           </Notice>
         )}
-        <View style={styles.composer}>
+        {/* Keep the input bottommost. Pointer presses retain browser focus until click opens the picker, avoiding blur-driven movement. */}
+        <View style={styles.composerToolbar}>
+          <View style={styles.pickers}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Choose mode"
+              accessibilityState={{ disabled: !settings || !options }}
+              disabled={!settings || !options}
+              onPointerDown={Platform.OS === "web" ? (event) => event.preventDefault() : undefined}
+              onPress={() => setShowSettings("agent")}
+              style={({ pressed }) => [
+                styles.modelButton,
+                { maxWidth: "45%" },
+                pressed && { opacity: 0.6 },
+              ]}
+            >
+              {options?.agentId === "plan" ? (
+                <ClipboardList size={15} color={colors.plan} />
+              ) : (
+                <View style={styles.modeDot} />
+              )}
+              <Text numberOfLines={1} style={styles.modelLabel}>
+                {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Mode"}
+              </Text>
+              <ChevronDown size={12} color={colors.muted} />
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Choose model"
+              accessibilityState={{ disabled: !settings || !options }}
+              disabled={!settings || !options}
+              onPointerDown={Platform.OS === "web" ? (event) => event.preventDefault() : undefined}
+              onPress={() => setShowSettings("model")}
+              style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
+            >
+              <Text numberOfLines={1} style={styles.modelLabel}>
+                {options?.model ? modelName(options.model) : "Model"}
+              </Text>
+              <ChevronDown size={12} color={colors.muted} />
+            </Pressable>
+          </View>
+        </View>
+        <View
+          style={[
+            styles.composer,
+            expanded && styles.expandedComposer,
+            inputFocused && styles.focusedComposer,
+          ]}
+        >
           <TextInput
             accessibilityLabel="Message"
             placeholder={
@@ -274,6 +338,8 @@ export function ConversationScreen(props: {
             value={draft}
             onChangeText={setDraft}
             multiline
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setInputFocused(false)}
             editable={!busy}
             onContentSizeChange={
               Platform.OS === "web"
@@ -283,65 +349,31 @@ export function ConversationScreen(props: {
                       Math.max(44, Math.min(132, event.nativeEvent.contentSize.height))
                     )
             }
-            style={[styles.input, Platform.OS === "web" ? webInputSizing : { height: inputHeight }]}
+            style={[
+              styles.input,
+              expanded && styles.expandedInput,
+              Platform.OS === "web"
+                ? webInputSizing
+                : { height: expanded ? Math.max(72, inputHeight) : 44 },
+            ]}
             selectionColor={colors.accent}
           />
-          <View style={styles.composerToolbar}>
-            <View style={styles.pickers}>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Choose mode"
-                accessibilityState={{ disabled: !settings || !options }}
-                disabled={!settings || !options}
-                onPress={() => setShowSettings("agent")}
-                style={({ pressed }) => [
-                  styles.modelButton,
-                  { maxWidth: "45%" },
-                  pressed && { opacity: 0.6 },
-                ]}
-              >
-                <View
-                  style={[
-                    styles.modeDot,
-                    { backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent },
-                  ]}
-                />
-                <Text numberOfLines={1} style={styles.modelLabel}>
-                  {settings?.agents.find((agent) => agent.id === options?.agentId)?.name ?? "Mode"}
-                </Text>
-                <ChevronDown size={12} color={colors.muted} />
-              </Pressable>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Choose model"
-                accessibilityState={{ disabled: !settings || !options }}
-                disabled={!settings || !options}
-                onPress={() => setShowSettings("model")}
-                style={({ pressed }) => [styles.modelButton, pressed && { opacity: 0.6 }]}
-              >
-                <Text numberOfLines={1} style={styles.modelLabel}>
-                  {options?.model ? modelName(options.model) : "Model"}
-                </Text>
-                <ChevronDown size={12} color={colors.muted} />
-              </Pressable>
-            </View>
-            <View
-              style={[
-                styles.send,
-                ready &&
-                  (running || Boolean(draft.trim())) && {
-                    backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
-                  },
-              ]}
-            >
-              <IconButton
-                label={running ? "Interrupt agent" : "Send message"}
-                icon={running ? Square : ArrowUp}
-                color={ready && (running || Boolean(draft.trim())) ? colors.bright : colors.muted}
-                disabled={!ready || busy || (!running && (!draft.trim() || !options?.model))}
-                onPress={running ? interrupt : send}
-              />
-            </View>
+          <View
+            style={[
+              styles.send,
+              ready &&
+                (running || Boolean(draft.trim())) && {
+                  backgroundColor: options?.agentId === "plan" ? colors.plan : colors.accent,
+                },
+            ]}
+          >
+            <IconButton
+              label={running ? "Interrupt agent" : "Send message"}
+              icon={running ? Square : ArrowUp}
+              color={ready && (running || Boolean(draft.trim())) ? colors.bright : colors.muted}
+              disabled={!ready || busy || (!running && (!draft.trim() || !options?.model))}
+              onPress={running ? interrupt : send}
+            />
           </View>
         </View>
       </View>
@@ -361,14 +393,15 @@ export function ConversationScreen(props: {
 
 const styles = StyleSheet.create({
   header: {
-    minHeight: 56,
-    paddingHorizontal: 8,
+    minHeight: 72,
+    paddingHorizontal: spacing.md,
     flexDirection: "row",
     alignItems: "center",
-    gap: 4,
+    gap: spacing.sm,
   },
-  title: { ...typography.header, color: colors.bright, textAlign: "center", fontSize: 16 },
-  subtitle: { ...typography.footnote, color: colors.muted, textAlign: "center", fontSize: 12 },
+  headerActions: { flexDirection: "row", borderRadius: radii.pill, backgroundColor: colors.panel },
+  title: { ...typography.header, color: colors.bright },
+  subtitle: { ...typography.footnote, color: colors.muted, marginTop: 2 },
   messages: {
     paddingHorizontal: spacing.xl,
     paddingTop: 20,
@@ -400,17 +433,23 @@ const styles = StyleSheet.create({
     width: "100%",
     maxWidth: 760,
     alignSelf: "center",
-    gap: 8,
+    gap: 4,
     backgroundColor: colors.background,
   },
   composer: {
-    borderRadius: radii.sheet,
+    flexDirection: "row",
+    alignItems: "flex-end",
+    borderRadius: radii.pill,
     padding: 6,
     backgroundColor: colors.panel,
     borderColor: colors.border,
     borderWidth: StyleSheet.hairlineWidth,
   },
+  expandedComposer: { borderRadius: radii.sheet },
+  focusedComposer: { borderColor: colors.selection },
+  expandedInput: { minHeight: 72 },
   input: {
+    flex: 1,
     fontFamily,
     minWidth: 0,
     color: colors.bright,
@@ -437,10 +476,10 @@ const styles = StyleSheet.create({
     gap: 6,
     flexShrink: 1,
     paddingHorizontal: 10,
-    backgroundColor: colors.elevated,
+    backgroundColor: colors.panel,
     borderRadius: radii.pill,
   },
-  modeDot: { width: 6, height: 6, borderRadius: 3 },
+  modeDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.accent },
   modelLabel: { fontFamily, color: colors.text, fontSize: 13, fontWeight: "500", flexShrink: 1 },
   send: { borderRadius: 22, overflow: "hidden", backgroundColor: colors.elevated },
   latest: {

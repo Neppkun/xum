@@ -24,6 +24,8 @@ export const colors = {
   scrim: "hsla(240, 3%, 3%, 0.58)",
 };
 
+export const WIDE_LAYOUT_MIN_WIDTH = 900;
+
 export const spacing = { xs: 4, sm: 8, md: 12, lg: 16, xl: 20, xxl: 24, xxxl: 32 };
 export const radii = { control: 12, card: 16, sheet: 24, pill: 999 };
 // TextInput does not inherit Text typography on web; share the native system face explicitly.

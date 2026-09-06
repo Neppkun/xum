@@ -17,7 +17,7 @@ import { SettingsScreen } from "./src/screens/SettingsScreen";
 import { Button, Header, Loading, Notice } from "./src/components/Controls";
 import { useProjects } from "./src/useProjects";
 import { useConnection } from "./src/useConnection";
-import { colors, layout } from "./src/theme";
+import { colors, layout, WIDE_LAYOUT_MIN_WIDTH } from "./src/theme";
 import type { ChatSettings } from "./src/settings";
 
 export type MobileRoutes = {
@@ -201,7 +201,7 @@ function ScreenLayout(props: {
   const { width } = useWindowDimensions();
   return (
     <SafeAreaView style={[layout.fill, { flexDirection: "row" }]}>
-      {width >= 900 && (
+      {width >= WIDE_LAYOUT_MIN_WIDTH && (
         <View style={{ width: 300, borderRightWidth: 1, borderRightColor: colors.border }}>
           <WorkspaceList
             compact
@@ -228,12 +228,14 @@ function ConversationRoute(props: NativeStackScreenProps<MobileRoutes, "Conversa
         <ConversationScreen
           key={workspaceId}
           client={session.connection.client}
+          serverLabel={new URL(session.connection.endpoint).host}
           workspace={workspace}
           signal={session.signal}
           connected={session.ready}
           onReconnect={session.reconnect}
           onBack={() => props.navigation.popTo("Workspaces")}
           onChanges={() => props.navigation.navigate("Changes", { workspaceId })}
+          onSettings={() => props.navigation.navigate("Settings")}
           selection={selections[workspaceId] ?? null}
           onSelectionChange={(value) => setSelection(workspaceId, value)}
           draft={drafts[workspaceId] ?? ""}

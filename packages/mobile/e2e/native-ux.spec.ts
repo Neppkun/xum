@@ -26,7 +26,31 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
     await expect(page.getByRole("textbox", { name: "Bearer token", exact: true })).toBeFocused();
     await page.getByRole("textbox", { name: "Bearer token", exact: true }).fill(token);
     await page.getByRole("button", { name: /^Connect(?: without encryption)?$/ }).click();
-    await expect(page.getByRole("textbox", { name: "Search workspaces" })).toBeVisible();
+    const workspaceSearch = page.getByRole("textbox", { name: "Search workspaces" });
+    const newWorkspace = page.getByRole("button", { name: "New workspace", exact: true }).first();
+    await expect(workspaceSearch).toBeVisible();
+    const viewport = page.viewportSize()!;
+    await expect
+      .poll(async () => {
+        const y = (await workspaceSearch.boundingBox())!.y;
+        return viewport.width < 900 ? y > viewport.height - 130 : y < 180;
+      })
+      .toBe(true);
+    await withinViewport(page, newWorkspace);
+    const searchY = (await workspaceSearch.boundingBox())!.y;
+    await page.getByTestId("workspace-list").evaluate((list) => {
+      list.scrollTop = list.scrollHeight;
+    });
+    await expect.poll(async () => (await workspaceSearch.boundingBox())!.y).toBe(searchY);
+    await workspaceSearch.fill("keep this query while resizing");
+    await page.setViewportSize({
+      width: viewport.width < 900 ? 1200 : 375,
+      height: viewport.height,
+    });
+    await expect(workspaceSearch).toHaveValue("keep this query while resizing");
+    await expect(workspaceSearch).toBeFocused();
+    await page.setViewportSize(viewport);
+    await workspaceSearch.fill("");
 
     await page.getByRole("button", { name: "New workspace", exact: true }).first().click();
     const create = page.getByRole("button", { name: "Create scratch chat", exact: true });
@@ -36,9 +60,52 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
     await expect(page.getByRole("textbox", { name: "Message", exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeDisabled();
     const message = page.getByRole("textbox", { name: "Message", exact: true });
+    await expect(
+      page.getByText(`Scratch chat · ${new URL(endpoint).host}`, { exact: true })
+    ).toBeVisible();
+    await expect.poll(async () => (await message.boundingBox())!.height).toBeLessThanOrEqual(50);
+    const modeControl = page.getByRole("button", { name: "Choose mode", exact: true });
+    const modelControl = page.getByRole("button", { name: "Choose model", exact: true });
+    for (const control of [modeControl, modelControl]) {
+      await expect
+        .poll(async () => {
+          const button = (await control.boundingBox())!;
+          const input = (await message.boundingBox())!;
+          return button.y + button.height <= input.y;
+        })
+        .toBe(true);
+    }
+    await message.focus();
+    await expect(message).toBeFocused();
+    await expect.poll(async () => (await message.boundingBox())!.height).toBeGreaterThan(60);
+    // Pointer-down blurs the input before click: the toolbar must not shift below that press.
+    const modelBounds = (await modelControl.boundingBox())!;
+    await page.mouse.move(
+      modelBounds.x + modelBounds.width / 2,
+      modelBounds.y + modelBounds.height / 2
+    );
+    await page.mouse.down();
+    await expect.poll(async () => (await message.boundingBox())!.height).toBeGreaterThan(60);
+    await expect.poll(async () => (await modelControl.boundingBox())!.y).toBe(modelBounds.y);
+    await expect(page.getByRole("textbox", { name: "Search models" })).toHaveCount(0);
+    await page.mouse.up();
+    await expect(page.getByRole("textbox", { name: "Search models" })).toBeVisible();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await message.focus();
+    await page.getByRole("button", { name: "Choose mode", exact: true }).click();
+    await expect(page.getByRole("radio", { name: /^Plan/ })).toBeVisible();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await modelControl.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("textbox", { name: "Search models" })).toBeVisible();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await message.focus();
     await message.fill("A line of a longer draft\n".repeat(10));
     await expect.poll(async () => (await message.boundingBox())!.height).toBeGreaterThan(80);
     await message.fill("");
+    await expect.poll(async () => (await message.boundingBox())!.height).toBeLessThanOrEqual(80);
+    await page.getByRole("button", { name: "Connection settings", exact: true }).click();
+    await page.getByRole("button", { name: "Back", exact: true }).click();
     await expect.poll(async () => (await message.boundingBox())!.height).toBeLessThanOrEqual(50);
     const draft = "Keep this unsent draft while navigating.";
     await message.fill(draft);
@@ -81,7 +148,7 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
     await page.getByRole("button", { name: "Close", exact: true }).click();
 
     await message.fill("");
-    const viewport = page.viewportSize()!;
+    await message.blur();
     await page.setViewportSize({
       width: viewport.width === 1200 ? 375 : 1200,
       height: viewport.height,
@@ -92,6 +159,15 @@ test("native stack preserves drafts and sheets keep their actions reachable", as
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(
       true
     );
+    // Exercise the relocated send/stop targets through the real disposable server.
+    await message.fill("[mock:tool:parallel-step]");
+    await send.click();
+    const interrupt = page.getByRole("button", { name: "Interrupt agent", exact: true });
+    await expect(interrupt).toBeVisible();
+    await withinViewport(page, interrupt);
+    await interrupt.click();
+    await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeDisabled();
+    await expect(message).toHaveValue("");
     expect(
       await page.evaluate(
         (secret) =>
