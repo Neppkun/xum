@@ -15,6 +15,7 @@ import { buildWorkflowRunCardMessage } from "@/common/utils/workflowRunMessages"
 import { jsonSchema, tool } from "ai";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { createTestHistoryService } from "./testHistoryService";
 
 import {
   assemblePromptPayload,
@@ -143,6 +144,67 @@ describe("prepareProviderRequestMessages", () => {
     expect(result.providerRequestMessages.map((message) => message.id)).toEqual(["new-user"]);
   });
 
+  test.each(["rejected", "workflow", "rejected-workflow", "normal"] as const)(
+    "honors an externally edited reset across archive and active history before %s filtering",
+    async (kind) => {
+      const { historyService, config, cleanup } = await createTestHistoryService();
+      try {
+        const workspaceId = "external-reset-filter";
+        const sessionDir = path.join(config.sessionsDir, workspaceId);
+        await fs.mkdir(sessionDir, { recursive: true });
+        const archived = createMuxMessage("archived-private", "user", "Sealed private context", {
+          historySequence: 0,
+        });
+        const oldActive = createMuxMessage("active-private", "user", "Old private context", {
+          historySequence: 1,
+        });
+        const reset = createMuxMessage("externally-edited-reset", "assistant", "", {
+          historySequence: 2,
+          contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+          ...(kind === "rejected" || kind === "rejected-workflow"
+            ? { contextBudgetRejected: true as const }
+            : {}),
+          ...(kind === "workflow" || kind === "rejected-workflow"
+            ? { muxMetadata: { type: "workflow-run-card-display" as const, runId: "wfr_reset" } }
+            : {}),
+        });
+        const current = createMuxMessage("current-user", "user", "Fresh request", {
+          historySequence: 3,
+        });
+        await fs.writeFile(
+          path.join(sessionDir, "chat-archive.jsonl"),
+          JSON.stringify(archived) + "\n"
+        );
+        // External editors need not use the writer's compact JSON layout. Exercise
+        // the parsed reset when the disk reader's compact-needle fast path misses it.
+        const resetLine = JSON.stringify(reset).replace(
+          '"contextBoundaryKind":"reset"',
+          '"contextBoundaryKind" : "reset"'
+        );
+        await fs.writeFile(
+          path.join(sessionDir, "chat.jsonl"),
+          [JSON.stringify(oldActive), resetLine, JSON.stringify(current)].join("\n") + "\n"
+        );
+        const loaded = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(loaded.success).toBe(true);
+        if (!loaded.success) throw new Error(loaded.error);
+        expect(loaded.data.map((row) => row.id)).toEqual([
+          archived.id,
+          oldActive.id,
+          reset.id,
+          current.id,
+        ]);
+        const prepared = prepareProviderRequestMessages(loaded.data, "openai", "off");
+        expect(prepared.activeContextMessages.map((row) => row.id)).toEqual([current.id]);
+        expect(prepared.providerRequestMessages.map((row) => row.id)).toEqual([current.id]);
+        expect(prepared.contextBoundarySlicedCount).toBe(kind === "normal" ? 3 : 2);
+        expect(await fs.readFile(path.join(sessionDir, "chat.jsonl"), "utf8")).toContain(resetLine);
+      } finally {
+        await cleanup();
+      }
+    }
+  );
+
   test("filters workflow display rows while keeping provider-visible workflow results", () => {
     const trigger = createMuxMessage("workflow-command", "user", "/shallow-review mux", {
       historySequence: 1,
@@ -228,6 +290,40 @@ describe("prepareProviderRequestMessages", () => {
       "head-assistant",
       "compact-req",
     ]);
+  });
+
+  test("preserves keep-recent selection and excludes content filters from the sliced count", () => {
+    const rows = [
+      createMuxMessage("old", "user", "Before reset", { historySequence: 0 }),
+      createMuxMessage("reset", "assistant", "", {
+        historySequence: 1,
+        contextBoundaryKind: CONTEXT_BOUNDARY_KINDS.RESET,
+        contextBudgetRejected: true,
+      }),
+      createMuxMessage("head", "user", "Summarize this", { historySequence: 2 }),
+      createMuxMessage("display", "assistant", "Workflow card", {
+        historySequence: 3,
+        muxMetadata: { type: "workflow-run-card-display", runId: "wfr_1" },
+      }),
+      createMuxMessage("tail", "user", "Preserve this", { historySequence: 4 }),
+      createMuxMessage("tail-answer", "assistant", "Recent answer", { historySequence: 5 }),
+      createMuxMessage("compact", "user", "/compact", {
+        historySequence: 6,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          parsed: {},
+          keepRecentTail: { startHistorySequence: 4 },
+        },
+      }),
+      createMuxMessage("rejected", "user", "Not part of the request", {
+        historySequence: 7,
+        contextBudgetRejected: true,
+      }),
+    ];
+    const prepared = prepareProviderRequestMessages(rows, "openai", "off");
+    expect(prepared.providerRequestMessages.map((row) => row.id)).toEqual(["head", "compact"]);
+    expect(prepared.contextBoundarySlicedCount).toBe(3);
   });
 
   test("keeps whole-epoch summarization for unstamped compaction requests (RLM off)", () => {

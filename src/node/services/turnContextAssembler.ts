@@ -18,7 +18,7 @@ import {
 import type { ModelMessage, SystemModelMessage, Tool } from "ai";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { excludeKeepRecentTailForCompactionRequest } from "@/common/utils/messages/keepRecentTail";
-import { filterWorkflowDisplayOnlyMessages } from "@/common/utils/workflowRunMessages";
+import { isWorkflowDisplayOnlyMessage } from "@/common/utils/workflowRunMessages";
 import type { DesktopCapability } from "@/common/types/desktop";
 import type { ProjectsConfig } from "@/common/types/project";
 import type { XumToolScope } from "@/common/types/toolScope";
@@ -67,16 +67,18 @@ export function prepareProviderRequestMessages(
   providerRequestMessages: MuxMessage[];
   contextBoundarySlicedCount: number;
 } {
-  // Workflow display rows are durable UI history, not main-agent context.
-  const messagesWithoutWorkflowDisplay = filterWorkflowDisplayOnlyMessages(messages).filter(
-    (message) => !message.metadata?.contextBudgetRejected
-  );
+  // A durable reset still seals history when its row is rejected or display-only.
+  // Establish the boundary before any content filter can erase that structural evidence.
+  const boundarySlicedMessages = sliceMessagesForProviderFromLatestContextBoundary(messages);
+  const keepContextRow = (message: MuxMessage) =>
+    !isWorkflowDisplayOnlyMessage(message) && !message.metadata?.contextBudgetRejected;
   // RLM keep-recent floor: a stamped compaction request summarizes only the older head.
   const activeContextMessages = excludeKeepRecentTailForCompactionRequest(
-    sliceMessagesForProviderFromLatestContextBoundary(messagesWithoutWorkflowDisplay)
+    boundarySlicedMessages.filter(keepContextRow)
   );
+  // Count only boundary/keep-recent removals, not the ordinary content filtering above.
   const contextBoundarySlicedCount =
-    messagesWithoutWorkflowDisplay.length - activeContextMessages.length;
+    messages.filter(keepContextRow).length - activeContextMessages.length;
   const preserveReasoningOnly =
     canonicalProviderName === "anthropic" && effectiveThinkingLevel !== "off";
   return {
