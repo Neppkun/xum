@@ -7,6 +7,7 @@ import type { AgentSession } from "./agentSession";
 import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
 import {
   createAgentSessionHarness,
+  createModelRoutingSnapshotMock,
   createStartedTurnHandle,
   createStreamLifecycleMocks,
 } from "./agentSession.testHarness";
@@ -6356,6 +6357,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       aiServiceOverride ??
       ({
         ...createStreamLifecycleMocks(),
+        captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
         on: mock(() => undefined),
         isStreaming: mock(() => false),
       } as unknown as AIService);
@@ -7137,6 +7139,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     let streaming = true;
     const aiService = {
       ...createStreamLifecycleMocks(),
+      captureModelRoutingSnapshot: createModelRoutingSnapshotMock(),
       on: mock(() => undefined),
       isStreaming: mock(() => streaming),
     } as unknown as AIService;
