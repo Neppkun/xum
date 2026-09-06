@@ -228,6 +228,7 @@ export function prepareBudgetTokenCount(content: unknown): BudgetTokenCountInput
 export interface FreshRequestBudgetInput {
   userText: string;
   attachments?: readonly unknown[];
+  prelude?: readonly unknown[];
   leadIn?: string;
   systemFloorTokens?: number;
   modelContextLimit?: number;
@@ -260,6 +261,7 @@ export function prepareFreshRequestTokenCount(
     input.userText,
     input.leadIn ?? "",
     ...(input.attachments ?? []),
+    ...(input.prelude ?? []),
   ]);
   return {
     ...content,

@@ -1,3 +1,6 @@
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import * as budgetCounting from "./contextBudgetCounting";
+import type { MCPServerManager } from "./mcpServerManager";
 import { eventSpine } from "./events/eventSpine";
 import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -105,6 +108,7 @@ describe("AgentSession token-budget lifecycle", () => {
 
   async function setup(args?: {
     previous?: AgentSessionHarness;
+    mcpServerManager?: MCPServerManager;
     failure?: (
       attempt: number
     ) => SendMessageError | undefined | Promise<SendMessageError | undefined>;
@@ -135,6 +139,7 @@ describe("AgentSession token-budget lifecycle", () => {
       captureEvents: true,
       historyService: args?.previous?.historyService,
       config: args?.previous?.config,
+      mcpServerManager: args?.mcpServerManager,
       aiServiceOverrides: {
         streamMessage,
         buildMemorySessionContext: mock(() => Promise.resolve(null)),
@@ -564,6 +569,194 @@ describe("AgentSession token-budget lifecycle", () => {
       } finally {
         unregister();
       }
+    }
+  );
+
+  test.each(
+    (["file", "skill", "mcp", "family"] as const).flatMap((kind) =>
+      [false, true].map((oldContext) => ({ kind, oldContext }))
+    )
+  )(
+    "oversized materialized $kind preludes are rejected before cleanup/publication (oldContext=$oldContext)",
+    async ({ kind, oldContext }) => {
+      const large = ("漢".repeat(100) + "\n").repeat(40);
+      const getPrompt = mock(() => Promise.resolve({ text: large }));
+      const h = await setup({ mcpServerManager: { getPrompt } as unknown as MCPServerManager });
+      if (oldContext) await seedHistory(h, 110_000);
+      const original = await allRows(h);
+      const contextLimit = spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(10000);
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
+      let message = "Use the requested input";
+      let sendOptions = options;
+      if (kind === "file") {
+        await fs.writeFile(path.join(h.config.rootDir, "large.txt"), large);
+        message = "Read @large.txt";
+      } else if (kind === "skill") {
+        spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
+          (id) => id === EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT
+        );
+        const skillDir = path.join(h.config.rootDir, ".xum", "skills", "large-prelude");
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: large-prelude\ndescription: Large test input\n---\n" +
+            "!`printf x >> materializations.marker`\n" +
+            large
+        );
+        sendOptions = {
+          ...options,
+          muxMetadata: {
+            type: "agent-skill",
+            rawCommand: "/large-prelude",
+            skillName: "large-prelude",
+            scope: "project",
+          },
+        };
+      } else if (kind === "mcp") {
+        sendOptions = {
+          ...options,
+          muxMetadata: {
+            type: "normal",
+            mcpPromptRefs: [
+              {
+                serverName: "test",
+                promptName: "large",
+                commandKey: "mcp__test__large",
+                source: "slash",
+              },
+            ],
+          },
+        };
+      }
+      const payload = createMuxMessage("large-family", "assistant", large, {
+        synthetic: true,
+        muxMetadata: { type: "family-message" },
+      });
+      const result = await h.session.sendMessage(
+        message,
+        sendOptions,
+        kind === "family"
+          ? { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+          : undefined
+      );
+      expect(result).toMatchObject({ success: false, error: { type: "context_budget_blocked" } });
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(h.requests).toHaveLength(0);
+      const rows = await allRows(h);
+      expect(rolloverRows(rows)).toHaveLength(0);
+      expect(rows.filter((row) => original.some((old) => old.id === row.id))).toEqual(original);
+      expect(rows.some((row) => text(row).includes(large))).toBe(false);
+      if (kind !== "family") {
+        expect(rows.at(-1)?.metadata?.contextBudgetRejected).toBe(true);
+        expect(rows.at(-1)?.role).toBe("assistant");
+        expect(rows.at(-1)?.parts).toEqual([]);
+      }
+      expect(h.session.getTrackedFilePaths()).toEqual([]);
+      if (kind === "mcp") expect(getPrompt).toHaveBeenCalledTimes(1);
+      if (kind === "skill")
+        expect(
+          await fs.readFile(path.join(h.config.rootDir, "materializations.marker"), "utf8")
+        ).toBe("x");
+
+      // Unpublished snapshots must remain eligible for a later fitting send.
+      contextLimit.mockReturnValue(128000);
+      const retry = await h.session.sendMessage(
+        message,
+        sendOptions,
+        kind === "family"
+          ? { synthetic: true, agentInitiated: true, preTurnMessages: [payload] }
+          : undefined
+      );
+      expect(retry.success).toBe(true);
+      expect(cleanup).toHaveBeenCalledTimes(oldContext ? 1 : 0);
+      expect(h.requests).toHaveLength(1);
+      expect(h.requests[0].messages.some((row) => text(row).includes("漢".repeat(100)))).toBe(true);
+      expect(rolloverRows(await allRows(h))).toHaveLength(oldContext ? 1 : 0);
+      if (kind === "mcp") expect(getPrompt).toHaveBeenCalledTimes(2);
+      if (kind === "skill")
+        expect(
+          await fs.readFile(path.join(h.config.rootDir, "materializations.marker"), "utf8")
+        ).toBe("xx");
+      if (kind === "file")
+        expect(h.session.getTrackedFilePaths()).toContain(path.join(h.config.rootDir, "large.txt"));
+    }
+  );
+
+  test.each(["file", "mcp", "both"] as const)(
+    "fresh admission counts the sum of materialized preludes: %s",
+    async (sources) => {
+      const content = ("漢".repeat(100) + "\n").repeat(16);
+      const getPrompt = mock(() => Promise.resolve({ text: content }));
+      const h = await setup({ mcpServerManager: { getPrompt } as unknown as MCPServerManager });
+      await seedHistory(h, 110_000);
+      spyOn(contextLimits, "getEffectiveContextLimit").mockReturnValue(10000);
+      await fs.writeFile(path.join(h.config.rootDir, "combined.txt"), content);
+      const result = await h.session.sendMessage(
+        sources === "mcp" ? "Use the prompt" : "Use @combined.txt",
+        {
+          ...options,
+          ...(sources !== "file"
+            ? {
+                muxMetadata: {
+                  type: "normal",
+                  mcpPromptRefs: [
+                    {
+                      serverName: "test",
+                      promptName: "small",
+                      commandKey: "mcp__test__small",
+                      source: "slash",
+                    },
+                  ],
+                },
+              }
+            : {}),
+        }
+      );
+      expect(result.success).toBe(sources !== "both");
+      expect(h.requests).toHaveLength(sources === "both" ? 0 : 1);
+      expect(rolloverRows(await allRows(h))).toHaveLength(sources === "both" ? 0 : 1);
+    }
+  );
+
+  test.each(["cancel", "shutdown"] as const)(
+    "%s during materialized preflight leaves old history and context untouched",
+    async (action) => {
+      const h = await setup();
+      await seedHistory(h, 110_000);
+      const before = await allRows(h);
+      const cleanup = spyOn(h.session, "applyContextResetSideEffects");
+      const controller = new AbortController();
+      const cancelState = { canceledBeforeAcceptance: false };
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const count = budgetCounting.estimateFreshRequestTokensForModel;
+      spyOn(budgetCounting, "estimateFreshRequestTokensForModel").mockImplementation(
+        async (input, model) => {
+          const estimate = await count(input, model);
+          if ((input.prelude?.length ?? 0) > 2) {
+            entered.resolve();
+            await release.promise;
+          }
+          return estimate;
+        }
+      );
+      const send = h.session.sendMessage("Handle peer payload", options, {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("pending-family", "assistant", "Peer content", { synthetic: true }),
+        ],
+        cancelSignal: controller.signal,
+        cancelState,
+      });
+      await entered.promise;
+      if (action === "cancel") controller.abort();
+      else h.session.beginShutdown();
+      release.resolve();
+      expect((await send).success).toBe(action === "cancel");
+      expect(cancelState.canceledBeforeAcceptance).toBe(action === "cancel");
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(await allRows(h)).toEqual(before);
+      expect(h.requests).toHaveLength(0);
     }
   );
 

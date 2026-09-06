@@ -15,7 +15,6 @@ import {
   getContextBudgetHardCeiling,
 } from "@/common/utils/compaction/contextBudget";
 import {
-  buildLeadInText,
   createRolloverPrefix,
   createContextBudgetWarning,
   currentContextWindowId,
@@ -3846,6 +3845,26 @@ export class AgentSession {
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: MuxMessage | null = null;
     const tokenBudgetActive = this.isTokenBudgetActive(optionsForStream);
+    const rejectBudgetSend = async (error: SendMessageError) => {
+      if (isManualUserMessage) {
+        const actionable = await this.preserveRejectedManualSend(
+          message,
+          options,
+          error,
+          internal?.enqueuedAtMs
+        );
+        // Rejection does not cancel the user's intervention; match the pricing gate's safety.
+        if (actionable) {
+          await this.applyManualUserMessageGoalSafety({
+            policy: "pause",
+            enqueuedAtMs: internal?.enqueuedAtMs,
+          });
+        }
+      } else {
+        this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(error)));
+      }
+      return Err(error);
+    };
     let contextBudgetPrefix: MuxMessage[] = [];
     let requestAssemblySnapshot: RequestAssemblySnapshot | undefined;
     if (tokenBudgetActive && !editMessageId) {
@@ -3855,24 +3874,7 @@ export class AgentSession {
       await this.seedUsageStateFromHistory();
       const prepared = await this.prepareContextBudgetSend(userMessage, optionsForStream);
       if (!prepared.success) {
-        if (isManualUserMessage) {
-          const actionable = await this.preserveRejectedManualSend(
-            message,
-            options,
-            prepared.error,
-            internal?.enqueuedAtMs
-          );
-          // Rejection does not cancel the user's intervention; match the pricing gate's safety.
-          if (actionable) {
-            await this.applyManualUserMessageGoalSafety({
-              policy: "pause",
-              enqueuedAtMs: internal?.enqueuedAtMs,
-            });
-          }
-        } else {
-          this.emitChatEvent(createStreamErrorMessage(buildStreamErrorEventData(prepared.error)));
-        }
-        return prepared;
+        return rejectBudgetSend(prepared.error);
       }
       contextBudgetPrefix = prepared.data.prefix;
       requestAssemblySnapshot = prepared.data.requestAssemblySnapshot;
@@ -4151,7 +4153,19 @@ export class AgentSession {
         ...mcpPromptSnapshotMessages,
         ...(internal?.preTurnMessages ?? []),
       ];
+      // Admit the exact materialized snapshots, not their short invocation text,
+      // before clearing context state or publishing a reset. Reuse these rows below:
+      // skill directives and MCP prompt expansion must not execute a second time.
       if (requestPrelude.length > 0) {
+        const freshBudget = await this.checkFreshContextBudget(userMessage, optionsForStream, [
+          ...contextBudgetPrefix,
+          ...requestPrelude,
+        ]);
+        if (await cancelBeforeAcceptance()) return Ok(undefined);
+        if (isAdmissionStale() || this.turnAdmissionBlocks > 0 || this.shuttingDown) {
+          return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+        }
+        if (!freshBudget.success) return rejectBudgetSend(freshBudget.error);
         userMessage.metadata = {
           ...userMessage.metadata,
           requestPreludeMessageIds: requestPrelude.map((row) => row.id),
@@ -5046,6 +5060,43 @@ export class AgentSession {
     }
   }
 
+  private async checkFreshContextBudget(
+    userMessage: MuxMessage,
+    options: SendMessageOptions,
+    prelude: readonly MuxMessage[]
+  ): Promise<Result<void, SendMessageError>> {
+    const providersConfig = this.getProvidersConfigSafe();
+    const maxTokens = getEffectiveContextLimit(
+      options.model,
+      this.is1MContextEnabledForModel(options.model, options, providersConfig),
+      providersConfig,
+      { openaiWireFormat: options.providerOptions?.openai?.wireFormat }
+    );
+    if (maxTokens == null || maxTokens <= 0) return Ok(undefined);
+    // Historical usage includes old user/history content, not just system/schema
+    // overhead. Keep the model-scaled floor; final assembly checks the actual prompt.
+    const estimate = await estimateFreshRequestTokensForModel(
+      {
+        userText: userMessage.parts
+          .flatMap((part) => (part.type === "text" ? [part.text] : []))
+          .join("\n"),
+        attachments: userMessage.parts.filter((part) => part.type === "file"),
+        prelude: prelude.map((row) => row.parts),
+        modelContextLimit: maxTokens,
+      },
+      {
+        model: options.model,
+        metadataModel: resolveModelForMetadata(options.model, providersConfig),
+      }
+    );
+    return estimate >= getContextBudgetHardCeiling(maxTokens)
+      ? Err({
+          type: "context_budget_blocked",
+          message: `This message plus its snapshots and system context does not fit in a fresh context window for ${options.model}; shorten it, remove attachments, or use a larger model.`,
+        })
+      : Ok(undefined);
+  }
+
   private async prepareContextBudgetSend(
     userMessage: MuxMessage,
     options: SendMessageOptions
@@ -5160,24 +5211,12 @@ export class AgentSession {
       const access = await this.checkContextBudgetHistoryAccess(options);
       if (!access.success) return access;
     }
-    // Historical input usage includes user/history content, especially for compaction.
-    // Without measured system+schema overhead, use the model-scaled fallback; the
-    // assembled-request preflight remains authoritative for the actual prompt.
-    const freshEstimate = await estimateFreshRequestTokensForModel(
-      {
-        userText,
-        attachments,
-        leadIn: rollover ? buildLeadInText(rollover) : undefined,
-        modelContextLimit: maxTokens,
-      },
-      budgetModel
+    const freshBudget = await this.checkFreshContextBudget(
+      userMessage,
+      options,
+      rollover ? createRolloverPrefix(rollover) : []
     );
-    if (freshEstimate >= getContextBudgetHardCeiling(maxTokens)) {
-      return Err({
-        type: "context_budget_blocked",
-        message: `This message plus the system context does not fit in a fresh context window for ${options.model}; shorten it, remove attachments, or use a larger model.`,
-      });
-    }
+    if (!freshBudget.success) return freshBudget;
     if (rollover) {
       const captured = await this.captureRolloverRequestAssembly();
       if (!captured.success) return captured;
