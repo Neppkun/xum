@@ -43,6 +43,8 @@ The receipt assumes transcript writers honor the history lock during a tracked t
 
 The receipt does not turn history readers into unbounded prefix verifiers. Transcript scan and result budgets remain unchanged, and the receipt itself has a fixed-size read limit. Raw malformed reset candidates must also survive automatic history rewrites: invalidating an old cursor cannot repair a privacy floor that a writer erased before a new query.
 
+Archived sequence coverage is not proof that an active row is a replay. Retrieval retains rows with reused sequences so repaired or imported content remains accessible; possible physical replay duplicates may therefore appear in results.
+
 ## Consequences
 
 - `session_history` list/search/read is bounded: 16 KiB per tool result, 2 MiB scanned, 500 rows, and a 1 MiB per-line cap. Retrieval is scoped to the calling workspace and the manual-reset privacy floor.
