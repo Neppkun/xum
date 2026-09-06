@@ -29,6 +29,7 @@ import { Ok, Err } from "@/common/types/result";
 import { log, type Logger } from "./log";
 import type {
   StreamStartEvent,
+  StreamModelUpdateEvent,
   StreamDeltaEvent,
   StreamEndEvent,
   StreamAbortEvent,
@@ -192,6 +193,7 @@ type StreamToken = string & { __brand: "StreamToken" };
 
 export type TurnEngineEvent =
   | StreamStartEvent
+  | StreamModelUpdateEvent
   | StreamDeltaEvent
   | StreamEndEvent
   | StreamAbortEvent
@@ -3004,6 +3006,7 @@ export class StreamManager {
       // removes/retags the instance mid-stream.
       metadataModel: streamInfo.metadataModel,
       effectiveContextLimit: streamInfo.effectiveContextLimit,
+      modelFallback: streamInfo.initialMetadata?.modelFallback,
       routedThroughGateway,
       ...(routeProvider != null && { routeProvider }),
       historySequence,
@@ -3532,7 +3535,7 @@ export class StreamManager {
     streamInfo.reasoningBackfillStartIndex = preserveParts ? streamInfo.parts.length : undefined;
 
     streamInfo.model = prepared.data.modelString;
-    streamInfo.effectiveContextLimit = prepared.data.effectiveContextLimit;
+    streamInfo.effectiveContextLimit = prepared.data.effectiveContextLimit ?? null;
     streamInfo.metadataModel = this.resolveMetadataModel(
       prepared.data.modelString,
       prepared.data.providersConfig
@@ -3540,15 +3543,21 @@ export class StreamManager {
     if (prepared.data.thinkingLevel !== undefined) {
       streamInfo.thinkingLevel = prepared.data.thinkingLevel;
     }
+    const modelFallback = {
+      requestedModel: fallbackState.requestedModel,
+      refusedModels: [...fallbackState.refusedModels],
+    };
     // Final stream-end metadata spreads initialMetadata, so route attribution
     // corrections and the fallback record propagate automatically.
     streamInfo.initialMetadata = {
       ...streamInfo.initialMetadata,
       ...prepared.data.initialMetadataPatch,
-      modelFallback: {
-        requestedModel: fallbackState.requestedModel,
-        refusedModels: [...fallbackState.refusedModels],
-      },
+      // Missing fallback route fields must not retain the refused gateway's attribution.
+      routedThroughGateway:
+        prepared.data.initialMetadataPatch?.routedThroughGateway ??
+        prepared.data.modelString.startsWith("mux-gateway:"),
+      routeProvider: prepared.data.initialMetadataPatch?.routeProvider,
+      modelFallback,
     };
     // Release the refused model's transport resources now: the stream-exit
     // finally only cleans the final request's model, so without this the
@@ -3556,6 +3565,19 @@ export class StreamManager {
     runLanguageModelCleanup(streamInfo.request.model);
     streamInfo.request = nextRequest;
     streamInfo.streamResult = nextStreamResult;
+    // Publish each accepted attempt before its first step, without restarting stream lifecycle consumers.
+    this.emitTurnEvent({
+      type: "stream-model-update",
+      workspaceId,
+      messageId: streamInfo.messageId,
+      model: metadataModelIdentity(streamInfo.model),
+      metadataModel: streamInfo.metadataModel,
+      effectiveContextLimit: streamInfo.effectiveContextLimit,
+      modelFallback,
+      routedThroughGateway: streamInfo.initialMetadata.routedThroughGateway ?? false,
+      routeProvider: streamInfo.initialMetadata.routeProvider,
+      thinkingLevel: streamInfo.thinkingLevel as ThinkingLevel | undefined,
+    });
     await this.tokenTracker.setModel(streamInfo.model, streamInfo.metadataModel);
     if (
       consumedSwap &&

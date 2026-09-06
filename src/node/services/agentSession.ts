@@ -6658,6 +6658,9 @@ export class AgentSession {
         this.emitChatEvent(payload);
       }
     });
+    forward("stream-model-update", (payload) => {
+      this.emitChatEvent(payload);
+    });
     forward("stream-delta", (payload) => {
       this.markActiveStreamHadAnyOutput();
       this.emitChatEvent(payload);

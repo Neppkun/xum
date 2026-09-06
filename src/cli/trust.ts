@@ -197,32 +197,48 @@ export async function materializeCodexOauthAccount(
   targetProjectPath: string
 ): Promise<void> {
   const projects = realConfig.loadConfigOrDefault().projects;
-  let sourcePath: string | undefined = projects.has(projectDir) ? projectDir : undefined;
+  // Compare physical directories, but retain config keys and exact-path precedence.
+  const resolvedProjectDir = await realpathOrResolve(projectDir);
+  const resolvedProjects = new Map<string, string>();
+  for (const projectPath of projects.keys()) {
+    resolvedProjects.set(projectPath, await realpathOrResolve(projectPath));
+  }
+  const findExactProject = (requestedPath: string, resolvedPath: string): string | undefined =>
+    projects.has(requestedPath)
+      ? requestedPath
+      : Array.from(resolvedProjects).find(([, physicalPath]) => physicalPath === resolvedPath)?.[0];
+  let sourcePath = findExactProject(projectDir, resolvedProjectDir);
   if (sourcePath === undefined) {
     for (const [projectPath, project] of projects) {
-      const workspace = project.workspaces.find((entry) => entry.path === projectDir);
-      if (workspace) {
-        sourcePath =
-          workspace.projects?.[0]?.projectPath ?? workspace.subProjectPath ?? projectPath;
-        break;
+      for (const workspace of project.workspaces) {
+        if ((await realpathOrResolve(workspace.path)) === resolvedProjectDir) {
+          sourcePath =
+            workspace.projects?.[0]?.projectPath ?? workspace.subProjectPath ?? projectPath;
+          break;
+        }
       }
+      if (sourcePath !== undefined) break;
     }
   }
   if (sourcePath === undefined) {
     // An explicit directory can sit below a registered subproject. Keep its account scope.
-    for (const projectPath of projects.keys()) {
-      const relative = path.relative(projectPath, projectDir);
+    let longestMatch = -1;
+    for (const [projectPath, physicalPath] of resolvedProjects) {
+      const relative = path.relative(physicalPath, resolvedProjectDir);
       if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
         continue;
       }
-      if (sourcePath === undefined || projectPath.length > sourcePath.length) {
+      if (physicalPath.length > longestMatch) {
         sourcePath = projectPath;
+        longestMatch = physicalPath.length;
       }
     }
   }
   sourcePath ??=
     (await findMainRepoDir(projectDir)) ?? (await findGitRoot(projectDir)) ?? projectDir;
-  const accountId = projects.get(sourcePath)?.codexOauthAccountId;
+  const sourceKey = findExactProject(sourcePath, await realpathOrResolve(sourcePath));
+  const accountId =
+    sourceKey === undefined ? undefined : projects.get(sourceKey)?.codexOauthAccountId;
   await targetConfig.editConfig((config) => {
     const project = config.projects.get(targetProjectPath) ?? { workspaces: [] };
     if (accountId === undefined) {

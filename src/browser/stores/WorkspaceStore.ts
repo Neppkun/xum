@@ -913,6 +913,12 @@ export class WorkspaceStore {
       // fresh recompute regardless of how the previous one was wound down.
       this.streamingStatsStore.bump(workspaceId);
     },
+    "stream-model-update": (workspaceId, aggregator, data) => {
+      applyWorkspaceChatEventToAggregator(aggregator, data);
+      this.states.bump(workspaceId);
+      this.usageStore.bump(workspaceId);
+      this.streamingStatsStore.bump(workspaceId);
+    },
     "stream-lifecycle": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.states.bump(workspaceId);

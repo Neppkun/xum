@@ -8,6 +8,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   StreamEndEventSchema,
   StreamStartEventSchema,
+  StreamModelUpdateEventSchema,
   ToolCallStartEventSchema,
   UsageDeltaEventSchema,
 } from "@/common/orpc/schemas/stream";
@@ -4187,6 +4188,119 @@ describe("StreamManager - empty stream completions", () => {
     expect(committed?.metadata?.finishReason).toBe("content-filter");
     expect(committed?.metadata?.usage).toBeUndefined();
   });
+
+  test.each([false, true])(
+    "publishes every fallback before usage while preserving parts: %s",
+    async (preserveParts) => {
+      const streamManager = new StreamManager(historyService);
+      const workspaceId = "fallback-metadata-workspace";
+      const messageId = "fallback-metadata-message";
+      const models = ["openai:gpt-5.5", "openai:gpt-5.6-sol"];
+      const limits = [272_000, null];
+      const entered = models.map(() => Promise.withResolvers<void>());
+      const release = models.map(() => Promise.withResolvers<void>());
+      const events: TurnEngineEvent[] = [];
+      streamManager.setEventSink((event) => {
+        events.push(event);
+      });
+      await appendPartialAssistantForTests(workspaceId, messageId, 1);
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      });
+      let attempt = 0;
+      Reflect.set(streamManager, "createStreamResult", () => {
+        const index = attempt++;
+        return createStreamResultForTests(
+          (async function* () {
+            entered[index].resolve();
+            await release[index].promise;
+            if (index === 0) {
+              yield { type: "finish", finishReason: "content-filter" };
+            } else {
+              yield { type: "text-delta", text: "fallback answer" };
+              yield { type: "finish", finishReason: "stop" };
+            }
+          })()
+        );
+      });
+      const streamInfo = createStreamInfoForTests({
+        messageId,
+        model: KNOWN_MODELS.SONNET.id,
+        effectiveContextLimit: 200_000,
+        initialMetadata: { routedThroughGateway: true, routeProvider: "mux-gateway" },
+        streamResult: createStreamResultForTests(
+          (async function* () {
+            await Promise.resolve();
+            if (preserveParts) yield { type: "text-delta", text: "partial answer" };
+            yield {
+              type: "finish-step",
+              usage: { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 },
+            };
+            yield { type: "finish", finishReason: "content-filter" };
+          })()
+        ),
+        modelFallback: {
+          options: {
+            chain: models,
+            prepare: (modelString: string) =>
+              Promise.resolve(
+                Ok({
+                  model: createTestLanguageModel(modelString),
+                  modelString,
+                  effectiveContextLimit: limits[models.indexOf(modelString)],
+                  messages: [],
+                  system: "fallback",
+                  tools: undefined,
+                })
+              ),
+          },
+          requestedModel: KNOWN_MODELS.SONNET.id,
+          refusedModels: [],
+          original: { maxOutputTokens: undefined },
+        },
+      });
+      getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+      const processing = getProcessStreamWithCleanupForTests(streamManager).call(
+        streamManager,
+        workspaceId,
+        streamInfo,
+        1
+      );
+      try {
+        for (let index = 0; index < models.length; index++) {
+          await entered[index].promise;
+          const updates = events.filter((event) => event.type === "stream-model-update");
+          expect(updates).toHaveLength(index + 1);
+          const update = StreamModelUpdateEventSchema.parse(updates[index]);
+          expect(update.model).toBe(models[index]);
+          expect(update.metadataModel).toBe(models[index]);
+          expect(update.effectiveContextLimit).toBe(limits[index]);
+          expect(update.routedThroughGateway).toBe(false);
+          expect(update.routeProvider).toBeUndefined();
+          expect(update.modelFallback.refusedModels).toHaveLength(index + 1);
+          expect(events.filter((event) => event.type === "usage-delta")).toHaveLength(1);
+          expect(
+            events.filter((event) => event.type === "stream-start" && !event.replay)
+          ).toHaveLength(1);
+          expect((streamInfo.parts as Array<{ text: string }>).map((part) => part.text)).toEqual(
+            preserveParts ? ["partial answer"] : []
+          );
+          await streamManager.replayStream(workspaceId);
+          const replayStart = events.findLast((event) => event.type === "stream-start");
+          expect(StreamStartEventSchema.parse(replayStart)).toMatchObject({
+            model: models[index],
+            effectiveContextLimit: limits[index],
+            modelFallback: update.modelFallback,
+          });
+          release[index].resolve();
+        }
+      } finally {
+        for (const gate of release) gate.resolve();
+        await processing;
+      }
+    }
+  );
 
   test("zero-output refusal with a configured fallback chain swaps models without any error event", async () => {
     const streamManager = new StreamManager(historyService);

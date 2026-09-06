@@ -153,6 +153,146 @@ describe("xum trust CLI", () => {
     ).toBeUndefined();
   });
 
+  test("copies a physical non-git project's account through a requested symlink", async () => {
+    using tmp = new DisposableTempDir("codex-requested-symlink");
+    const real = new Config(path.join(tmp.path, "real"));
+    const target = new Config(path.join(tmp.path, "target"));
+    const projectPath = path.join(tmp.path, "project");
+    const alias = path.join(tmp.path, "alias");
+    await fs.mkdir(projectPath);
+    await fs.symlink(projectPath, alias, "junction");
+    await real.editConfig((config) => {
+      config.projects.set(projectPath, { workspaces: [], codexOauthAccountId: "work" });
+      return config;
+    });
+    await materializeCodexOauthAccount(real, target, alias, alias);
+    expect(target.loadConfigOrDefault().projects.get(alias)?.codexOauthAccountId).toBe("work");
+  });
+
+  test("resolves linked worktree fallback through a registered repository alias", async () => {
+    using tmp = new DisposableTempDir("codex-linked-worktree-alias");
+    const real = new Config(path.join(tmp.path, "real"));
+    const target = new Config(path.join(tmp.path, "target"));
+    const repo = path.join(tmp.path, "repo");
+    const repoAlias = path.join(tmp.path, "repo-alias");
+    const worktree = path.join(tmp.path, "worktree");
+    const worktreeAlias = path.join(tmp.path, "worktree-alias");
+    await fs.mkdir(repo);
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git -c user.name=Test -c user.email=test@example.com commit --allow-empty -m init`
+      .cwd(repo)
+      .quiet();
+    await Bun.$`git worktree add ${worktree} -b feature`.cwd(repo).quiet();
+    await fs.mkdir(path.join(worktree, "src"));
+    await fs.symlink(repo, repoAlias, "junction");
+    await fs.symlink(worktree, worktreeAlias, "junction");
+    await real.editConfig((config) => {
+      config.projects.set(repoAlias, { workspaces: [], codexOauthAccountId: "work" });
+      return config;
+    });
+    await materializeCodexOauthAccount(
+      real,
+      target,
+      path.join(worktreeAlias, "src"),
+      worktreeAlias
+    );
+    expect(target.loadConfigOrDefault().projects.get(worktreeAlias)?.codexOauthAccountId).toBe(
+      "work"
+    );
+  });
+
+  test.each(["work", undefined])(
+    "resolves non-git account scopes through directory aliases: %s",
+    async (accountId) => {
+      using tmp = new DisposableTempDir("codex-symlink-account");
+      const real = new Config(path.join(tmp.path, "real"));
+      const target = new Config(path.join(tmp.path, "target"));
+      const root = path.join(tmp.path, "project");
+      const subproject = path.join(root, "packages", "api");
+      const rootAlias = path.join(tmp.path, "a-long-parent-alias");
+      const subprojectAlias = path.join(tmp.path, "child");
+      const targetProject = path.join(tmp.path, "cli-project");
+      await fs.mkdir(path.join(subproject, "src"), { recursive: true });
+      await fs.mkdir(path.join(root, "packages", "api-other"), { recursive: true });
+      await fs.symlink(root, rootAlias, "junction");
+      await fs.symlink(subproject, subprojectAlias, "junction");
+      await real.editConfig((config) => {
+        // Alias length must not let a parent displace a deeper physical project.
+        config.projects.set(rootAlias, { workspaces: [], codexOauthAccountId: "personal" });
+        config.projects.set(subprojectAlias, { workspaces: [], codexOauthAccountId: accountId });
+        return config;
+      });
+      for (const requestedPath of [
+        subproject,
+        subprojectAlias,
+        path.join(rootAlias, "packages", "api"),
+        path.join(subproject, "src"),
+        path.join(rootAlias, "packages", "api", "src"),
+      ]) {
+        await target.editConfig((config) => {
+          config.projects.set(targetProject, { workspaces: [], codexOauthAccountId: "stale" });
+          return config;
+        });
+        await materializeCodexOauthAccount(real, target, requestedPath, targetProject);
+        const project = target.loadConfigOrDefault().projects.get(targetProject);
+        expect(project?.codexOauthAccountId).toBe(accountId);
+        expect(Object.hasOwn(project ?? {}, "codexOauthAccountId")).toBe(accountId !== undefined);
+      }
+      await materializeCodexOauthAccount(
+        real,
+        target,
+        path.join(root, "packages", "api-other"),
+        targetProject
+      );
+      expect(target.loadConfigOrDefault().projects.get(targetProject)?.codexOauthAccountId).toBe(
+        "personal"
+      );
+      // An exact configured path still wins over another spelling of the same directory.
+      await real.editConfig((config) => {
+        config.projects.set(subproject, { workspaces: [], codexOauthAccountId: "exact" });
+        return config;
+      });
+      await materializeCodexOauthAccount(real, target, subproject, targetProject);
+      expect(target.loadConfigOrDefault().projects.get(targetProject)?.codexOauthAccountId).toBe(
+        "exact"
+      );
+    }
+  );
+
+  test("matches aliased workspace paths and subproject references", async () => {
+    using tmp = new DisposableTempDir("codex-symlink-workspace");
+    const real = new Config(path.join(tmp.path, "real"));
+    const target = new Config(path.join(tmp.path, "target"));
+    const root = path.join(tmp.path, "project");
+    const subproject = path.join(root, "subproject");
+    const subprojectAlias = path.join(tmp.path, "subproject-alias");
+    const checkout = path.join(tmp.path, "checkout");
+    const checkoutAlias = path.join(tmp.path, "checkout-alias");
+    const cliProject = path.join(tmp.path, "cli-project");
+    await fs.mkdir(subproject, { recursive: true });
+    await fs.mkdir(checkout);
+    await fs.symlink(subproject, subprojectAlias, "junction");
+    await fs.symlink(checkout, checkoutAlias, "junction");
+    await real.editConfig((config) => {
+      config.projects.set(root, {
+        codexOauthAccountId: "personal",
+        workspaces: [{ id: "aliased-workspace", path: checkoutAlias, subProjectPath: subproject }],
+      });
+      config.projects.set(subprojectAlias, { workspaces: [], codexOauthAccountId: "work" });
+      return config;
+    });
+    await materializeCodexOauthAccount(real, target, checkout, cliProject);
+    expect(target.loadConfigOrDefault().projects.get(cliProject)?.codexOauthAccountId).toBe("work");
+    await real.editConfig((config) => {
+      delete config.projects.get(subprojectAlias)!.codexOauthAccountId;
+      return config;
+    });
+    await materializeCodexOauthAccount(real, target, checkoutAlias, cliProject);
+    expect(
+      target.loadConfigOrDefault().projects.get(cliProject)?.codexOauthAccountId
+    ).toBeUndefined();
+  });
+
   test.each(["work", undefined])(
     "uses the deepest registered account scope: %s",
     async (accountId) => {

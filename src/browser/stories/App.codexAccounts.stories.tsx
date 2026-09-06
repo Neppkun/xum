@@ -568,7 +568,14 @@ export const DisconnectedDefaultRecoveryPhone: AppStory = {
   play: DisconnectedDefaultRecovery.play,
 };
 
-let contextStream: { finish: () => void; next: () => void; reportUsage: () => void } | undefined;
+let contextStream:
+  | {
+      finish: () => void;
+      next: () => void;
+      reportUsage: () => void;
+      fallback: (model: string, effectiveContextLimit: number | null) => void;
+    }
+  | undefined;
 
 function setupLiveContextLimit(workspaceId = "codex-live-limit") {
   contextStream = undefined;
@@ -592,7 +599,23 @@ function setupLiveContextLimit(workspaceId = "codex-live-limit") {
           effectiveContextLimit,
         });
       };
+      const refusedModels: string[] = [];
+      let currentModel = model;
       contextStream = {
+        fallback: (nextModel, effectiveContextLimit) => {
+          refusedModels.push(currentModel);
+          currentModel = nextModel;
+          emit({
+            type: "stream-model-update",
+            workspaceId,
+            messageId: "context-turn-" + turn,
+            model: nextModel,
+            metadataModel: nextModel,
+            effectiveContextLimit,
+            routedThroughGateway: false,
+            modelFallback: { requestedModel: model, refusedModels: [...refusedModels] },
+          });
+        },
         reportUsage: () =>
           emit({
             type: "usage-delta",
@@ -632,23 +655,30 @@ function setupLiveContextLimit(workspaceId = "codex-live-limit") {
   return client;
 }
 
+async function checkContextMeters(
+  canvasElement: HTMLElement,
+  limit: string,
+  percentage: string,
+  tokens = "100.0k"
+) {
+  const canvas = within(canvasElement);
+  await waitFor(
+    async () => {
+      await expect(
+        canvas.getByRole("button", {
+          name: new RegExp("Context usage: " + tokens + " / " + limit),
+        })
+      ).toHaveAccessibleName(expect.stringContaining(percentage));
+      await expect(canvas.getByTestId("context-usage")).toHaveTextContent(limit);
+      await expect(canvas.getByTestId("context-usage")).toHaveTextContent(percentage);
+    },
+    { timeout: 10000 }
+  );
+}
+
 async function exerciseLiveContextLimit(canvasElement: HTMLElement) {
   const canvas = within(canvasElement);
-  const checkMeters = async (limit: string, percentage: string, tokens = "100.0k") => {
-    await waitFor(
-      async () => {
-        await expect(
-          canvas.getByRole("button", {
-            name: new RegExp("Context usage: " + tokens + " / " + limit),
-          })
-        ).toHaveAccessibleName(expect.stringContaining(percentage));
-        await expect(canvas.getByTestId("context-usage")).toHaveTextContent(limit);
-        await expect(canvas.getByTestId("context-usage")).toHaveTextContent(percentage);
-      },
-      { timeout: 10000 }
-    );
-  };
-  await checkMeters("272.0k", "0.0%", "0");
+  await checkContextMeters(canvasElement, "272.0k", "0.0%", "0");
   // Settings changes must not alter the accepted limit before the first usage event.
   const controls = within(await openAccounts(canvasElement));
   const global = controls.getByRole("combobox", { name: "Global default account" });
@@ -665,14 +695,14 @@ async function exerciseLiveContextLimit(canvasElement: HTMLElement) {
   await userEvent.click(
     canvas.getAllByRole("button", { name: /Close settings|Back to previous page/ })[0]
   );
-  await checkMeters("272.0k", "0.0%", "0");
+  await checkContextMeters(canvasElement, "272.0k", "0.0%", "0");
   if (!contextStream) throw new Error("The live context stream is missing");
   contextStream.reportUsage();
-  await checkMeters("272.0k", "36.8%");
+  await checkContextMeters(canvasElement, "272.0k", "36.8%");
   contextStream.finish();
-  await checkMeters("500.0k", "20.0%");
+  await checkContextMeters(canvasElement, "500.0k", "20.0%");
   contextStream.next();
-  await checkMeters("500.0k", "20.0%");
+  await checkContextMeters(canvasElement, "500.0k", "20.0%");
   if (window.innerWidth < 768) {
     const meter = canvas.getByTestId("context-usage");
     await expect(meter.getBoundingClientRect().right).toBeLessThanOrEqual(window.innerWidth);
@@ -687,6 +717,44 @@ export const LiveContextLimit: AppStory = {
 export const LiveContextLimitPhone: AppStory = {
   ...LiveContextLimit,
   render: () => <AppWithMocks setup={() => setupLiveContextLimit("codex-live-limit-phone")} />,
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
+};
+
+async function exerciseFallbackContextLimit(canvasElement: HTMLElement) {
+  const canvas = within(canvasElement);
+  await checkContextMeters(canvasElement, "272.0k", "0.0%", "0");
+  if (!contextStream) throw new Error("The fallback context stream is missing");
+  contextStream.reportUsage();
+  await checkContextMeters(canvasElement, "272.0k", "36.8%", "100.0k");
+  // No usage follows these updates. Both meters must immediately use each accepted fallback limit.
+  contextStream.fallback("anthropic:claude-sonnet-4-5", 200_000);
+  await checkContextMeters(canvasElement, "200.0k", "0.0%", "0");
+  contextStream.fallback("openai:gpt-5.5", null);
+  await waitFor(async () => {
+    await expect(
+      canvas.getByRole("button", { name: "Context usage: 0 (unknown limit)" })
+    ).toBeVisible();
+    await expect(within(canvas.getByTestId("context-usage")).queryByRole("slider")).toBeNull();
+    await expect(canvas.getByTestId("context-usage")).not.toHaveTextContent("272.0k");
+    await expect(canvas.getByTestId("context-usage")).not.toHaveTextContent("200.0k");
+  });
+  if (window.innerWidth < 768) {
+    await expect(
+      canvas.getByTestId("context-usage").getBoundingClientRect().right
+    ).toBeLessThanOrEqual(window.innerWidth);
+  }
+}
+
+export const FallbackContextLimit: AppStory = {
+  render: () => <AppWithMocks setup={() => setupLiveContextLimit("codex-fallback-limit")} />,
+  play: async ({ canvasElement }) => exerciseFallbackContextLimit(canvasElement),
+};
+
+export const FallbackContextLimitPhone: AppStory = {
+  ...FallbackContextLimit,
+  render: () => <AppWithMocks setup={() => setupLiveContextLimit("codex-fallback-limit-phone")} />,
+  play: async ({ canvasElement }) => exerciseFallbackContextLimit(canvasElement),
   globals: { viewport: { value: "mobile1", isRotated: false } },
   parameters: { pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } } },
 };
