@@ -495,10 +495,6 @@ export class AIService extends EventEmitter {
     return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
   }
 
-  isMockModeEnabled(): boolean {
-    return this.mockModeEnabled;
-  }
-
   releaseMockStreamStartGate(workspaceId: string): void {
     this.mockAiStreamPlayer?.releaseStreamStartGate(workspaceId);
   }

@@ -6492,11 +6492,6 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
     return intervalMs;
   }
 
-  getHeartbeatDefaultIntervalMs(): number {
-    const config = this.config.loadConfigOrDefault();
-    return this.getHeartbeatDefaultIntervalMsFromConfig(config);
-  }
-
   async unsetHeartbeatSettings(workspaceId: string): Promise<Result<void, string>> {
     try {
       const resolved = this.resolveHeartbeatWorkspaceEntry(workspaceId, "unsetHeartbeatSettings");

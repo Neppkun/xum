@@ -623,21 +623,6 @@ export class WorkspaceTurnManager {
     return await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
   }
 
-  async getWorkspaceTurnForExecution(
-    workspaceId: string,
-    executionId: string
-  ): Promise<WorkspaceTurnTaskHandleRecord | null> {
-    const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
-    if (live?.handleId === executionId) {
-      return await this.taskHandleStore.getWorkspaceTurn(live.ownerWorkspaceId, executionId);
-    }
-    return (
-      (await this.taskHandleStore.listAllWorkspaceTurns()).find(
-        (record) => record.handleId === executionId
-      ) ?? null
-    );
-  }
-
   private nextWorkspaceTurnCreatedAt(): string {
     const nowMs = Math.max(Date.now(), this.lastWorkspaceTurnCreatedAtMs + 1);
     this.lastWorkspaceTurnCreatedAtMs = nowMs;
