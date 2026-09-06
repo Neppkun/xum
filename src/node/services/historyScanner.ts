@@ -111,6 +111,226 @@ export function hasAmbiguousResetKeys(text: string): boolean {
   return false;
 }
 
+interface HistoryResetProbe {
+  resetProbe: string;
+  resetStage: 0 | 1 | 2;
+  possibleReset: boolean;
+}
+
+function addHistoryResetProbe(state: HistoryResetProbe, segment: Buffer, reverse: boolean): void {
+  // Oversized tool outputs remain traversable. Only a potential reset
+  // marker is a fail-closed privacy barrier. Match raw bytes (including
+  // nested objects conservatively) without parsing or retaining the row.
+  // Keep only token-sized raw overlap plus a three-stage recognizer.
+  // Junk of arbitrary size may separate intact tokens in unreadable rows;
+  // valid rows isolate their own evidence in deliver() and reset this state.
+  const raw = segment.toString("latin1");
+  const previousLength = state.resetProbe.length;
+  const probe = reverse ? raw + state.resetProbe : state.resetProbe + raw;
+  const tokens = [...probe.matchAll(resetTokenPattern)];
+  if (reverse) tokens.reverse();
+  for (const match of tokens) {
+    // Ignore tokens entirely inside already-consumed overlap. Otherwise
+    // replaying overlap could manufacture the opposite token ordering.
+    if (reverse ? match.index >= raw.length : match.index + match[0].length <= previousLength)
+      continue;
+    const token = decodeResetEscapes(match[0]);
+    if (token === (reverse ? resetValueToken : resetKeyToken)) {
+      if (state.resetStage === 0) state.resetStage = 1;
+    } else if (token === ":" && state.resetStage === 1) state.resetStage = 2;
+    else if (token === (reverse ? resetKeyToken : resetValueToken) && state.resetStage === 2)
+      state.possibleReset = true;
+  }
+  state.resetProbe = reverse
+    ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
+    : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
+}
+
+function classifyHistoryScanRow(text: string, probe: HistoryResetProbe): MuxMessage | null {
+  let rowReset = hasRawResetMarker(text);
+  probe.possibleReset ||= rowReset;
+  try {
+    const raw: unknown = JSON.parse(text);
+    try {
+      rowReset ||= JSON.stringify(raw).includes(SESSION_HISTORY_RESET_NEEDLE);
+      probe.possibleReset ||= rowReset;
+    } catch {
+      rowReset = true;
+      probe.possibleReset = true;
+    }
+    if (rowReset && hasAmbiguousResetKeys(text)) return null;
+    if (!isReadableHistoryMessage(raw)) return null;
+    // A valid row breaks any chain of older/newer malformed fragments.
+    probe.possibleReset = rowReset;
+    return normalizeLegacyMuxMetadata(raw);
+  } catch {
+    return null;
+  }
+}
+
+function historyFileStamp(
+  stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number } | undefined
+): string {
+  return stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` : "missing";
+}
+
+type ProviderHistoryStart =
+  | { kind: "start"; offset: number }
+  | { kind: "exhausted"; oldestBoundary: number | null; boundaryCount: number };
+
+/** Provider-only location: bound row/probe carryover, not the amount of context scanned. */
+async function findProviderHistoryStart(
+  handle: fs.FileHandle,
+  fileSize: number,
+  skip: number
+): Promise<ProviderHistoryStart> {
+  const probe: HistoryResetProbe = { resetProbe: "", resetStage: 0, possibleReset: false };
+  let parts: Buffer[] = [];
+  let size = 0;
+  let rowEnd = fileSize;
+  let unreadableRunEnd: number | null = null;
+  let oldestBoundary: number | null = null;
+  let boundaryCount = 0;
+  const add = (bytes: Buffer) => {
+    addHistoryResetProbe(probe, bytes, true);
+    size += bytes.length;
+    if (size <= SESSION_HISTORY_MAX_LINE_BYTES) parts.push(bytes);
+    else parts = [];
+  };
+  const deliver = (start: number): number | null => {
+    if (size === 0) {
+      rowEnd = start;
+      return null;
+    }
+    const message =
+      size > SESSION_HISTORY_MAX_LINE_BYTES
+        ? null
+        : classifyHistoryScanRow(Buffer.concat(parts.reverse()).toString("utf8"), probe);
+    if (message) unreadableRunEnd = null;
+    else unreadableRunEnd ??= rowEnd;
+    if (message && isDurableContextBoundaryMarker(message)) {
+      oldestBoundary = start;
+      if (boundaryCount++ === skip) return start;
+    } else if (isManualHistoryReset(message, probe.possibleReset)) {
+      // A fragmented marker may end several rows to the right of the key that
+      // completed recognition. Never return any of that unreadable evidence.
+      return unreadableRunEnd ?? rowEnd;
+    }
+    if (message) {
+      probe.resetProbe = "";
+      probe.resetStage = 0;
+      probe.possibleReset = false;
+    }
+    parts = [];
+    size = 0;
+    rowEnd = start;
+    return null;
+  };
+  for (let end = fileSize; end > 0; ) {
+    const start = Math.max(0, end - SESSION_HISTORY_SCAN_CHUNK_BYTES);
+    const chunk = Buffer.alloc(end - start);
+    const read = await handle.read(chunk, 0, chunk.length, start);
+    if (read.bytesRead !== chunk.length) throw new Error("History changed during provider read");
+    let edge = chunk.length;
+    for (let i = chunk.length - 1; i >= 0; i--) {
+      if (chunk[i] !== 10) continue;
+      add(chunk.subarray(i + 1, edge));
+      const offset = deliver(start + i + 1);
+      if (offset !== null) return { kind: "start", offset };
+      edge = i;
+    }
+    add(chunk.subarray(0, edge));
+    end = start;
+  }
+  const offset = deliver(0);
+  return offset === null
+    ? { kind: "exhausted", oldestBoundary, boundaryCount }
+    : { kind: "start", offset };
+}
+
+/** Keep raw location and provider tail reads on one verified snapshot, without write-lock re-entry. */
+export async function readProviderHistoryFromLatestBoundary(
+  paths: Record<HistoryArtifact, string>,
+  skip: number
+): Promise<MuxMessage[]> {
+  assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
+  const files = new Map<HistoryArtifact, { handle: fs.FileHandle; size: number; stamp: string }>();
+  try {
+    for (const artifact of ["chat", "archive"] as const) {
+      let handle: fs.FileHandle;
+      try {
+        handle = await fs.open(paths[artifact], "r");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      // Register before stat so a failed snapshot still closes its descriptor.
+      files.set(artifact, { handle, size: 0, stamp: "missing" });
+      const stat = await handle.stat();
+      files.set(artifact, { handle, size: stat.size, stamp: historyFileStamp(stat) });
+    }
+    const locate = (
+      artifact: HistoryArtifact,
+      skipCount: number
+    ): Promise<ProviderHistoryStart> => {
+      const file = files.get(artifact);
+      return file
+        ? findProviderHistoryStart(file.handle, file.size, skipCount)
+        : Promise.resolve({ kind: "exhausted", oldestBoundary: null, boundaryCount: 0 });
+    };
+    const readTail = async (artifact: HistoryArtifact, offset: number): Promise<MuxMessage[]> => {
+      const file = files.get(artifact);
+      if (!file) return [];
+      assert(offset >= 0 && offset <= file.size, "provider start must be within its snapshot");
+      const buffer = Buffer.alloc(file.size - offset);
+      const read = await file.handle.read(buffer, 0, buffer.length, offset);
+      if (read.bytesRead !== buffer.length) throw new Error("History changed during provider read");
+      const messages: MuxMessage[] = [];
+      for (const line of buffer.toString("utf8").split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const value: unknown = JSON.parse(line);
+          if (isReadableHistoryMessage(value)) messages.push(normalizeLegacyMuxMetadata(value));
+        } catch {
+          // Provider-only self-healing; full/UI history keeps its existing reader.
+        }
+      }
+      return messages;
+    };
+    const chat = await locate("chat", skip);
+    let messages: MuxMessage[];
+    if (chat.kind === "start") messages = await readTail("chat", chat.offset);
+    else {
+      const archive = await locate("archive", skip - chat.boundaryCount);
+      if (archive.kind === "start" || archive.oldestBoundary !== null) {
+        messages = [
+          ...(await readTail(
+            "archive",
+            archive.kind === "start" ? archive.offset : archive.oldestBoundary!
+          )),
+          ...(await readTail("chat", 0)),
+        ];
+      } else if (chat.oldestBoundary !== null)
+        messages = await readTail("chat", chat.oldestBoundary);
+      else messages = [...(await readTail("archive", 0)), ...(await readTail("chat", 0))];
+    }
+    // Foreign writers can replace either pathname while these descriptors stay
+    // open. Never release provider rows assembled from an obsolete raw offset.
+    for (const artifact of ["chat", "archive"] as const) {
+      const stat = await fs.stat(paths[artifact]).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+        return undefined;
+      });
+      if (historyFileStamp(stat) !== (files.get(artifact)?.stamp ?? "missing")) {
+        throw new Error("History changed during provider read");
+      }
+    }
+    return messages;
+  } finally {
+    await Promise.all([...files.values()].map((file) => file.handle.close()));
+  }
+}
+
 export interface BoundedHistoryRow {
   message: MuxMessage;
   windowId: string;
@@ -159,13 +379,9 @@ export async function scanHistoryFilesBounded(
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
     }
-    const fileStamp = (
-      stat: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number } | undefined
-    ) =>
-      stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}` : "missing";
     const initialStamps = new Map<HistoryArtifact, string>();
     for (const artifact of ["chat", "archive"] as const) {
-      initialStamps.set(artifact, fileStamp(await handles.get(artifact)?.stat()));
+      initialStamps.set(artifact, historyFileStamp(await handles.get(artifact)?.stat()));
     }
     const finish = async () => {
       // The mutex excludes local writers, not foreign backends. Never release
@@ -175,7 +391,8 @@ export async function scanHistoryFilesBounded(
           if (error.code !== "ENOENT") throw error;
           return undefined;
         });
-        if (fileStamp(current) !== initialStamps.get(artifact)) throw new Error("stale_cursor");
+        if (historyFileStamp(current) !== initialStamps.get(artifact))
+          throw new Error("stale_cursor");
       }
       return result;
     };
@@ -288,9 +505,11 @@ export async function scanHistoryFilesBounded(
       let parts: Buffer[] = [];
       let size = 0;
       let skipping = position.skippingOversized;
-      let resetProbe = position.resetProbe;
-      let resetStage = position.resetStage;
-      let possibleReset = position.possibleReset;
+      const probe: HistoryResetProbe = {
+        resetProbe: position.resetProbe,
+        resetStage: position.resetStage,
+        possibleReset: position.possibleReset,
+      };
       const deliver = (edge: number): boolean => {
         const start = reverse ? edge : rowEdge;
         const finish = reverse ? (position.oversizedRowEnd ?? rowEdge) : edge;
@@ -301,48 +520,26 @@ export async function scanHistoryFilesBounded(
         }
         result.rowsScanned++;
         let message: MuxMessage | null = null;
-        let rowReset = false;
         if (skipping) result.oversizedLines++;
         else {
-          try {
-            const line = Buffer.concat(reverse ? parts.reverse() : parts).toString("utf8");
-            rowReset = hasRawResetMarker(line);
-            const raw: unknown = JSON.parse(line);
-            // Canonicalize only this bounded row before shape validation so
-            // Unicode-escaped reset keys/values cannot bypass the raw probe.
-            try {
-              rowReset ||= JSON.stringify(raw).includes(SESSION_HISTORY_RESET_NEEDLE);
-              possibleReset ||= rowReset;
-            } catch {
-              // Deep corrupt JSON can parse but overflow stringify's stack.
-              // An unreadable reset candidate must remain a privacy floor.
-              rowReset = true;
-              possibleReset = true;
-            }
-            // Last-key-wins parsing must not disguise a manual reset as a
-            // complete rollover. Reject ambiguous objects before the exemption.
-            if (rowReset && hasAmbiguousResetKeys(line)) throw new Error();
-            if (!isReadableHistoryMessage(raw)) throw new Error();
-            message = normalizeLegacyMuxMetadata(raw);
-          } catch {
-            result.malformedLines++;
-          }
+          message = classifyHistoryScanRow(
+            Buffer.concat(reverse ? parts.reverse() : parts).toString("utf8"),
+            probe
+          );
+          if (!message) result.malformedLines++;
         }
-        // Only adjacent unreadable fragments may form a marker. A valid row
-        // supplies its own decoded evidence and breaks the fragment chain.
-        if (message) possibleReset = rowReset;
-        if (!visit(message, start, finish, skipping, possibleReset)) return false;
+        if (!visit(message, start, finish, skipping, probe.possibleReset)) return false;
         parts = [];
         size = 0;
         skipping = false;
         if (message) {
-          resetProbe = "";
-          resetStage = 0;
-          possibleReset = false;
+          probe.resetProbe = "";
+          probe.resetStage = 0;
+          probe.possibleReset = false;
         }
-        position.resetProbe = resetProbe;
-        position.resetStage = resetStage;
-        position.possibleReset = possibleReset;
+        position.resetProbe = probe.resetProbe;
+        position.resetStage = probe.resetStage;
+        position.possibleReset = probe.possibleReset;
         rowEdge = edge;
         position.byteOffset = edge;
         position.skippingOversized = false;
@@ -364,34 +561,7 @@ export async function scanHistoryFilesBounded(
         if (chunk.length !== length) throw new Error("stale_cursor");
         let segmentEdge = reverse ? chunk.length : 0;
         const add = (segment: Buffer) => {
-          // Oversized tool outputs remain traversable. Only a potential reset
-          // marker is a fail-closed privacy barrier. Match raw bytes (including
-          // nested objects conservatively) without parsing or retaining the row.
-          // Keep only token-sized raw overlap plus a three-stage recognizer.
-          // Junk of arbitrary size may separate intact tokens in unreadable rows;
-          // valid rows isolate their own evidence in deliver() and reset this state.
-          const raw = segment.toString("latin1");
-          const previousLength = resetProbe.length;
-          const probe = reverse ? raw + resetProbe : resetProbe + raw;
-          const tokens = [...probe.matchAll(resetTokenPattern)];
-          if (reverse) tokens.reverse();
-          for (const match of tokens) {
-            // Ignore tokens entirely inside already-consumed overlap. Otherwise
-            // replaying overlap could manufacture the opposite token ordering.
-            if (
-              reverse ? match.index >= raw.length : match.index + match[0].length <= previousLength
-            )
-              continue;
-            const token = decodeResetEscapes(match[0]);
-            if (token === (reverse ? resetValueToken : resetKeyToken)) {
-              if (resetStage === 0) resetStage = 1;
-            } else if (token === ":" && resetStage === 1) resetStage = 2;
-            else if (token === (reverse ? resetKeyToken : resetValueToken) && resetStage === 2)
-              possibleReset = true;
-          }
-          resetProbe = reverse
-            ? probe.slice(0, SESSION_HISTORY_RESET_PROBE_CHARS - 1)
-            : probe.slice(-(SESSION_HISTORY_RESET_PROBE_CHARS - 1));
+          addHistoryResetProbe(probe, segment, reverse);
           size += segment.length;
           if (size > SESSION_HISTORY_MAX_LINE_BYTES) {
             position.oversizedRowEnd ??= rowEdge;
@@ -426,9 +596,9 @@ export async function scanHistoryFilesBounded(
       position.byteOffset = skipping ? cursor : rowEdge;
       position.skippingOversized = skipping;
       if (skipping) {
-        position.resetProbe = resetProbe;
-        position.resetStage = resetStage;
-        position.possibleReset = possibleReset;
+        position.resetProbe = probe.resetProbe;
+        position.resetStage = probe.resetStage;
+        position.possibleReset = probe.possibleReset;
       }
       return false;
     };

@@ -9,6 +9,7 @@ import {
   hasAmbiguousResetKeys,
   isReadableHistoryMessage,
   scanHistoryFilesBounded,
+  readProviderHistoryFromLatestBoundary,
   type BoundedHistoryScanOptions,
 } from "./historyScanner";
 import { getRequestPreludeMessageIds } from "@/common/utils/messages/requestPrelude";
@@ -1802,6 +1803,7 @@ export class HistoryService {
   /**
    * Read messages from a compaction boundary onward.
    * Falls back to full history if no boundary exists (new/uncompacted workspace).
+   * Unreadable reset evidence is a provider privacy floor that skip/fallback cannot cross.
    *
    * @param skip How many boundaries to skip (counting from the latest, across
    *             chat.jsonl and the sealed archive). 0 = read from the latest
@@ -1831,45 +1833,17 @@ export class HistoryService {
     // by older builds so this read (and every later one) stays O(active epoch).
     await this.ensureSealedHistoryRotatedUnlocked(workspaceId);
 
-    const chatPath = this.getChatHistoryPath(workspaceId);
-    const archivePath = this.getChatArchivePath(workspaceId);
-
-    // Try the requested boundary in chat.jsonl, falling back to less-skipped boundaries.
-    let chatBoundaryCount = 0;
-    let chatFallbackOffset: number | null = null;
-    for (let s = skip; s >= 0; s--) {
-      const offset = await this.findLastBoundaryByteOffset(chatPath, s);
-      if (offset !== null) {
-        if (s === skip) {
-          return Ok(await this.readHistoryFromOffset(chatPath, offset));
-        }
-        // chat.jsonl has fewer boundaries than requested; remember its oldest
-        // boundary as a fallback and keep counting into the archive.
-        chatBoundaryCount = s + 1;
-        chatFallbackOffset = offset;
-        break;
-      }
-    }
-
-    // Boundaries older than chat.jsonl live in the sealed archive. A window that
-    // starts at an archive boundary spans the archive tail plus all of chat.jsonl.
-    for (let s = skip - chatBoundaryCount; s >= 0; s--) {
-      const offset = await this.findLastBoundaryByteOffset(archivePath, s);
-      if (offset !== null) {
-        const archived = await this.readHistoryFromOffset(archivePath, offset);
-        const active = await this.readChatHistory(workspaceId);
-        return Ok([...archived, ...active]);
-      }
-    }
-
-    if (chatFallbackOffset !== null) {
-      return Ok(await this.readHistoryFromOffset(chatPath, chatFallbackOffset));
-    }
-
-    // No boundaries at all — workspace is uncompacted, full read is the only option
-    const archived = await this.readArchivedHistory(workspaceId);
-    const active = await this.readChatHistory(workspaceId);
-    return Ok([...archived, ...active]);
+    // Raw privacy floors are provider-only: UI browsing and archival rotation
+    // keep using the shared durable-boundary locator and retain the full log.
+    return Ok(
+      await readProviderHistoryFromLatestBoundary(
+        {
+          chat: this.getChatHistoryPath(workspaceId),
+          archive: this.getChatArchivePath(workspaceId),
+        },
+        skip
+      )
+    );
   }
 
   // ── Sealed-history rotation ─────────────────────────────────────────────
