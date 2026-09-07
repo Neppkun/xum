@@ -4019,7 +4019,9 @@ export class AgentSession {
     // during goal sync or acceptance) keeps its durable, accepted rows but never streams: the Stop
     // saw no turn to abort. The trailing UI-visible row would read as an interrupted turn to
     // startup recovery, so every exit below that skips PREPARING records the same abandon marker a
-    // user-aborted stream leaves, before the send resolves (Stop joins the send for this).
+    // user-aborted stream leaves, before the send resolves (Stop joins the send for this). The
+    // withdrawal can land during any await on the way out, including acceptance I/O, so each exit
+    // runs this check after its last other await.
     const abandonWithdrawnSend = async (): Promise<void> => {
       if (cancelSignal?.aborted === true) {
         await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
@@ -4037,9 +4039,12 @@ export class AgentSession {
       if (cancelSignal != null) {
         // The durable row crossed the point of no return, so every later goal-sync failure must still
         // finalize this monitor wake. Startup recovery can resume the row without redelivering it,
-        // unless a Stop withdrew the wake (marker recorded first, in case acceptance throws).
-        await abandonWithdrawnSend();
-        await internal?.onAccepted?.();
+        // unless a Stop withdrew the wake.
+        try {
+          await internal?.onAccepted?.();
+        } finally {
+          await abandonWithdrawnSend();
+        }
       }
       throw error;
     }
@@ -4056,8 +4061,11 @@ export class AgentSession {
     // wake past the point of no return is already durable, so finalize it before leaving.
     if (this.coordinator.disposed) {
       if (cancelSignal != null && cancellationDisabled) {
-        await abandonWithdrawnSend();
-        await internal?.onAccepted?.();
+        try {
+          await internal?.onAccepted?.();
+        } finally {
+          await abandonWithdrawnSend();
+        }
       }
       return Ok(undefined);
     }
@@ -4163,6 +4171,7 @@ export class AgentSession {
       // callback to revert it — returning without notifying would strand
       // that bookkeeping (r41).
       await notifyAcceptedPreStreamFailure(error);
+      await abandonWithdrawnSend();
       return Err(error);
     }
     // A withdrawn send must not claim PREPARING (see abandonWithdrawnSend); it resolves Ok without
