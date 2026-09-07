@@ -399,66 +399,62 @@ describe("staging and activation", () => {
   test("anchors every locked dependency digest to the registry for each manager's lockfile", async () => {
     const { layout, root } = await fixture();
     const deps = { "zod@4.5.4": sriOf("zod"), "inner@1.0.0": sriOf("inner") };
-    // npm records an aliased install (`aliaspkg@npm:realpkg@1.0.0`) under the alias folder.
-    const alias = { "realpkg@1.0.0": sriOf("realpkg") };
-    const stage = async (
-      manager: InstallLayout["packageManager"],
-      lockfile: string,
-      raw: string
-    ) => {
-      const dir = path.join(root, `stage-${manager}`);
+    const stage = async (label: string, lockfile: string, raw: string) => {
+      const dir = path.join(root, `stage-${label}`);
       await fs.mkdir(dir, { recursive: true });
       await fs.writeFile(path.join(dir, lockfile), raw);
       return dir;
     };
-    const npmLock = JSON.stringify({
-      lockfileVersion: 3,
-      packages: {
-        "": { dependencies: { "@coder/xum": "file:xum-2.0.0.tgz" } },
-        "node_modules/@coder/xum": { version: "2.0.0", resolved: "file:xum-2.0.0.tgz" },
-        "node_modules/zod": {
-          version: "4.5.4",
-          resolved: "https://registry.example.com/zod/-/zod-4.5.4.tgz",
-          integrity: deps["zod@4.5.4"],
+    const npmLock = (packages: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          "": { dependencies: { "@coder/xum": "file:xum-2.0.0.tgz" } },
+          "node_modules/@coder/xum": { version: "2.0.0", resolved: "file:xum-2.0.0.tgz" },
+          "node_modules/zod": {
+            version: "4.5.4",
+            resolved: "https://registry.example.com/zod/-/zod-4.5.4.tgz",
+            integrity: deps["zod@4.5.4"],
+          },
+          "node_modules/zod/node_modules/inner": {
+            version: "1.0.0",
+            resolved: "https://registry.example.com/inner/-/inner-1.0.0.tgz",
+            integrity: deps["inner@1.0.0"],
+          },
+          ...packages,
         },
-        "node_modules/zod/node_modules/inner": {
-          version: "1.0.0",
-          resolved: "https://registry.example.com/inner/-/inner-1.0.0.tgz",
-          integrity: deps["inner@1.0.0"],
-        },
-        "node_modules/bundled": { version: "1.0.0", inBundle: true },
-        "node_modules/aliaspkg": {
-          name: "realpkg",
-          version: "1.0.0",
-          resolved: "https://registry.example.com/realpkg/-/realpkg-1.0.0.tgz",
-          integrity: alias["realpkg@1.0.0"],
-        },
-      },
-    });
-    const pnpmLock = [
-      "lockfileVersion: '9.0'",
-      "packages:",
-      "  '@coder/xum@file:xum-2.0.0.tgz':",
-      "    resolution: {integrity: sha512-unchecked, tarball: file:xum-2.0.0.tgz}",
-      "    version: 2.0.0",
-      "  zod@4.5.4:",
-      `    resolution: {integrity: ${deps["zod@4.5.4"]}}`,
-      "  '/inner@1.0.0(zod@4.5.4)':",
-      `    resolution: {integrity: ${deps["inner@1.0.0"]}}`,
-      "snapshots:",
-      "  zod@4.5.4: {}",
-      "",
-    ].join("\n");
+      });
+    const pnpmLock = (packages: string[] = [], snapshots: string[] = []) =>
+      [
+        "lockfileVersion: '9.0'",
+        "packages:",
+        "  '@coder/xum@file:xum-2.0.0.tgz':",
+        "    resolution: {integrity: sha512-unchecked, tarball: file:xum-2.0.0.tgz}",
+        "    version: 2.0.0",
+        "  zod@4.5.4:",
+        `    resolution: {integrity: ${deps["zod@4.5.4"]}}`,
+        "  '/inner@1.0.0(zod@4.5.4)':",
+        `    resolution: {integrity: ${deps["inner@1.0.0"]}}`,
+        ...packages,
+        "snapshots:",
+        "  '@coder/xum@file:xum-2.0.0.tgz':",
+        "    dependencies:",
+        "      zod: 4.5.4",
+        "  zod@4.5.4:",
+        "    dependencies:",
+        "      inner: 1.0.0(zod@4.5.4)",
+        ...snapshots,
+        "",
+      ].join("\n");
     const stages = {
       bun: await stage("bun", "bun.lock", bunLock("/stage/xum-2.0.0.tgz", deps)),
-      npm: await stage("npm", "package-lock.json", npmLock),
-      pnpm: await stage("pnpm", "pnpm-lock.yaml", pnpmLock),
+      npm: await stage("npm", "package-lock.json", npmLock()),
+      pnpm: await stage("pnpm", "pnpm-lock.yaml", pnpmLock()),
     };
     for (const packageManager of ["bun", "npm", "pnpm"] as const) {
-      const registry = fakeRegistry("2.0.0", undefined, {}, { ...deps, ...alias });
+      const registry = fakeRegistry("2.0.0", undefined, {}, deps);
       const managerLayout = { ...layout, packageManager };
       const expected = [`${layout.registry}/inner/1.0.0`, `${layout.registry}/zod/4.5.4`];
-      if (packageManager === "npm") expected.push(`${layout.registry}/realpkg/1.0.0`);
       expect(
         await verifyStagedDependencies(managerLayout, stages[packageManager], registry.request)
       ).toBe(expected.length);
@@ -506,17 +502,111 @@ describe("staging and activation", () => {
       await expectFailure(() => verifyStagedDependencies(layout, dir, registry.request));
       expect(registry.calls).toHaveLength(0);
     }
-    // Bundled packages ship inside their parent's verified tarball and are never fetched.
-    const bundled =
-      '    "bundled": ["bundled@1.0.0", "", { "bundled": true }, "sha512-unchecked"],';
+    // Redirected metadata can present any published package, or the release tarball itself, as
+    // the dependency a package requested; only the requested name may be verified, so a lockfile
+    // recording a different installed name is refused before any registry lookup.
+    const substituted: Array<[InstallLayout["packageManager"], string]> = [
+      [
+        "npm",
+        await stage(
+          "npm-renamed",
+          "package-lock.json",
+          npmLock({
+            "node_modules/is-odd": {
+              name: "is-number",
+              version: "6.0.0",
+              resolved: "https://registry.example.com/is-number/-/is-number-6.0.0.tgz",
+              integrity: sriOf("is-number"),
+            },
+          })
+        ),
+      ],
+      [
+        "npm",
+        await stage(
+          "npm-release",
+          "package-lock.json",
+          npmLock({
+            "node_modules/commander": {
+              name: "@coder/xum",
+              version: "2.0.0",
+              resolved: "file:xum-2.0.0.tgz",
+            },
+          })
+        ),
+      ],
+      [
+        "npm",
+        await stage(
+          "npm-nested-release",
+          "package-lock.json",
+          npmLock({
+            "node_modules/zod/node_modules/@coder/xum": {
+              version: "2.0.0",
+              resolved: "file:xum-2.0.0.tgz",
+            },
+          })
+        ),
+      ],
+      [
+        "npm",
+        await stage(
+          "npm-bundled",
+          "package-lock.json",
+          npmLock({ "node_modules/bundled": { version: "1.0.0", inBundle: true } })
+        ),
+      ],
+      [
+        "pnpm",
+        await stage(
+          "pnpm-renamed",
+          "pnpm-lock.yaml",
+          pnpmLock(
+            ["  is-number@6.0.0:", `    resolution: {integrity: ${sriOf("is-number")}}`],
+            [
+              "  is-number@6.0.0: {}",
+              "  inner@1.0.0(zod@4.5.4):",
+              "    dependencies:",
+              "      is-odd: is-number@6.0.0",
+            ]
+          )
+        ),
+      ],
+      [
+        "bun",
+        await stage(
+          "bun-release",
+          "bun.lock",
+          bunLock(
+            "/stage/xum-2.0.0.tgz",
+            deps,
+            '    "commander": ["@coder/xum@/stage/xum-2.0.0.tgz", {}],'
+          )
+        ),
+      ],
+    ];
+    for (const [packageManager, dir] of substituted) {
+      const registry = fakeRegistry(
+        "2.0.0",
+        undefined,
+        {},
+        { ...deps, "is-number@6.0.0": sriOf("is-number") }
+      );
+      await expectFailure(() =>
+        verifyStagedDependencies({ ...layout, packageManager }, dir, registry.request)
+      );
+      expect(registry.calls).toHaveLength(0);
+    }
+    // A bundled flag is metadata too and exempts nothing: the entry is verified like any other.
+    const bundled = `    "bundled": ["bundled@1.0.0", "", { "bundled": true }, "${sriOf("bundled")}"],`;
     const dir = await stage("bun", "bun.lock", bunLock("/stage/xum-2.0.0.tgz", deps, bundled));
     expect(
       await verifyStagedDependencies(
         layout,
         dir,
-        fakeRegistry("2.0.0", undefined, {}, deps).request
+        fakeRegistry("2.0.0", undefined, {}, { ...deps, "bundled@1.0.0": sriOf("bundled") }).request
       )
-    ).toBe(2);
+    ).toBe(3);
     const unreadable = await stage("bun", "bun.lock", "not a lockfile");
     await expectFailure(() =>
       verifyStagedDependencies(layout, unreadable, fakeRegistry("2.0.0").request)
