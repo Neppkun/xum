@@ -11617,18 +11617,28 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // ACP disconnect, send-now) must not lose monitor output. Start retiring before the abort:
       // consumeCurrent withdraws an in-flight dispatch synchronously and reserves the reconciler
       // lock ahead of the reconcile this abort's idle transition triggers, so the abort itself
-      // never waits behind acceptance I/O. Monitors stay armed for new output. Best-effort, and
-      // never behind the history lock (a wake admission holds it across stream construction).
+      // never waits behind acceptance I/O. The durable consumption commits only once the stop
+      // succeeded: a failed stop leaves the agent running, so its output stays owed. Monitors stay
+      // armed for new output. Best-effort, and never behind the history lock (a wake admission
+      // holds it across stream construction).
+      const stopSettled = Promise.withResolvers<boolean>();
       const retirement =
         options?.retireBashMonitorAttention === true
-          ? this.bashMonitorWakeReconciler.consumeCurrent(workspaceId).catch((error: unknown) => {
-              log.warn("Failed to retire bash monitor attention before Stop", {
-                workspaceId,
-                error,
-              });
-            })
+          ? this.bashMonitorWakeReconciler
+              .consumeCurrent(workspaceId, () => stopSettled.promise)
+              .catch((error: unknown) => {
+                log.warn("Failed to retire bash monitor attention before Stop", {
+                  workspaceId,
+                  error,
+                });
+              })
           : undefined;
-      const stopResult = await session.interruptStream(options);
+      let stopResult: Result<void> | undefined;
+      try {
+        stopResult = await session.interruptStream(options);
+      } finally {
+        stopSettled.resolve(stopResult?.success === true);
+      }
       await retirement;
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.

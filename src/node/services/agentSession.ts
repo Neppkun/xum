@@ -6674,7 +6674,8 @@ export class AgentSession {
             ...this.getContinuousCompactionContext(context.modelString, context.options),
             phase: "mid-stream",
           });
-          this.settleMidStreamCompaction();
+          // The observation's finally settles the pending window only after this dispatches the
+          // continuation; settling earlier would let an idle waiter race the follow-up send.
           await this.finishContinuousCompaction(result === "applied", context);
         });
       } catch (error) {

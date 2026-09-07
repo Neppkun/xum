@@ -661,6 +661,26 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("a failed hard Stop keeps owed attention for the idle wake", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      h.stopStream.mockResolvedValueOnce(Err("stop failed"));
+      expect(
+        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
+          .success
+      ).toBe(false);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(2);
+      await h.complete();
+      await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(2);
+    } finally {
+      await h.finish();
+    }
+  });
+
   test("an interrupt without retireBashMonitorAttention keeps owed attention for the idle wake", async () => {
     const h = await createActiveWakeHarness();
     try {

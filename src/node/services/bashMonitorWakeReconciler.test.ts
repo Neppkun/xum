@@ -186,6 +186,20 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(1);
   });
 
+  test("consumeCurrent withdraws the wake but keeps signals owed when the commit is refused", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const wake = dispatches[0];
+
+    await reconciler.consumeCurrent(OWNER, () => Promise.resolve(false));
+
+    expect(wake.cancelSignal.aborted).toBe(true);
+    expect(acknowledged).toEqual([]);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].cancelSignal.aborted).toBe(false);
+  });
+
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
     rows = [registryRecord()];
 
