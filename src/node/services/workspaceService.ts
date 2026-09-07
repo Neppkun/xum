@@ -11656,9 +11656,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
       await retirement;
       // A wake withdrawn past its point of no return (durable row, not yet PREPARING, so the
-      // session interrupt above saw idle) resolves only after recording the startup abandon marker
-      // for that row. Stop is acknowledged after it settles: a forced exit right after Stop must
-      // not leave the row eligible for startup replay. Its own failure is reported by the dispatch.
+      // session interrupt above saw idle) records the startup abandon marker for that row on every
+      // exit before it resolves, including a failed goal sync or acceptance (see
+      // abandonWithdrawnSend in AgentSession.sendMessage). Stop is acknowledged after it settles: a
+      // forced exit right after Stop must not leave the row eligible for startup replay. The send's
+      // own result is the dispatch's to report.
       await withdrawnWakeSend?.catch(() => undefined);
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.

@@ -262,7 +262,9 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     return { config, historyService, backgroundProcessManager, service, events, cleanup };
   }
 
-  async function createActiveWakeHarness() {
+  async function createActiveWakeHarness(options?: {
+    workspaceGoalService?: WorkspaceGoalService;
+  }) {
     const fixture = await createWakeWiringService();
     const { config, service, historyService, backgroundProcessManager } = fixture;
     const workspaceId = "monitor-attention-owner";
@@ -285,6 +287,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       historyService,
       backgroundProcessManager,
       aiEmitter,
+      workspaceGoalService: options?.workspaceGoalService,
       aiServiceOverrides: {
         isStreaming: () => streaming,
         streamMessage: mock((request: Parameters<AIService["streamMessage"]>[0]) => {
@@ -768,6 +771,43 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       expect(h.requests).toHaveLength(0);
     } finally {
       release.resolve();
+      await h.finish();
+    }
+  });
+
+  test("hard Stop during a wake's goal sync records the abandon marker even when goal sync fails", async () => {
+    let stop: Promise<Result<void>> | undefined;
+    const h = await createActiveWakeHarness({
+      workspaceGoalService: {
+        assertPricedModelForBudgetedGoal: () => Promise.resolve(Ok(undefined)),
+        recordStreamStarted: () => undefined,
+        // Goal sync runs past the point of no return; Stop lands while it is pending.
+        syncGoalModeWithChatTail: () => {
+          stop ??= h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+          return Promise.reject(new Error("goal sync failed"));
+        },
+      } as unknown as WorkspaceGoalService,
+    });
+    try {
+      await h.addAttention(10);
+      expect(stop).toBeDefined();
+      expect((await stop!).success).toBe(true);
+      const sessionInternal = h.session as unknown as { getAutoRetryPreferencePath(): string };
+      const persisted = JSON.parse(
+        await fsPromises.readFile(sessionInternal.getAutoRetryPreferencePath(), "utf-8")
+      ) as { startupAutoRetryAbandon?: { reason: string; userMessageId?: string } };
+      const history = await h.historyService.getHistoryFromLatestBoundary(h.workspaceId);
+      const wakeRow = history.success
+        ? history.data.filter((row) => row.role === "user").at(-1)
+        : undefined;
+      expect(wakeRow).toBeDefined();
+      expect(persisted.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: wakeRow!.id,
+      });
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      expect(h.requests).toHaveLength(0);
+    } finally {
       await h.finish();
     }
   });

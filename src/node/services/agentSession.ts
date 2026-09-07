@@ -4015,6 +4015,16 @@ export class AgentSession {
     if (cancelSignal != null) {
       cancellationDisabled = true;
     }
+    // A cancelable send withdrawn past the point of no return (a hard Stop retiring owed attention
+    // during goal sync or acceptance) keeps its durable, accepted rows but never streams: the Stop
+    // saw no turn to abort. The trailing UI-visible row would read as an interrupted turn to
+    // startup recovery, so every exit below that skips PREPARING records the same abandon marker a
+    // user-aborted stream leaves, before the send resolves (Stop joins the send for this).
+    const abandonWithdrawnSend = async (): Promise<void> => {
+      if (cancelSignal?.aborted === true) {
+        await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
+      }
+    };
     // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
     // is never invoked past this point, so even a failure in goal sync or
     // acceptance leaves the payload + trigger rows durable in the transcript.
@@ -4026,7 +4036,9 @@ export class AgentSession {
     } catch (error) {
       if (cancelSignal != null) {
         // The durable row crossed the point of no return, so every later goal-sync failure must still
-        // finalize this monitor wake. Startup recovery can resume the row without redelivering it.
+        // finalize this monitor wake. Startup recovery can resume the row without redelivering it,
+        // unless a Stop withdrew the wake (marker recorded first, in case acceptance throws).
+        await abandonWithdrawnSend();
         await internal?.onAccepted?.();
       }
       throw error;
@@ -4044,6 +4056,7 @@ export class AgentSession {
     // wake past the point of no return is already durable, so finalize it before leaving.
     if (this.coordinator.disposed) {
       if (cancelSignal != null && cancellationDisabled) {
+        await abandonWithdrawnSend();
         await internal?.onAccepted?.();
       }
       return Ok(undefined);
@@ -4116,6 +4129,7 @@ export class AgentSession {
       if (this.coordinator.thinkingOverride === turnThinkingOverride) {
         this.coordinator.releaseThinkingOverride(turnThinkingOverride);
       }
+      await abandonWithdrawnSend();
       return Err(createUnknownSendMessageError(getErrorMessage(error)));
     }
 
@@ -4151,17 +4165,13 @@ export class AgentSession {
       await notifyAcceptedPreStreamFailure(error);
       return Err(error);
     }
-    // A cancelable send withdrawn past the point of no return (a hard Stop retiring owed
-    // attention during goal sync or acceptance) keeps its durable, accepted rows but must not
-    // claim PREPARING: the Stop saw no turn to abort and has already returned. Withdrawn sends
-    // resolve Ok without a stream, like cancelBeforeAcceptance and the disposed path above. The
-    // trailing UI-visible row would otherwise read as an interrupted turn to startup recovery,
-    // so record the same abandon marker a user-aborted stream leaves.
+    // A withdrawn send must not claim PREPARING (see abandonWithdrawnSend); it resolves Ok without
+    // a stream, like cancelBeforeAcceptance and the disposed path above.
     if (cancelSignal?.aborted === true) {
       if (this.coordinator.thinkingOverride === turnThinkingOverride) {
         this.coordinator.releaseThinkingOverride(turnThinkingOverride);
       }
-      await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
+      await abandonWithdrawnSend();
       return Ok(undefined);
     }
 
