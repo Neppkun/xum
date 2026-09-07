@@ -119,7 +119,7 @@ export function resolveInstallLayout(
       env.npm_config_registry ??
       "https://registry.npmjs.org";
     const url = new URL(registry);
-    // The staged package is executed by the smoke run, so the registry must be TLS-protected; even
+    // The registry is the trust root for the release digest, so it must be TLS-protected; even
     // loopback plaintext can be routed through an inherited HTTP proxy.
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash)
       throw new Error("Unsupported update registry URL");

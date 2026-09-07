@@ -28,7 +28,7 @@ export class ServerUpdater {
   private readonly layout: InstallLayout | null;
   private readonly subscribers = new Set<(status: UpdateStatus) => void>();
   private availableVersion: string | null = null;
-  private stagedEntry: string | null = null;
+  private staged: { entry: string; version: string } | null = null;
   private installing = false;
   private shuttingDown = false;
   private download: { abort: AbortController; settled: Promise<void> } | null = null;
@@ -75,7 +75,7 @@ export class ServerUpdater {
       throw new Error("An update operation is in progress");
     this.channel = channel;
     this.availableVersion = null;
-    this.stagedEntry = null;
+    this.staged = null;
     this.setStatus({ type: "idle" });
   }
 
@@ -85,8 +85,7 @@ export class ServerUpdater {
       this.shuttingDown ||
       this.installing ||
       this.status.type === "checking" ||
-      this.status.type === "downloading" ||
-      this.stagedEntry
+      this.status.type === "downloading"
     )
       return;
     const previous = this.status;
@@ -97,8 +96,15 @@ export class ServerUpdater {
       if (!isExactVersion(version))
         throw new Error("Registry has no valid version for the selected channel");
       this.availableVersion = version === this.layout.version ? null : version;
+      // A staged download stays installable while the channel still points at it, so a re-check
+      // after a failed install returns to the ready state instead of discarding the download.
+      if (this.staged && this.staged.version !== this.availableVersion) this.staged = null;
       this.setStatus(
-        this.availableVersion ? { type: "available", info: { version } } : { type: "up-to-date" }
+        this.staged
+          ? { type: "downloaded", info: { version } }
+          : this.availableVersion
+            ? { type: "available", info: { version } }
+            : { type: "up-to-date" }
       );
     } catch (error) {
       this.setStatus(
@@ -114,7 +120,7 @@ export class ServerUpdater {
       !this.layout ||
       this.shuttingDown ||
       !this.availableVersion ||
-      this.stagedEntry ||
+      this.staged ||
       this.installing ||
       this.status.type === "checking" ||
       this.status.type === "downloading"
@@ -133,12 +139,8 @@ export class ServerUpdater {
 
   private async stage(layout: InstallLayout, version: string, signal: AbortSignal): Promise<void> {
     try {
-      this.stagedEntry = await (this.deps.runInstall ?? stageUpdate)(
-        layout,
-        version,
-        undefined,
-        signal
-      );
+      const entry = await (this.deps.runInstall ?? stageUpdate)(layout, version, { signal });
+      this.staged = { entry, version };
       this.setStatus({ type: "downloaded", info: { version } });
     } catch (error) {
       this.setStatus({ type: "error", phase: "download", message: getErrorMessage(error) });
@@ -153,14 +155,8 @@ export class ServerUpdater {
   }
 
   async installUpdate(): Promise<void> {
-    if (
-      !this.layout ||
-      this.shuttingDown ||
-      !this.stagedEntry ||
-      !this.availableVersion ||
-      this.installing
-    )
-      return;
+    if (!this.layout || this.shuttingDown || !this.staged || this.installing) return;
+    const staged = this.staged;
     this.installing = true;
     try {
       await this.deps.refreshBlockers?.();
@@ -175,13 +171,13 @@ export class ServerUpdater {
         this.installing = false;
         this.setStatus({
           type: "install-blocked",
-          info: { version: this.availableVersion },
+          info: { version: staged.version },
           blockers,
         });
         return;
       }
       // No await between the idle snapshot, atomic swap, and the CLI's shutdown latch.
-      (this.deps.activate ?? activateUpdate)(this.layout, this.stagedEntry);
+      (this.deps.activate ?? activateUpdate)(this.layout, staged.entry);
       await this.deps.restart();
     } catch (error) {
       this.installing = false;

@@ -174,7 +174,7 @@ export function AboutDialog() {
     api.update
       .check({ source: "manual" })
       .catch(console.error)
-      // Clear pending if the backend no-ops (e.g. already downloaded) and emits no status event.
+      // Clear pending if the backend no-ops (e.g. a check is already running) and emits no status event.
       .finally(() => setPendingAction((prev) => (prev === "check" ? null : prev)));
   };
 

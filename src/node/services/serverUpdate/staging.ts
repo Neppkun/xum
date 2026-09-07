@@ -12,18 +12,18 @@ import {
   resolveCliEntry,
   type InstallLayout,
 } from "./installLayout";
+import { downloadArtifact, fetchArtifact, type RegistryRequest } from "./registry";
 
+/** Installs an already verified local tarball; only its dependencies come from the registry. */
 export function installCommand(
   layout: InstallLayout,
-  version: string
+  tarball: string
 ): { file: string; args: string[] } {
-  if (!isExactVersion(version)) throw new Error("Invalid update version");
-  const spec = `@coder/xum@${version}`;
   // CLI flags outrank npmrc files and npm_config_* env, so an inherited strict-ssl=false cannot
   // disable certificate validation for the download. bun has no such setting; its only TLS knob
   // is the env variable runInstall strips.
   const flags = {
-    bun: ["add", "--ignore-scripts", "--exact"],
+    bun: ["add", "--ignore-scripts"],
     npm: [
       "install",
       "--no-global",
@@ -37,7 +37,7 @@ export function installCommand(
   } satisfies Record<InstallLayout["packageManager"], string[]>;
   return {
     file: layout.packageManager,
-    args: [...flags[layout.packageManager], spec, "--registry", layout.registry],
+    args: [...flags[layout.packageManager], tarball, "--registry", layout.registry],
   };
 }
 
@@ -64,8 +64,9 @@ export async function verifyStagedPackage(
   }
   if (process.platform !== "win32" && (stat.mode & 0o111) === 0)
     throw new Error("Staged CLI entry is not executable");
-  // Parse-only: nothing from the registry runs until the operator activates it.
-  using smoke = execFileAsync(process.execPath, ["--check", entry], {
+  // Parse-only: nothing from the registry runs until the operator activates it. The shebang's
+  // interpreter is used because process.execPath may be bun, which has no parse-only mode.
+  using smoke = execFileAsync("node", ["--check", entry], {
     timeoutMs: SERVER_UPDATE_SMOKE_TIMEOUT_MS,
     signal,
   });
@@ -90,13 +91,19 @@ async function runInstall(
   await install.result;
 }
 
+export interface StageOptions {
+  install?: typeof runInstall;
+  request?: RegistryRequest;
+  signal?: AbortSignal;
+}
+
 export async function stageUpdate(
   layout: InstallLayout,
   version: string,
-  install = runInstall,
-  signal?: AbortSignal
+  options: StageOptions = {}
 ): Promise<string> {
-  const command = installCommand(layout, version);
+  const { install = runInstall, request, signal } = options;
+  if (!isExactVersion(version)) throw new Error("Invalid update version");
   // Pruning must never remove the target of a launcher that was re-pointed behind this process.
   if (resolveCliEntry(layout.launcher) !== layout.entry)
     throw new Error("Server launcher changed since startup");
@@ -116,6 +123,16 @@ export async function stageUpdate(
   // Exclusive creation refuses pre-existing links, and never mutates the running installation.
   await fs.mkdir(dir);
   await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ private: true }));
+  // Package managers follow redirects, so the release itself is fetched and digest-checked here
+  // and only the dependency tree is left to the manager, as in the operator's original install.
+  const tarball = path.join(dir, `xum-${version}.tgz`);
+  await downloadArtifact(
+    await fetchArtifact(layout.registry, version, request),
+    tarball,
+    request,
+    signal
+  );
+  const command = installCommand(layout, tarball);
   await install(command.file, command.args, dir, signal);
   return verifyStagedPackage(dir, version, signal);
 }

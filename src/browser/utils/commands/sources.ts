@@ -1496,7 +1496,11 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         title: `Update Channel: ${channel === "stable" ? "Stable" : "Nightly"}`,
         section: section.help,
         keywords: ["update", "channel", channel],
-        run: updateCommand((api) => api.update.setChannel({ channel })),
+        // The dialog reads the channel once when it opens, so the change must land first.
+        run: async () => {
+          if (p.api) await p.api.update.setChannel({ channel }).catch(console.error);
+          openAbout();
+        },
       })),
     ]);
   }
