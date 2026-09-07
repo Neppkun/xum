@@ -235,7 +235,10 @@ describe("server install layout", () => {
     await fs.unlink(path.join(layout.workdir, "package-lock.json"));
     await fs.unlink(path.join(layout.workdir, "bun.lock"));
     expect(resolveInstallLayout(env, argv).supported).toBe(false);
+    // The legacy binary lockfile cannot be verified after staging.
     await fs.writeFile(path.join(layout.workdir, "bun.lockb"), "");
+    expect(resolveInstallLayout(env, argv).supported).toBe(false);
+    await fs.writeFile(path.join(layout.workdir, "bun.lock"), "");
     expect(resolveInstallLayout(env, argv).supported).toBe(true);
     await fs.writeFile(path.join(layout.workdir, "node_modules/@coder/xum/package.json"), "{}");
     expect(resolveInstallLayout(env, argv).supported).toBe(false);
@@ -257,6 +260,9 @@ describe("staging and activation", () => {
     );
     expect(installCommand({ ...layout, packageManager: "pnpm" }, "/x.tgz").args).toContain(
       "--config.strict-ssl=true"
+    );
+    expect(installCommand({ ...layout, packageManager: "bun" }, "/x.tgz").args).toContain(
+      "--save-text-lockfile"
     );
     await expectFailure(() => stageUpdate(layout, "../../escape", fakeRegistry("2.0.0")));
   });
@@ -318,6 +324,13 @@ describe("staging and activation", () => {
       path.join(root, "xum-staging-0.7.0", SERVER_UPDATE_STAGE_MARKER),
       JSON.stringify({ launcher: path.join(root, "other-mux") })
     );
+    // A stage that crashed before taking its final name is marked and pruned as well.
+    const crashed = path.join(root, "xum-staging-1.4.0.a1b2c3");
+    await fs.mkdir(crashed);
+    await fs.writeFile(
+      path.join(crashed, SERVER_UPDATE_STAGE_MARKER),
+      JSON.stringify({ launcher: layout.launcher })
+    );
     // The updater's own earlier stage carries the marker it wrote and is pruned like the stale one.
     await stageUpdate(layout, "1.5.0", { ...fakeRegistry("1.5.0"), install: fakeInstall("1.5.0") });
     const bin = await stageUpdate(layout, "2.0.0", {
@@ -349,6 +362,16 @@ describe("staging and activation", () => {
     );
     expect(await fs.realpath(layout.launcher)).toBe(await fs.realpath(bin));
     expect(await fs.readFile(layout.entry, "utf8")).toBe(oldEntry);
+    // A populated foreign directory under the target name fails the stage and is left intact.
+    await fs.mkdir(path.join(root, "xum-staging-4.0.0"));
+    await fs.writeFile(path.join(root, "xum-staging-4.0.0/keep"), "");
+    await expectFailure(() =>
+      stageUpdate(result.layout, "4.0.0", {
+        ...fakeRegistry("4.0.0"),
+        install: fakeInstall("4.0.0"),
+      })
+    );
+    expect(await fs.readdir(path.join(root, "xum-staging-4.0.0"))).toEqual(["keep"]);
   });
   test("verification rejects mismatched versions, missing entrypoints, and failing smoke runs", async () => {
     const { layout } = await fixture();
@@ -376,6 +399,8 @@ describe("staging and activation", () => {
   test("anchors every locked dependency digest to the registry for each manager's lockfile", async () => {
     const { layout, root } = await fixture();
     const deps = { "zod@4.5.4": sriOf("zod"), "inner@1.0.0": sriOf("inner") };
+    // npm records an aliased install (`aliaspkg@npm:realpkg@1.0.0`) under the alias folder.
+    const alias = { "realpkg@1.0.0": sriOf("realpkg") };
     const stage = async (
       manager: InstallLayout["packageManager"],
       lockfile: string,
@@ -402,6 +427,12 @@ describe("staging and activation", () => {
           integrity: deps["inner@1.0.0"],
         },
         "node_modules/bundled": { version: "1.0.0", inBundle: true },
+        "node_modules/aliaspkg": {
+          name: "realpkg",
+          version: "1.0.0",
+          resolved: "https://registry.example.com/realpkg/-/realpkg-1.0.0.tgz",
+          integrity: alias["realpkg@1.0.0"],
+        },
       },
     });
     const pnpmLock = [
@@ -424,15 +455,14 @@ describe("staging and activation", () => {
       pnpm: await stage("pnpm", "pnpm-lock.yaml", pnpmLock),
     };
     for (const packageManager of ["bun", "npm", "pnpm"] as const) {
-      const registry = fakeRegistry("2.0.0", undefined, {}, deps);
+      const registry = fakeRegistry("2.0.0", undefined, {}, { ...deps, ...alias });
       const managerLayout = { ...layout, packageManager };
+      const expected = [`${layout.registry}/inner/1.0.0`, `${layout.registry}/zod/4.5.4`];
+      if (packageManager === "npm") expected.push(`${layout.registry}/realpkg/1.0.0`);
       expect(
         await verifyStagedDependencies(managerLayout, stages[packageManager], registry.request)
-      ).toBe(2);
-      expect(registry.calls.map((call) => call.url).sort()).toEqual([
-        `${layout.registry}/inner/1.0.0`,
-        `${layout.registry}/zod/4.5.4`,
-      ]);
+      ).toBe(expected.length);
+      expect(registry.calls.map((call) => call.url).sort()).toEqual(expected.sort());
       expect(registry.calls.every((call) => call.options.redirect === "error")).toBe(true);
       // A digest the registry does not publish is the redirect-tampering signature.
       const tampered = fakeRegistry(
@@ -795,6 +825,15 @@ describe("registry discovery", () => {
     await expectFailure(() =>
       downloadArtifact(artifact, tampered, () => Promise.resolve(new Response("", { status: 404 })))
     );
+  });
+  test("the stage's abort signal reaches the manifest request", async () => {
+    const registry = fakeRegistry("2.0.0");
+    const abort = new AbortController();
+    abort.abort();
+    await fetchArtifact("https://registry.example.com", "2.0.0", registry.request, abort.signal);
+    expect(registry.calls[0].options.signal?.aborted).toBe(true);
+    await fetchArtifact("https://registry.example.com", "2.0.0", registry.request);
+    expect(registry.calls[1].options.signal?.aborted).toBe(false);
   });
   test("publishes a release's sha512 digest and legacy sha1 shasum, for the named package only", async () => {
     const shasum = "0123456789abcdef0123456789abcdef01234567";

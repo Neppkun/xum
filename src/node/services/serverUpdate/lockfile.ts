@@ -48,6 +48,8 @@ const npmLock = z.object({
   packages: z.record(
     z.string(),
     z.object({
+      // Present when the installed folder name is an alias for another package.
+      name: z.string().optional(),
       version: z.string().optional(),
       resolved: z.string().optional(),
       integrity: z.string().optional(),
@@ -87,7 +89,8 @@ const lockfileParsers: Record<InstallLayout["packageManager"], (raw: string) => 
         ? []
         : [
             {
-              name: key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length),
+              name:
+                pkg.name ?? key.slice(key.lastIndexOf("node_modules/") + "node_modules/".length),
               version: pkg.version ?? "",
               integrity: pkg.integrity,
               resolved: pkg.resolved,

@@ -94,9 +94,10 @@ async function fetchManifest(
 export async function fetchArtifact(
   registry: string,
   version: string,
-  request: RegistryRequest = fetch
+  request: RegistryRequest = fetch,
+  signal?: AbortSignal
 ): Promise<ReleaseArtifact> {
-  const dist = await fetchManifest(registry, "@coder/xum", version, request);
+  const dist = await fetchManifest(registry, "@coder/xum", version, request, signal);
   if (!dist.integrity)
     throw new Error("Registry manifest has no verifiable tarball for the requested version");
   const tarball = new URL(dist.tarball);

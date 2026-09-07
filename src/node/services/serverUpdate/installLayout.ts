@@ -101,12 +101,9 @@ export function resolveInstallLayout(
       if (path.basename(dir) !== "node_modules") continue;
       const parent = path.dirname(dir);
       const managers: Array<InstallLayout["packageManager"]> = [];
-      if (
-        [SERVER_UPDATE_LOCKFILES.bun, "bun.lockb"].some((lock) =>
-          existsSync(path.join(parent, lock))
-        )
-      )
-        managers.push("bun");
+      // Only the text lockfile is supported: staged dependencies are verified from the lockfile the
+      // manager writes, and there is no parser for the legacy binary bun.lockb.
+      if (existsSync(path.join(parent, SERVER_UPDATE_LOCKFILES.bun))) managers.push("bun");
       if (existsSync(path.join(parent, SERVER_UPDATE_LOCKFILES.npm))) managers.push("npm");
       if (existsSync(path.join(parent, SERVER_UPDATE_LOCKFILES.pnpm))) managers.push("pnpm");
       if (managers.length > 1) throw new Error("Ambiguous package manager lockfiles");
