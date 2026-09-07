@@ -200,6 +200,28 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches[1].cancelSignal.aborted).toBe(false);
   });
 
+  test("consumeCurrent retires only the attention owed when the stop was requested", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const stop = Promise.withResolvers<boolean>();
+    const stopRequested = Promise.withResolvers<void>();
+    const consuming = reconciler.consumeCurrent(OWNER, () => {
+      stopRequested.resolve();
+      return stop.promise;
+    });
+    await stopRequested.promise;
+    live = [
+      liveSnapshot({ match: { throughOffset: 30, lines: ["READY", "READY"], totalMatches: 2 } }),
+    ];
+    stop.resolve(true);
+    await consuming;
+
+    expect(acknowledged).toEqual([{ processId: "proc", matchedThroughOffset: 12 }]);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(2);
+    expect(dispatches[1].cancelSignal.aborted).toBe(false);
+  });
+
   test("keeps dead registry evidence until the queued wake is accepted", async () => {
     rows = [registryRecord()];
 

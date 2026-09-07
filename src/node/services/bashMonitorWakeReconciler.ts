@@ -590,9 +590,9 @@ export class BashMonitorWakeReconciler {
   }
 
   /**
-   * Withdraws the in-flight wake and consumes every outstanding signal. When `commit` is given,
-   * the durable consumption waits for it under the lock and is skipped when it resolves false,
-   * leaving the withdrawn signals owed to the next reconcile.
+   * Withdraws the in-flight wake and consumes every signal outstanding on entry. When `commit` is
+   * given, the durable consumption waits for it under the lock and is skipped when it resolves
+   * false, leaving the withdrawn signals owed to the next reconcile.
    */
   async consumeCurrent(ownerWorkspaceId: string, commit?: () => Promise<boolean>): Promise<void> {
     // Withdraw before taking the lock: an acceptance in progress holds it across watermark,
@@ -602,8 +602,10 @@ export class BashMonitorWakeReconciler {
     this.abortDispatch(ownerWorkspaceId);
     const committed = await this.locks.withLock(ownerWorkspaceId, async () => {
       this.abortDispatch(ownerWorkspaceId);
-      if (commit != null && !(await commit())) return false;
+      // Snapshot before waiting on the stop: output that arrives while it settles is new and
+      // stays owed to the idle agent.
       const collected = await this.collect(ownerWorkspaceId, false);
+      if (commit != null && !(await commit())) return false;
       const consumed = [...collected.signals, ...collected.autoConsumed];
       await this.advanceWatermarks(ownerWorkspaceId, collected.watermarks, consumed);
       await this.cleanup(consumed);
