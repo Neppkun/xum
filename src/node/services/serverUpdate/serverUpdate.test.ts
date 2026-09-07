@@ -167,6 +167,12 @@ describe("staging and activation", () => {
       expect(command.args).toContain("--ignore-scripts");
       expect(command.args.slice(-2)).toEqual(["--registry", layout.registry]);
     }
+    expect(installCommand({ ...layout, packageManager: "npm" }, "2.0.0").args).toContain(
+      "--strict-ssl"
+    );
+    expect(installCommand({ ...layout, packageManager: "pnpm" }, "2.0.0").args).toContain(
+      "--config.strict-ssl=true"
+    );
     expect(() => installCommand(layout, "../../escape")).toThrow();
   });
   test("prunes only old stages, preserves active and original installs, and swaps atomically", async () => {

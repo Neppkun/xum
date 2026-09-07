@@ -19,10 +19,21 @@ export function installCommand(
 ): { file: string; args: string[] } {
   if (!isExactVersion(version)) throw new Error("Invalid update version");
   const spec = `@coder/xum@${version}`;
+  // CLI flags outrank npmrc files and npm_config_* env, so an inherited strict-ssl=false cannot
+  // disable certificate validation for the download. bun has no such setting; its only TLS knob
+  // is the env variable runInstall strips.
   const flags = {
     bun: ["add", "--ignore-scripts", "--exact"],
-    npm: ["install", "--no-global", "--no-audit", "--no-fund", "--omit=dev", "--ignore-scripts"],
-    pnpm: ["add", "--no-global", "--ignore-scripts"],
+    npm: [
+      "install",
+      "--no-global",
+      "--no-audit",
+      "--no-fund",
+      "--omit=dev",
+      "--ignore-scripts",
+      "--strict-ssl",
+    ],
+    pnpm: ["add", "--no-global", "--ignore-scripts", "--config.strict-ssl=true"],
   } satisfies Record<InstallLayout["packageManager"], string[]>;
   return {
     file: layout.packageManager,
@@ -57,6 +68,8 @@ async function runInstall(
 ): Promise<void> {
   using install = execFileAsync(file, args, {
     cwd,
+    // Disables TLS validation process-wide in every manager and cannot be outranked by a flag.
+    env: { NODE_TLS_REJECT_UNAUTHORIZED: undefined },
     timeoutMs: SERVER_UPDATE_INSTALL_TIMEOUT_MS,
     killTreeOnTermination: true,
     signal,
