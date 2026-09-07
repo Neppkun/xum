@@ -384,7 +384,7 @@ describe("StreamingBarrier", () => {
     expect(setInterrupting).not.toHaveBeenCalled();
     expect(interruptStream).toHaveBeenCalledWith({
       workspaceId: "ws-1",
-      options: { abandonPartial: true },
+      options: { abandonPartial: true, retireBashMonitorAttention: true },
     });
   });
 

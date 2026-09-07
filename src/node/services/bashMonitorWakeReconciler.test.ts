@@ -60,6 +60,7 @@ describe("BashMonitorWakeReconciler", () => {
   let removedOwners: string[];
   let dropped: string[];
   let droppedGenerations: Array<string | undefined>;
+  let acknowledgeGate: ReturnType<typeof Promise.withResolvers<void>> | undefined;
   let reconciler: BashMonitorWakeReconciler;
 
   beforeEach(async () => {
@@ -74,6 +75,7 @@ describe("BashMonitorWakeReconciler", () => {
     removedOwners = [];
     dropped = [];
     droppedGenerations = [];
+    acknowledgeGate = undefined;
     reconciler = new BashMonitorWakeReconciler({
       sessionsDir: root,
       processManager: {
@@ -84,6 +86,7 @@ describe("BashMonitorWakeReconciler", () => {
             processId,
             ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
           });
+          return acknowledgeGate?.promise;
         },
         dropRetiredMonitor: (processId, createdAt) => {
           droppedGenerations.push(createdAt);
@@ -155,6 +158,32 @@ describe("BashMonitorWakeReconciler", () => {
     expect(dispatches).toHaveLength(2);
     expect(dispatches[0].cancelSignal.aborted).toBe(true);
     expect(dispatches[1].cancelSignal.aborted).toBe(false);
+  });
+
+  test("consumeCurrent withdraws an in-flight wake without waiting behind acceptance I/O", async () => {
+    live = [liveSnapshot()];
+    await reconciler.reconcile(OWNER);
+    const wake = dispatches[0];
+
+    // Acceptance holds the owner lock while acknowledging the process; a Stop must still
+    // withdraw the wake immediately so the admission can bail before claiming a turn.
+    acknowledgeGate = Promise.withResolvers<void>();
+    const accepted = wake.onAccepted();
+    while (acknowledged.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    const consumed = reconciler.consumeCurrent(OWNER);
+    try {
+      expect(wake.cancelSignal.aborted).toBe(true);
+    } finally {
+      acknowledgeGate.resolve();
+    }
+    await accepted;
+    await consumed;
+    expect(acknowledged).toHaveLength(1);
+    await reconciler.reconcile(OWNER);
+    expect(dispatches).toHaveLength(1);
   });
 
   test("keeps dead registry evidence until the queued wake is accepted", async () => {

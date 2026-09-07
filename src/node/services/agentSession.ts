@@ -759,6 +759,7 @@ export class AgentSession {
 
   /** Prevent duplicate mid-stream compaction interrupts while we are already transitioning. */
   private midStreamCompactionPending = false;
+  private midStreamCompactionSettledWaiters: Array<() => void> = [];
   private continuousCompactionAbandoned = false;
   private continuousCompactionStopped = false;
   private continuousCompactionObserving = false;
@@ -4153,11 +4154,14 @@ export class AgentSession {
     // A cancelable send withdrawn past the point of no return (a hard Stop retiring owed
     // attention during goal sync or acceptance) keeps its durable, accepted rows but must not
     // claim PREPARING: the Stop saw no turn to abort and has already returned. Withdrawn sends
-    // resolve Ok without a stream, like cancelBeforeAcceptance and the disposed path above.
+    // resolve Ok without a stream, like cancelBeforeAcceptance and the disposed path above. The
+    // trailing UI-visible row would otherwise read as an interrupted turn to startup recovery,
+    // so record the same abandon marker a user-aborted stream leaves.
     if (cancelSignal?.aborted === true) {
       if (this.coordinator.thinkingOverride === turnThinkingOverride) {
         this.coordinator.releaseThinkingOverride(turnThinkingOverride);
       }
+      await this.updateStartupAutoRetryAbandonFromAbort("user", userMessage.id);
       return Ok(undefined);
     }
 
@@ -4994,7 +4998,7 @@ export class AgentSession {
       // Reserve through dispatch and cleanup, not just the compactor's apply latch.
       // Waiters/duplicate invalidations never own or clear these flags.
       if (this.continuousCompactionObservation === observation) {
-        this.midStreamCompactionPending = false;
+        this.settleMidStreamCompaction();
         this.continuousCompactionStopped = false;
         this.continuousCompactionObserving = false;
         this.continuousCompactionObservation = null;
@@ -5226,7 +5230,7 @@ export class AgentSession {
         }
       }
     } finally {
-      this.midStreamCompactionPending = false;
+      this.settleMidStreamCompaction();
       // Preflight drains deferred to this pending compaction have no other retry: if the
       // compaction request never became a turn, release the queue now (no-op when it did).
       this.drainQueuedMessagesIfIdle();
@@ -6670,7 +6674,7 @@ export class AgentSession {
             ...this.getContinuousCompactionContext(context.modelString, context.options),
             phase: "mid-stream",
           });
-          this.midStreamCompactionPending = false;
+          this.settleMidStreamCompaction();
           await this.finishContinuousCompaction(result === "applied", context);
         });
       } catch (error) {
@@ -6886,6 +6890,21 @@ export class AgentSession {
    */
   hasActiveOrPendingTurnWork(): boolean {
     return this.isBusy() || this.midStreamCompactionPending;
+  }
+
+  /**
+   * Resolves once no mid-stream compaction request is pending. The window closes with no
+   * chat event when the compaction request never becomes a turn, so idle waiters need this
+   * signal rather than the stream lifecycle.
+   */
+  waitForMidStreamCompactionSettled(): Promise<void> {
+    if (!this.midStreamCompactionPending) return Promise.resolve();
+    return new Promise((resolve) => this.midStreamCompactionSettledWaiters.push(resolve));
+  }
+
+  private settleMidStreamCompaction(): void {
+    this.midStreamCompactionPending = false;
+    for (const resolve of this.midStreamCompactionSettledWaiters.splice(0)) resolve();
   }
 
   /**

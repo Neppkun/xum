@@ -102,7 +102,7 @@ export async function cancelCompaction(
   // Backend detects this and skips compaction (Ctrl+C flow)
   await client.workspace.interruptStream({
     workspaceId,
-    options: { abandonPartial: true },
+    options: { abandonPartial: true, retireBashMonitorAttention: true },
   });
 
   return true;

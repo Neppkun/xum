@@ -885,6 +885,7 @@ describe("ACP prompt stream correlation", () => {
     expect(harness.interruptCalls).toEqual([
       {
         workspaceId: newSessionResponse.sessionId,
+        options: { retireBashMonitorAttention: true },
       },
     ]);
 

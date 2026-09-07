@@ -276,7 +276,7 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
 
       void api.workspace.interruptStream({
         workspaceId,
-        options: { abandonPartial: true },
+        options: { abandonPartial: true, retireBashMonitorAttention: true },
       });
       return;
     }

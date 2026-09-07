@@ -1195,15 +1195,27 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
-      if (history.success) {
-        expect(
-          history.data.some((message) =>
+      const wakeRow = history.success
+        ? history.data.find((message) =>
             message.parts.some(
               (part) => part.type === "text" && part.text === "Background monitor wake"
             )
           )
-        ).toBe(true);
-      }
+        : undefined;
+      expect(wakeRow).toBeDefined();
+
+      // The accepted row has no assistant follow-up, so startup recovery would otherwise treat
+      // it as an interrupted turn and replay the withdrawn wake.
+      const preferencePath = (
+        session as unknown as { getAutoRetryPreferencePath: () => string }
+      ).getAutoRetryPreferencePath();
+      const persisted = (await Bun.file(preferencePath).json()) as {
+        startupAutoRetryAbandon?: unknown;
+      };
+      expect(persisted.startupAutoRetryAbandon).toEqual({
+        reason: "aborted",
+        userMessageId: wakeRow?.id,
+      });
     } finally {
       releaseInitialSync();
       session.dispose();

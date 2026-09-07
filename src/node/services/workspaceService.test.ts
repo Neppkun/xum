@@ -1355,7 +1355,6 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     const internal = service as unknown as {
       aiService: { isStreaming(workspaceId: string): boolean };
       hasPendingQueuedOrPreparingTurn(workspaceId: string): boolean;
-      isBusyForMessage(workspaceId: string): boolean;
       scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
       getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
       sendMessage: typeof sendMessage;
@@ -1369,9 +1368,60 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       }): Promise<"in-flight" | "deferred">;
     };
     try {
+      spyOn(service.getOrCreateSession(workspaceId), "isBusy").mockReturnValue(true);
       internal.aiService = { isStreaming: () => true };
       internal.hasPendingQueuedOrPreparingTurn = () => false;
-      internal.isBusyForMessage = () => true;
+      internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
+      internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
+      internal.sendMessage = sendMessage;
+
+      const outcome = await internal.dispatchBashMonitorWake({
+        ownerWorkspaceId: workspaceId,
+        prompt: "wake",
+        muxMetadata: { type: "bash-monitor-wake", records: [] },
+        cancelSignal: new AbortController().signal,
+        onAccepted: () => Promise.resolve(),
+        onDeferred: () => Promise.resolve(),
+      });
+
+      expect(outcome).toBe("deferred");
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(afterIdle).toHaveBeenCalledWith(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("pending mid-stream compaction defers monitor attention like an active turn", async () => {
+    const { config, service, cleanup } = await createWakeWiringService();
+    const workspaceId = "compacting-wake-owner";
+    await config.addWorkspace("/tmp/compacting-wake-project", {
+      id: workspaceId,
+      name: workspaceId,
+      projectName: "compacting-wake-project",
+      projectPath: "/tmp/compacting-wake-project",
+      runtimeConfig: { type: "local" },
+    });
+    const sendMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const afterIdle = mock(() => undefined);
+    const internal = service as unknown as {
+      scheduleBashMonitorWakeReconcileAfterIdle(workspaceId: string): void;
+      getDelegatedTurnContinuationSendOptions(workspaceId: string): Promise<object>;
+      sendMessage: typeof sendMessage;
+      dispatchBashMonitorWake(dispatch: {
+        ownerWorkspaceId: string;
+        prompt: string;
+        muxMetadata: { type: "bash-monitor-wake"; records: [] };
+        cancelSignal: AbortSignal;
+        onAccepted(): Promise<void>;
+        onDeferred(): Promise<void>;
+      }): Promise<"in-flight" | "deferred">;
+    };
+    try {
+      // Between the stopped stream and its compaction request the coordinator is idle and no
+      // stream is running; only the session's pending flag marks the turn work.
+      const session = service.getOrCreateSession(workspaceId);
+      Reflect.set(session, "midStreamCompactionPending", true);
       internal.scheduleBashMonitorWakeReconcileAfterIdle = afterIdle;
       internal.getDelegatedTurnContinuationSendOptions = () => Promise.resolve({});
       internal.sendMessage = sendMessage;
@@ -6946,6 +6996,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
     const session = {
       isBusy: mock(() => busy),
+      hasActiveOrPendingTurnWork: mock(() => busy),
       hasQueuedMessages: mock(() => false),
       hasPendingAutoRetry: mock(() => pendingAutoRetry),
       waitForIdle,
@@ -6984,6 +7035,29 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       expect(waitForIdle).toHaveBeenCalledTimes(1);
     } finally {
       internalWorkspaceService.sessions.delete(workspaceId);
+      await cleanup();
+    }
+  });
+
+  test("idle wait outlasts a pending mid-stream compaction request", async () => {
+    const { workspaceService, cleanup } = await createServices();
+    const workspaceId = "idle-wait-pending-compaction";
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    const settle = Reflect.get(session, "settleMidStreamCompaction") as () => void;
+    try {
+      Reflect.set(session, "midStreamCompactionPending", true);
+      let resolved = false;
+      const waitPromise = workspaceService.waitForIdleAndNoQueuedMessages(workspaceId).then(() => {
+        resolved = true;
+      });
+      await drainPendingDispatches();
+      expect(resolved).toBe(false);
+
+      // The compaction request never became a turn: no stream event fires, only the window closes.
+      settle.call(session);
+      await waitPromise;
+      expect(resolved).toBe(true);
+    } finally {
       await cleanup();
     }
   });

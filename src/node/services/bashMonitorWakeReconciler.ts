@@ -439,7 +439,6 @@ export class BashMonitorWakeReconciler {
     });
   }
   async beginFullHistoryClear(ownerWorkspaceId: string): Promise<BashMonitorFullHistoryClearToken> {
-    this.abortDispatch(ownerWorkspaceId);
     await this.consumeCurrent(ownerWorkspaceId);
     return { ownerWorkspaceId };
   }
@@ -591,6 +590,11 @@ export class BashMonitorWakeReconciler {
   }
 
   async consumeCurrent(ownerWorkspaceId: string): Promise<void> {
+    // Withdraw before taking the lock: an acceptance in progress holds it across watermark,
+    // registry, and process-acknowledgement I/O, and a hard Stop must cancel the admission
+    // without waiting behind that. The lock slot is reserved synchronously too, ahead of any
+    // reconcile the stop's own stream abort triggers.
+    this.abortDispatch(ownerWorkspaceId);
     await this.locks.withLock(ownerWorkspaceId, async () => {
       this.abortDispatch(ownerWorkspaceId);
       const collected = await this.collect(ownerWorkspaceId, false);

@@ -2526,7 +2526,10 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return "in-flight";
       }
       const hasPendingTurn = this.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
-      const hasSessionBackedBusyState = this.isBusyForMessage(ownerWorkspaceId);
+      // Pending mid-stream compaction counts as turn work: the session reads idle between the
+      // stopped stream and its compaction request, which the session sends directly.
+      const hasSessionBackedBusyState =
+        this.sessions.get(ownerWorkspaceId)?.hasActiveOrPendingTurnWork() === true;
       const hasAiServiceStream = this.aiService.isStreaming(ownerWorkspaceId);
       // Cancelable attention must not cut a turn that can consume it in its current tool call.
       // Keep it outside the queue so later manual tool-end input cannot be held behind it.
@@ -11611,19 +11614,22 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
       const session = this.getOrCreateSession(workspaceId);
       // Only a user Stop dismisses owed attention; internal interrupts (goal promotion, archive,
-      // ACP disconnect, send-now) must not lose monitor output.
-      if (options?.retireBashMonitorAttention === true) {
-        // Retire owed attention before the abort: interruptStream returns after the abort
-        // settled, when an idle-triggered dispatch may already be admitting it. Consuming first
-        // withdraws any in-flight dispatch; monitors stay armed for new output. Best-effort, and
-        // never behind the history lock (a wake admission holds it across stream construction).
-        try {
-          await this.bashMonitorWakeReconciler.consumeCurrent(workspaceId);
-        } catch (error: unknown) {
-          log.warn("Failed to retire bash monitor attention before Stop", { workspaceId, error });
-        }
-      }
+      // ACP disconnect, send-now) must not lose monitor output. Start retiring before the abort:
+      // consumeCurrent withdraws an in-flight dispatch synchronously and reserves the reconciler
+      // lock ahead of the reconcile this abort's idle transition triggers, so the abort itself
+      // never waits behind acceptance I/O. Monitors stay armed for new output. Best-effort, and
+      // never behind the history lock (a wake admission holds it across stream construction).
+      const retirement =
+        options?.retireBashMonitorAttention === true
+          ? this.bashMonitorWakeReconciler.consumeCurrent(workspaceId).catch((error: unknown) => {
+              log.warn("Failed to retire bash monitor attention before Stop", {
+                workspaceId,
+                error,
+              });
+            })
+          : undefined;
       const stopResult = await session.interruptStream(options);
+      await retirement;
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
@@ -11996,9 +12002,19 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       return;
     }
 
-    while (session.isBusy() || session.hasQueuedMessages() || session.hasPendingAutoRetry()) {
+    // Pending mid-stream compaction is turn work the coordinator cannot see: the session reads
+    // idle until the compaction request claims PREPARING.
+    const hasTurnWork = () =>
+      session.hasActiveOrPendingTurnWork() ||
+      session.hasQueuedMessages() ||
+      session.hasPendingAutoRetry();
+    while (hasTurnWork()) {
       if (session.isBusy()) {
         await session.waitForIdle();
+        continue;
+      }
+      if (session.hasActiveOrPendingTurnWork()) {
+        await session.waitForMidStreamCompactionSettled();
         continue;
       }
 
@@ -12020,13 +12036,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
             eventType === "stream-lifecycle";
           const queuedOrRetryCleared =
             (eventType === "queued-message-changed" || eventType === "auto-retry-abandoned") &&
-            !session.hasQueuedMessages() &&
-            !session.hasPendingAutoRetry();
+            !hasTurnWork();
           if (retryStartedOrTurnPhaseChanged || queuedOrRetryCleared) {
             finish();
           }
         });
-        if (!session.hasQueuedMessages() && !session.hasPendingAutoRetry()) {
+        if (!hasTurnWork()) {
           finish();
         }
       });
