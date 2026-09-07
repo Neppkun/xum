@@ -9,7 +9,13 @@ export async function fetchDistTags(
   registry: string,
   request: (url: string, options: RequestInit) => Promise<Response> = fetch
 ): Promise<{ latest?: string; next?: string }> {
-  dispatcher ??= new EnvHttpProxyAgent();
+  // NODE_TLS_REJECT_UNAUTHORIZED=0 in the server's environment would otherwise let an on-path
+  // registry rewrite the tags; explicit options win over that process-wide default, for direct
+  // (connect) and proxied (requestTls) connections alike.
+  dispatcher ??= new EnvHttpProxyAgent({
+    connect: { rejectUnauthorized: true },
+    requestTls: { rejectUnauthorized: true },
+  });
   const options: RequestInit & { dispatcher: Dispatcher } = {
     dispatcher,
     signal: AbortSignal.timeout(SERVER_UPDATE_CHECK_TIMEOUT_MS),

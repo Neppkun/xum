@@ -50,7 +50,20 @@ export async function verifyStagedPackage(
   if (readPackageVersion(packageDir) !== version)
     throw new Error("Staged package version does not match the requested update");
   const entry = path.join(packageDir, "dist/cli/index.js");
-  if (!(await fs.stat(entry)).isFile()) throw new Error("Staged CLI entry is not a file");
+  const stat = await fs.stat(entry);
+  if (!stat.isFile()) throw new Error("Staged CLI entry is not a file");
+  // The supervisor execs the launcher symlink directly, so the entry must carry a shebang and be
+  // executable; a parseable file without them would fail every relaunch attempt.
+  const handle = await fs.open(entry);
+  try {
+    const { buffer, bytesRead } = await handle.read(Buffer.alloc(2), 0, 2, 0);
+    if (bytesRead < 2 || buffer.toString() !== "#!")
+      throw new Error("Staged CLI entry has no interpreter line");
+  } finally {
+    await handle.close();
+  }
+  if (process.platform !== "win32" && (stat.mode & 0o111) === 0)
+    throw new Error("Staged CLI entry is not executable");
   // Parse-only: nothing from the registry runs until the operator activates it.
   using smoke = execFileAsync(process.execPath, ["--check", entry], {
     timeoutMs: SERVER_UPDATE_SMOKE_TIMEOUT_MS,

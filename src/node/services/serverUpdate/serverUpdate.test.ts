@@ -26,7 +26,7 @@ async function writePackage(
     path.join(packageDir, "package.json"),
     JSON.stringify({ name: "@coder/xum", version })
   );
-  await fs.writeFile(entry, script);
+  await fs.writeFile(entry, `#!/usr/bin/env node\n${script}`, { mode: 0o755 });
   const bin = path.join(workdir, "node_modules/.bin/mux");
   await fs.mkdir(path.dirname(bin), { recursive: true });
   await fs.symlink(entry, bin);
@@ -205,8 +205,18 @@ describe("staging and activation", () => {
   });
   test("verification rejects mismatched versions, missing entrypoints, and failing smoke runs", async () => {
     const { layout } = await fixture();
+    expect(await verifyStagedPackage(layout.workdir, layout.version)).toBe(layout.entry);
     await expectFailure(() => verifyStagedPackage(layout.workdir, "9.0.0"));
-    await fs.writeFile(layout.entry, "this is not javascript (");
+    if (process.platform !== "win32") {
+      await fs.chmod(layout.entry, 0o644);
+      await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
+      await fs.chmod(layout.entry, 0o755);
+    }
+    await fs.writeFile(layout.entry, "console.log('no interpreter line')", { mode: 0o755 });
+    await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
+    await fs.writeFile(layout.entry, "#!/usr/bin/env node\nthis is not javascript (", {
+      mode: 0o755,
+    });
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
     await fs.unlink(layout.entry);
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
