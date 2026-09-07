@@ -940,6 +940,7 @@ function AppInner() {
     getEffectiveComposerModel: getModelForWorkspace,
     providersConfig,
     getRouteForModel,
+    getEffectiveRouteForModel: (modelString) => routing.resolveEffectiveRoute(modelString),
     getMinThinkingOverride,
     onStartScratchCreation: openNewScratchFromPalette,
     onStartWorkspaceCreation: openNewWorkspaceFromPalette,
