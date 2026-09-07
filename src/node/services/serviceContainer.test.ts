@@ -80,6 +80,8 @@ import {
   type AppTags,
 } from "@/node/services/di/tags";
 import { ServiceContainer, StartupStepTimeoutError } from "./serviceContainer";
+import type { TurnCoordinator } from "@/node/services/turnCoordinator";
+import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 
 /**
  * Independent field → tag listing for every ORPC context field (the production
@@ -169,6 +171,120 @@ describe("ServiceContainer", () => {
       services = undefined;
     }
     fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it("collects restart blockers from live sessions, including pre-stream work", () => {
+    services = new ServiceContainer(stores);
+    expect(services.collectRestartBlockers()).toEqual([]);
+    const session = services.workspaceService.getOrCreateSession("restart-test");
+    const { coordinator } = session as unknown as { coordinator: TurnCoordinator };
+    const turn = coordinator.prepare();
+    expect(services.collectRestartBlockers()).toContainEqual({ kind: "pending-turns", count: 1 });
+    coordinator.finishPreparation(turn);
+    session.queueMessage("queued for later");
+    expect(services.collectRestartBlockers()).toEqual([{ kind: "queued-messages", count: 1 }]);
+    session.clearQueue();
+    const retry = coordinator.beginRetry();
+    expect(services.collectRestartBlockers()).toEqual([{ kind: "auto-retries", count: 1 }]);
+    coordinator.finishRetry(retry);
+    expect(services.collectRestartBlockers()).toEqual([]);
+  });
+
+  it("counts server-wide streams, terminal starts, and foreground or background processes", () => {
+    services = new ServiceContainer(stores);
+    const streams = services.streamManager as unknown as { workspaceStreams: Map<string, unknown> };
+    const terminals = services.terminalService as unknown as {
+      pendingSessionCreations: Map<string, number>;
+    };
+    const processes = services.backgroundProcessManager as unknown as {
+      processes: Map<string, { status: string; isForeground: boolean }>;
+    };
+    const desktop = services.desktopSessionManager as unknown as {
+      sessions: Map<string, unknown>;
+      startupPromises: Map<string, Promise<unknown>>;
+    };
+    const project = services.projectService as unknown as { activeGitInits: Set<string> };
+    let releaseWorkflow: (() => void) | undefined;
+    const workspace = services.workspaceService as unknown as {
+      preflightSendCounts: Map<string, number>;
+      preflightExecCounts: Map<string, number>;
+      initSettlementPromises: Map<string, Promise<void>>;
+      initAbortControllers: Map<string, AbortController>;
+      removingWorkspaces: Set<string>;
+      archivingWorkspaces: Set<string>;
+      renamingWorkspaces: Set<string>;
+    };
+    try {
+      streams.workspaceStreams.set("streaming", {});
+      workspace.initSettlementPromises.set("initializing", new Promise<void>(() => undefined));
+      workspace.initAbortControllers.set("initializing", new AbortController());
+      workspace.initAbortControllers.set("provisioning", new AbortController());
+      workspace.removingWorkspaces.add("removing");
+      workspace.archivingWorkspaces.add("archiving");
+      workspace.archivingWorkspaces.add("removing");
+      workspace.renamingWorkspaces.add("renaming");
+      releaseWorkflow = registerInProcessWorkflowRun("workflow-workspace");
+      desktop.sessions.set("desktop-live", { isAlive: () => true });
+      desktop.sessions.set("desktop-exited", { isAlive: () => false });
+      desktop.startupPromises.set("desktop-starting", new Promise(() => undefined));
+      project.activeGitInits.add("/tmp/new-project");
+      terminals.pendingSessionCreations.set("terminal-starting", 2);
+      processes.processes.set("running", { status: "running", isForeground: false });
+      processes.processes.set("foreground", { status: "running", isForeground: true });
+      processes.processes.set("finished", { status: "exited", isForeground: false });
+      workspace.preflightSendCounts.set("preflight", 1);
+      workspace.preflightExecCounts.set("executing", 1);
+      expect(services.collectRestartBlockers()).toEqual([
+        { kind: "pending-turns", count: 1 },
+        { kind: "workspace-inits", count: 2 },
+        { kind: "workspace-lifecycle", count: 3 },
+        { kind: "background-processes", count: 3 },
+        { kind: "active-streams", count: 1 },
+        { kind: "workflows", count: 1 },
+        { kind: "projects", count: 1 },
+        { kind: "terminals", count: 2 },
+        { kind: "desktop-sessions", count: 2 },
+      ]);
+    } finally {
+      streams.workspaceStreams.clear();
+      terminals.pendingSessionCreations.clear();
+      processes.processes.clear();
+      workspace.preflightSendCounts.clear();
+      workspace.preflightExecCounts.clear();
+      workspace.initSettlementPromises.clear();
+      workspace.initAbortControllers.clear();
+      workspace.removingWorkspaces.clear();
+      workspace.archivingWorkspaces.clear();
+      workspace.renamingWorkspaces.clear();
+      releaseWorkflow?.();
+      desktop.sessions.clear();
+      desktop.startupPromises.clear();
+      project.activeGitInits.clear();
+    }
+    expect(services.collectRestartBlockers()).toEqual([]);
+  });
+
+  it("refuses new sessions, commands, and terminals synchronously during disposal", async () => {
+    services = new ServiceContainer(stores);
+    expect(services.serverService.isShuttingDown()).toBe(false);
+    const disposal = services.dispose();
+    expect(services.serverService.isShuttingDown()).toBe(true);
+    expect(() => services!.workspaceService.getOrCreateSession("cold-workspace")).toThrow(
+      "shutting down"
+    );
+    expect(await services.workspaceService.executeBash("cold-workspace", "echo not-run")).toEqual({
+      success: false,
+      error: "Server is shutting down",
+    });
+    let terminalError: unknown;
+    try {
+      await services.terminalService.create({ workspaceId: "cold-workspace", cols: 80, rows: 24 });
+    } catch (error) {
+      terminalError = error;
+    }
+    expect(terminalError).toBeInstanceOf(Error);
+    expect(String(terminalError)).toContain("shutting down");
+    await disposal;
   });
 
   it("attributes multi-project stream-end analytics to the primary project path", async () => {
