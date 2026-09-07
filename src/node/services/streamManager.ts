@@ -4872,15 +4872,6 @@ export class StreamManager {
       };
     }
 
-    // TODO: Add more specific error types as needed
-    // if (APICallError.isInstance(error)) {
-    //   if (error.statusCode === 401) return { type: "authentication", ... };
-    //   if (error.statusCode === 429) return { type: "rate_limit", ... };
-    // }
-    // if (RetryError.isInstance(error)) {
-    //   return { type: "retry_failed", ... };
-    // }
-
     // Fallback for unknown errors
     const message = getErrorMessage(error);
     return { type: "unknown", raw: message };

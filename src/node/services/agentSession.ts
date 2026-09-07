@@ -75,7 +75,6 @@ import {
   FileChangeTracker,
   createFileChangeNotificationMessage,
   type FileState,
-  type EditedFileAttachment,
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
@@ -7916,7 +7915,6 @@ export class AgentSession {
     const lastMessage = summaryMessage;
     const muxMeta = lastMessage.metadata?.muxMetadata;
 
-    // Check if it's a compaction summary with a pending follow-up
     if (!isCompactionSummaryMetadata(muxMeta) || !muxMeta.pendingFollowUp) {
       return false;
     }
@@ -8280,16 +8278,6 @@ export class AgentSession {
    */
   async recordFileState(filePath: string, state: FileState): Promise<void> {
     await this.fileChangeTracker.record(filePath, state);
-  }
-
-  /** Get the count of tracked files for UI display. */
-  getTrackedFilesCount(): number {
-    return this.fileChangeTracker.count;
-  }
-
-  /** Get the paths of tracked files for UI display. */
-  getTrackedFilePaths(): string[] {
-    return this.fileChangeTracker.paths;
   }
 
   /** Clear all tracked file state (e.g., on /clear). */
@@ -8978,11 +8966,6 @@ export class AgentSession {
       // File missing or unreadable
       return null;
     }
-  }
-
-  /** Delegate to FileChangeTracker for external file change detection (side-effect-free). */
-  async getChangedFileAttachments(): Promise<EditedFileAttachment[]> {
-    return (await this.fileChangeTracker.getChangedAttachments()).attachments;
   }
 
   async appendHeartbeatContextResetBoundary(params: {
