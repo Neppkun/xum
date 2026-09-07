@@ -177,7 +177,10 @@ describe("StreamingBarrier", () => {
 
     expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).toHaveBeenCalledWith("ws-1");
-    expect(interruptStream).toHaveBeenCalledWith({ workspaceId: "ws-1" });
+    expect(interruptStream).toHaveBeenCalledWith({
+      workspaceId: "ws-1",
+      options: { retireBashMonitorAttention: true },
+    });
   });
 
   test("clicking stop during stream-start interrupts without setting interrupting state", () => {
@@ -197,7 +200,10 @@ describe("StreamingBarrier", () => {
 
     expect(setAutoRetryEnabled).toHaveBeenCalledWith({ workspaceId: "ws-1", enabled: false });
     expect(setInterrupting).not.toHaveBeenCalled();
-    expect(interruptStream).toHaveBeenCalledWith({ workspaceId: "ws-1" });
+    expect(interruptStream).toHaveBeenCalledWith({
+      workspaceId: "ws-1",
+      options: { retireBashMonitorAttention: true },
+    });
   });
 
   test("shows the barrier immediately on first appearance", () => {

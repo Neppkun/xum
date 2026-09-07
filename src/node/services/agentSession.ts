@@ -4150,6 +4150,16 @@ export class AgentSession {
       await notifyAcceptedPreStreamFailure(error);
       return Err(error);
     }
+    // A cancelable send withdrawn past the point of no return (a hard Stop retiring owed
+    // attention during goal sync or acceptance) keeps its durable, accepted rows but must not
+    // claim PREPARING: the Stop saw no turn to abort and has already returned. Withdrawn sends
+    // resolve Ok without a stream, like cancelBeforeAcceptance and the disposed path above.
+    if (cancelSignal?.aborted === true) {
+      if (this.coordinator.thinkingOverride === turnThinkingOverride) {
+        this.coordinator.releaseThinkingOverride(turnThinkingOverride);
+      }
+      return Ok(undefined);
+    }
 
     const preparedTurnAbortController = new AbortController();
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);

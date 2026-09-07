@@ -593,7 +593,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         return Ok(undefined);
       });
       spyOn(h.aiService, "isStreaming").mockReturnValue(false);
-      expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
+      expect(
+        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
+          .success
+      ).toBe(true);
       await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
       await h.reconciler.reconcile(h.workspaceId);
       expect(h.requests).toHaveLength(1);
@@ -623,7 +626,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         return Ok(undefined);
       });
       spyOn(h.aiService, "isStreaming").mockReturnValue(false);
-      expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
+      expect(
+        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
+          .success
+      ).toBe(true);
       release.resolve();
       await held;
       await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
@@ -645,8 +651,55 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         return Ok(undefined);
       });
       spyOn(h.aiService, "isStreaming").mockReturnValue(false);
-      expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
+      expect(
+        (await h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true }))
+          .success
+      ).toBe(true);
       expect(h.stopStream).toHaveBeenCalledTimes(1);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("an interrupt without retireBashMonitorAttention keeps owed attention for the idle wake", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      await h.session.sendMessage("original", { model: h.model, agentId: "exec" });
+      await h.addAttention(10);
+      spyOn(h.aiService, "stopStream").mockImplementation(async () => {
+        h.abort("system");
+        await h.session.waitForIdle();
+        return Ok(undefined);
+      });
+      spyOn(h.aiService, "isStreaming").mockReturnValue(false);
+      expect((await h.service.interruptStream(h.workspaceId)).success).toBe(true);
+      await h.internal.pendingBashMonitorWakeIdleWaitsByOwner.get(h.workspaceId);
+      await h.reconciler.reconcile(h.workspaceId);
+      expect(h.requests).toHaveLength(2);
+    } finally {
+      await h.finish();
+    }
+  });
+
+  test("hard Stop during a wake's acceptance window keeps the wake from streaming", async () => {
+    const h = await createActiveWakeHarness();
+    try {
+      let stop: Promise<Result<void>> | undefined;
+      const unsubscribe = h.session.onChatEvent(({ message: event }) => {
+        // The wake's user row is emitted past the point of no return and before PREPARING.
+        if (event.type === "message" && event.role === "user" && stop == null) {
+          stop = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+        }
+      });
+      await h.addAttention(10);
+      unsubscribe();
+      expect(stop).toBeDefined();
+      expect((await stop!).success).toBe(true);
+      expect(h.requests).toHaveLength(0);
+      expect(h.session.isBusy()).toBe(false);
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      await h.addAttention(20);
+      expect(h.requests).toHaveLength(1);
     } finally {
       await h.finish();
     }

@@ -1218,7 +1218,10 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
             return;
           }
           await p.api?.workspace.setAutoRetryEnabled?.({ workspaceId: id, enabled: false });
-          await p.api?.workspace.interruptStream({ workspaceId: id });
+          await p.api?.workspace.interruptStream({
+            workspaceId: id,
+            options: { retireBashMonitorAttention: true },
+          });
         },
       });
       list.push({

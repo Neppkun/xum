@@ -966,7 +966,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
 
   test("rollback failure preserves the wake and continues acceptance", async () => {
     const workspaceId = "queue-dispatch-cancel-rollback-failure";
-    const { session, cleanup, historyService } = await createAgentSessionHarness({ workspaceId });
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
+    const { session, cleanup, historyService } = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
     const originalAppend = historyService.appendToHistory.bind(historyService);
     let markAppendStarted: () => void = () => undefined;
     const appendStarted = new Promise<void>((resolve) => {
@@ -1019,6 +1023,9 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       expect(accepted).toBe(true);
+      // Accepted but withdrawn: the row stays durable and no turn starts.
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
 
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);
@@ -1144,9 +1151,11 @@ describe("AgentSession queued message tool-call dispatch", () => {
       assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
       syncGoalModeWithChatTail,
     } as unknown as WorkspaceGoalService;
+    const streamMessage = mock(() => Promise.resolve(Ok(createStartedTurnHandle())));
     const { session, cleanup, historyService } = await createAgentSessionHarness({
       workspaceId,
       workspaceGoalService,
+      aiServiceOverrides: { streamMessage },
     });
 
     try {
@@ -1181,6 +1190,8 @@ describe("AgentSession queued message tool-call dispatch", () => {
       expect(canceledReasons).toEqual([]);
       expect(cancelState.canceledBeforeAcceptance).toBe(false);
       expect(accepted).toBe(true);
+      expect(streamMessage).not.toHaveBeenCalled();
+      expect(session.isBusy()).toBe(false);
 
       const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(history.success).toBe(true);

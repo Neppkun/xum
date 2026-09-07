@@ -285,7 +285,10 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       storeRaw.setInterrupting(workspaceId);
     }
 
-    void api.workspace.interruptStream({ workspaceId });
+    void api.workspace.interruptStream({
+      workspaceId,
+      options: { retireBashMonitorAttention: true },
+    });
   };
 
   // Show settings hint during compaction if no custom compaction model is configured

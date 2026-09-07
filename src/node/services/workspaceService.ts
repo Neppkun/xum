@@ -11585,7 +11585,12 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
   async interruptStream(
     workspaceId: string,
-    options?: { soft?: boolean; abandonPartial?: boolean; sendQueuedImmediately?: boolean }
+    options?: {
+      soft?: boolean;
+      abandonPartial?: boolean;
+      sendQueuedImmediately?: boolean;
+      retireBashMonitorAttention?: boolean;
+    }
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
     try {
@@ -11605,7 +11610,9 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       }
 
       const session = this.getOrCreateSession(workspaceId);
-      if (!options?.soft) {
+      // Only a user Stop dismisses owed attention; internal interrupts (goal promotion, archive,
+      // ACP disconnect, send-now) must not lose monitor output.
+      if (options?.retireBashMonitorAttention === true) {
         // Retire owed attention before the abort: interruptStream returns after the abort
         // settled, when an idle-triggered dispatch may already be admitting it. Consuming first
         // withdraws any in-flight dispatch; monitors stay armed for new output. Best-effort, and

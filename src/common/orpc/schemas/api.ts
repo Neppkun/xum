@@ -1654,6 +1654,9 @@ export const workspace = {
           soft: z.boolean().optional(),
           abandonPartial: z.boolean().optional(),
           sendQueuedImmediately: z.boolean().optional(),
+          // User Stop only: owed bash-monitor attention is dismissed instead of waking the
+          // agent on the output it just stopped around.
+          retireBashMonitorAttention: z.boolean().optional(),
         })
         .optional(),
     }),

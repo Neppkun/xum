@@ -615,7 +615,10 @@ export class MuxAgent implements Agent {
 
     this.touchSession(sessionId);
     const workspaceId = this.sessionManager.getWorkspaceId(sessionId);
-    const interruptResult = await this.server.client.workspace.interruptStream({ workspaceId });
+    const interruptResult = await this.server.client.workspace.interruptStream({
+      workspaceId,
+      options: { retireBashMonitorAttention: true },
+    });
 
     if (!interruptResult.success) {
       throw new Error(`cancel: workspace.interruptStream failed: ${interruptResult.error}`);
