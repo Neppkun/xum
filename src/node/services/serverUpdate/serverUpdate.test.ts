@@ -6,14 +6,17 @@ import type { RestartBlocker, UpdateStatus } from "@/common/orpc/types";
 import { resolveInstallLayout, inferChannel, type InstallLayout } from "./installLayout";
 import { activateUpdate } from "./activation";
 import { installCommand, stageUpdate, verifyStagedPackage } from "./staging";
+import { verifyStagedDependencies } from "./lockfile";
 import {
   downloadArtifact,
   fetchArtifact,
   fetchDistTags,
+  fetchPublishedDigests,
   type RegistryRequest,
   type ReleaseArtifact,
 } from "./registry";
 import { ServerUpdater, type ServerUpdaterDeps } from "./serverUpdater";
+import { SERVER_UPDATE_STAGE_MARKER } from "@/constants/serverUpdate";
 import { createHash } from "node:crypto";
 
 const dirs: string[] = [];
@@ -78,31 +81,78 @@ async function fixture(
 }
 
 const sri = (bytes: Uint8Array) => `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
+const sriOf = (text: string) => sri(new TextEncoder().encode(text));
+const splitSpec = (spec: string) => {
+  const at = spec.lastIndexOf("@");
+  return { name: spec.slice(0, at), version: spec.slice(at + 1) };
+};
 
-/** Serves one release: its version manifest and tarball, recording every request's options. */
+/**
+ * Serves one release (version manifest and tarball) plus the manifests of the dependencies in
+ * `deps` (`name@version` to sri), recording every request's options.
+ */
 function fakeRegistry(
   version: string,
   bytes = new TextEncoder().encode(`tarball ${version}`),
-  overrides: Partial<{ tarball: string; integrity: string; version: string }> = {}
+  overrides: Partial<{ tarball: string; integrity: string; version: string }> = {},
+  deps: Record<string, string> = {}
 ) {
   const calls: Array<{ url: string; options: RequestInit }> = [];
   const tarball =
     overrides.tarball ?? `https://registry.example.com/@coder/xum/-/xum-${version}.tgz`;
+  const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body)));
   const request: RegistryRequest = (url, options) => {
     calls.push({ url, options });
     if (url === tarball) return Promise.resolve(new Response(bytes));
-    return Promise.resolve(
-      new Response(
-        JSON.stringify({
-          name: "@coder/xum",
-          version: overrides.version ?? version,
-          dist: { tarball, integrity: overrides.integrity ?? sri(bytes) },
-        })
-      )
-    );
+    for (const [spec, integrity] of Object.entries(deps)) {
+      const { name, version } = splitSpec(spec);
+      if (url.endsWith(`/${name.replace("/", "%2F")}/${version}`))
+        return json({
+          name,
+          version,
+          dist: { tarball: `https://registry.example.com/${name}/-/${version}.tgz`, integrity },
+        });
+    }
+    return json({
+      name: "@coder/xum",
+      version: overrides.version ?? version,
+      dist: { tarball, integrity: overrides.integrity ?? sri(bytes) },
+    });
   };
   return { request, calls, bytes, tarball };
 }
+
+/** A bun.lock as bun 1.2 writes it: the local release tarball plus registry releases. */
+function bunLock(tarball: string, packages: Record<string, string | null> = {}, extra = "") {
+  const entries = Object.entries(packages).map(([spec, integrity]) =>
+    integrity === null
+      ? `    "${splitSpec(spec).name}": ["${spec}", {}],`
+      : `    "${splitSpec(spec).name}": ["${spec}", "", {}, "${integrity}"],`
+  );
+  return [
+    "{",
+    '  "lockfileVersion": 1,',
+    `  "workspaces": { "": { "dependencies": { "@coder/xum": "${tarball}" } } },`,
+    '  "packages": {',
+    `    "@coder/xum": ["@coder/xum@${tarball}", { "dependencies": {} }],`,
+    ...entries,
+    extra,
+    "  },",
+    "}",
+    "",
+  ].join("\n");
+}
+
+/** Stands in for the package manager: writes the staged package and the lockfile bun would. */
+const fakeInstall =
+  (version: string, packages: Record<string, string | null> = {}) =>
+  async (_file: string, _args: string[], cwd: string) => {
+    await writePackage(cwd, version);
+    await fs.writeFile(
+      path.join(cwd, "bun.lock"),
+      bunLock(path.join(cwd, `xum-${version}.tgz`), packages)
+    );
+  };
 
 async function expectFailure(run: () => Promise<unknown>) {
   let failed = false;
@@ -130,9 +180,7 @@ describe("server install layout", () => {
     expect(layout.version).toBe("1.0.0-next.1");
     const bin = await stageUpdate(layout, "2.0.0", {
       ...fakeRegistry("2.0.0"),
-      install: async (_file, _args, cwd) => {
-        await writePackage(cwd, "2.0.0");
-      },
+      install: fakeInstall("2.0.0"),
     });
     activateUpdate(layout, bin);
     expect(await fs.readlink(layout.launcher)).toBe(bin);
@@ -214,13 +262,13 @@ describe("staging and activation", () => {
   });
   test("stages the digest-checked tarball, refusing a corrupted download before any install", async () => {
     const { layout, root } = await fixture();
-    const registry = fakeRegistry("2.0.0");
+    const registry = fakeRegistry("2.0.0", undefined, {}, { "zod@4.5.4": sriOf("zod") });
     let installed: string[] = [];
     const bin = await stageUpdate(layout, "2.0.0", {
       ...registry,
-      install: async (_file, args, cwd) => {
+      install: async (file, args, cwd) => {
         installed = args;
-        await writePackage(cwd, "2.0.0");
+        await fakeInstall("2.0.0", { "zod@4.5.4": sriOf("zod") })(file, args, cwd);
       },
     });
     const tarball = path.join(root, "xum-staging-2.0.0", "xum-2.0.0.tgz");
@@ -232,6 +280,7 @@ describe("staging and activation", () => {
     expect(registry.calls.map((call) => call.url)).toEqual([
       `${layout.registry}/@coder%2Fxum/2.0.0`,
       registry.tarball,
+      `${layout.registry}/zod/4.5.4`,
     ]);
     expect(registry.calls.every((call) => call.options.redirect === "error")).toBe(true);
     const corrupted = fakeRegistry("3.0.0", undefined, { integrity: sri(new Uint8Array([1])) });
@@ -246,21 +295,42 @@ describe("staging and activation", () => {
       })
     );
     expect(installs).toBe(0);
-    expect(await fs.readdir(path.join(root, "xum-staging-3.0.0"))).toEqual(["package.json"]);
+    expect((await fs.readdir(path.join(root, "xum-staging-3.0.0"))).sort()).toEqual([
+      SERVER_UPDATE_STAGE_MARKER,
+      "package.json",
+    ]);
   });
-  test("prunes only old stages, preserves active and original installs, and swaps atomically", async () => {
+  test("prunes only its own old stages, preserves active and original installs, and swaps atomically", async () => {
     const { layout, root } = await fixture();
     const oldEntry = await fs.readFile(layout.entry, "utf8");
     const stale = path.join(root, "xum-staging-0.9.0");
     await fs.mkdir(stale);
+    await fs.writeFile(
+      path.join(stale, SERVER_UPDATE_STAGE_MARKER),
+      JSON.stringify({ launcher: layout.launcher })
+    );
+    // Same naming scheme, but not this updater's: an unmarked directory and another
+    // installation's stage sharing the parent.
+    await fs.mkdir(path.join(root, "xum-staging-0.8.0"));
+    await fs.writeFile(path.join(root, "xum-staging-0.8.0/keep"), "");
+    await fs.mkdir(path.join(root, "xum-staging-0.7.0"));
+    await fs.writeFile(
+      path.join(root, "xum-staging-0.7.0", SERVER_UPDATE_STAGE_MARKER),
+      JSON.stringify({ launcher: path.join(root, "other-mux") })
+    );
+    // The updater's own earlier stage carries the marker it wrote and is pruned like the stale one.
+    await stageUpdate(layout, "1.5.0", { ...fakeRegistry("1.5.0"), install: fakeInstall("1.5.0") });
     const bin = await stageUpdate(layout, "2.0.0", {
       ...fakeRegistry("2.0.0"),
-      install: async (_file, _args, cwd) => {
-        await writePackage(cwd, "2.0.0");
-        await fs.writeFile(path.join(cwd, "bun.lock"), "");
-      },
+      install: fakeInstall("2.0.0"),
     });
-    expect(await fs.readdir(root)).not.toContain("xum-staging-0.9.0");
+    const remaining = (await fs.readdir(root)).filter((name) => name.startsWith("xum-staging-"));
+    expect(remaining.sort()).toEqual([
+      "xum-staging-0.7.0",
+      "xum-staging-0.8.0",
+      "xum-staging-2.0.0",
+    ]);
+    expect(await fs.readdir(path.join(root, "xum-staging-0.8.0"))).toEqual(["keep"]);
     activateUpdate(layout, bin);
     expect(await fs.readlink(layout.launcher)).toBe(bin);
     expect(await fs.readFile(layout.entry, "utf8")).toBe(oldEntry);
@@ -272,12 +342,10 @@ describe("staging and activation", () => {
     expect(result.layout.version).toBe("2.0.0");
     await stageUpdate(result.layout, "3.0.0", {
       ...fakeRegistry("3.0.0"),
-      install: async (_file, _args, cwd) => {
-        await writePackage(cwd, "3.0.0");
-      },
+      install: fakeInstall("3.0.0"),
     });
     expect((await fs.readdir(root)).filter((name) => name.startsWith("xum-staging-"))).toHaveLength(
-      2
+      4
     );
     expect(await fs.realpath(layout.launcher)).toBe(await fs.realpath(bin));
     expect(await fs.readFile(layout.entry, "utf8")).toBe(oldEntry);
@@ -293,12 +361,123 @@ describe("staging and activation", () => {
     }
     await fs.writeFile(layout.entry, "console.log('no interpreter line')", { mode: 0o755 });
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
+    // Any other interpreter line parses but exits 127 under the supervisor.
+    await fs.writeFile(layout.entry, "#!/definitely/missing\nconsole.log('x')", { mode: 0o755 });
+    await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
+    await fs.writeFile(layout.entry, "#!/usr/bin/env node\r\nconsole.log('x')", { mode: 0o755 });
+    await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
     await fs.writeFile(layout.entry, "#!/usr/bin/env node\nthis is not javascript (", {
       mode: 0o755,
     });
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
     await fs.unlink(layout.entry);
     await expectFailure(() => verifyStagedPackage(layout.workdir, layout.version));
+  });
+  test("anchors every locked dependency digest to the registry for each manager's lockfile", async () => {
+    const { layout, root } = await fixture();
+    const deps = { "zod@4.5.4": sriOf("zod"), "inner@1.0.0": sriOf("inner") };
+    const stage = async (
+      manager: InstallLayout["packageManager"],
+      lockfile: string,
+      raw: string
+    ) => {
+      const dir = path.join(root, `stage-${manager}`);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, lockfile), raw);
+      return dir;
+    };
+    const npmLock = JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        "": { dependencies: { "@coder/xum": "file:xum-2.0.0.tgz" } },
+        "node_modules/@coder/xum": { version: "2.0.0", resolved: "file:xum-2.0.0.tgz" },
+        "node_modules/zod": {
+          version: "4.5.4",
+          resolved: "https://registry.example.com/zod/-/zod-4.5.4.tgz",
+          integrity: deps["zod@4.5.4"],
+        },
+        "node_modules/zod/node_modules/inner": {
+          version: "1.0.0",
+          resolved: "https://registry.example.com/inner/-/inner-1.0.0.tgz",
+          integrity: deps["inner@1.0.0"],
+        },
+        "node_modules/bundled": { version: "1.0.0", inBundle: true },
+      },
+    });
+    const pnpmLock = [
+      "lockfileVersion: '9.0'",
+      "packages:",
+      "  '@coder/xum@file:xum-2.0.0.tgz':",
+      "    resolution: {integrity: sha512-unchecked, tarball: file:xum-2.0.0.tgz}",
+      "    version: 2.0.0",
+      "  zod@4.5.4:",
+      `    resolution: {integrity: ${deps["zod@4.5.4"]}}`,
+      "  '/inner@1.0.0(zod@4.5.4)':",
+      `    resolution: {integrity: ${deps["inner@1.0.0"]}}`,
+      "snapshots:",
+      "  zod@4.5.4: {}",
+      "",
+    ].join("\n");
+    const stages = {
+      bun: await stage("bun", "bun.lock", bunLock("/stage/xum-2.0.0.tgz", deps)),
+      npm: await stage("npm", "package-lock.json", npmLock),
+      pnpm: await stage("pnpm", "pnpm-lock.yaml", pnpmLock),
+    };
+    for (const packageManager of ["bun", "npm", "pnpm"] as const) {
+      const registry = fakeRegistry("2.0.0", undefined, {}, deps);
+      const managerLayout = { ...layout, packageManager };
+      expect(
+        await verifyStagedDependencies(managerLayout, stages[packageManager], registry.request)
+      ).toBe(2);
+      expect(registry.calls.map((call) => call.url).sort()).toEqual([
+        `${layout.registry}/inner/1.0.0`,
+        `${layout.registry}/zod/4.5.4`,
+      ]);
+      expect(registry.calls.every((call) => call.options.redirect === "error")).toBe(true);
+      // A digest the registry does not publish is the redirect-tampering signature.
+      const tampered = fakeRegistry(
+        "2.0.0",
+        undefined,
+        {},
+        { ...deps, "inner@1.0.0": sriOf("evil") }
+      );
+      await expectFailure(() =>
+        verifyStagedDependencies(managerLayout, stages[packageManager], tampered.request)
+      );
+    }
+    const refused = {
+      plaintext: `    "evil": ["evil@1.0.0", "http://mirror.example.com/evil-1.0.0.tgz", {}, "${sriOf("evil")}"],`,
+      unpinned: '    "evil": ["evil@1.0.0", "", {}],',
+      remote: '    "evil": ["evil@https://mirror.example.com/evil-1.0.0.tgz", {}],',
+      local: '    "evil": ["evil@/tmp/evil.tgz", {}],',
+      git: '    "evil": ["evil@github:evil/evil#abc", {}],',
+    };
+    for (const extra of Object.values(refused)) {
+      const dir = await stage("bun", "bun.lock", bunLock("/stage/xum-2.0.0.tgz", deps, extra));
+      const registry = fakeRegistry(
+        "2.0.0",
+        undefined,
+        {},
+        { ...deps, "evil@1.0.0": sriOf("evil") }
+      );
+      await expectFailure(() => verifyStagedDependencies(layout, dir, registry.request));
+      expect(registry.calls).toHaveLength(0);
+    }
+    // Bundled packages ship inside their parent's verified tarball and are never fetched.
+    const bundled =
+      '    "bundled": ["bundled@1.0.0", "", { "bundled": true }, "sha512-unchecked"],';
+    const dir = await stage("bun", "bun.lock", bunLock("/stage/xum-2.0.0.tgz", deps, bundled));
+    expect(
+      await verifyStagedDependencies(
+        layout,
+        dir,
+        fakeRegistry("2.0.0", undefined, {}, deps).request
+      )
+    ).toBe(2);
+    const unreadable = await stage("bun", "bun.lock", "not a lockfile");
+    await expectFailure(() =>
+      verifyStagedDependencies(layout, unreadable, fakeRegistry("2.0.0").request)
+    );
   });
   test("activation failure leaves the old link intact", async () => {
     const { layout } = await fixture();
@@ -450,6 +629,31 @@ describe("server updater", () => {
     await updater.installUpdate();
     expect(events).toEqual(["/staged/2.0.0", "/staged/2.1.0"]);
   });
+  test("a failed check keeps a staged download installable", async () => {
+    const { layout } = await fixture();
+    let offline = false;
+    const events: string[] = [];
+    const updater = new ServerUpdater({ supported: true, layout }, undefined, {
+      collectBlockers: () => [],
+      restart: () => {
+        events.push("restart");
+        return Promise.resolve();
+      },
+      fetchDistTags: () =>
+        offline ? Promise.reject(new Error("offline")) : Promise.resolve({ next: "2.0.0" }),
+      runInstall: () => Promise.resolve("/staged"),
+      activate: () => {
+        events.push("activate");
+      },
+    });
+    await updater.checkForUpdates();
+    await updater.downloadUpdate();
+    offline = true;
+    await updater.checkForUpdates();
+    expect(updater.getStatus()).toEqual({ type: "downloaded", info: { version: "2.0.0" } });
+    await updater.installUpdate();
+    expect(events).toEqual(["activate", "restart"]);
+  });
   test("a shutdown that begins while blockers refresh never activates the update", async () => {
     const { layout } = await fixture();
     const events: string[] = [];
@@ -590,6 +794,25 @@ describe("registry discovery", () => {
     expect(await fs.readdir(root)).toEqual(["xum-2.0.0.tgz"]);
     await expectFailure(() =>
       downloadArtifact(artifact, tampered, () => Promise.resolve(new Response("", { status: 404 })))
+    );
+  });
+  test("publishes a release's sha512 digest and legacy sha1 shasum, for the named package only", async () => {
+    const shasum = "0123456789abcdef0123456789abcdef01234567";
+    const manifest = (name: string) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            name,
+            version: "1.0.0",
+            dist: { tarball: "https://r.example.com/x.tgz", integrity: sriOf("x"), shasum },
+          })
+        )
+      );
+    expect(
+      await fetchPublishedDigests("https://r.example.com", "x", "1.0.0", () => manifest("x"))
+    ).toEqual([sriOf("x"), `sha1-${Buffer.from(shasum, "hex").toString("base64")}`]);
+    await expectFailure(() =>
+      fetchPublishedDigests("https://r.example.com", "x", "1.0.0", () => manifest("y"))
     );
   });
   test("rejects HTTP errors and malformed responses", async () => {

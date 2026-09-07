@@ -1,9 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { z } from "zod";
 import { execFileAsync } from "@/node/utils/disposableExec";
 import {
+  SERVER_UPDATE_CLI_INTERPRETER,
+  SERVER_UPDATE_CLI_SHEBANG,
   SERVER_UPDATE_INSTALL_TIMEOUT_MS,
   SERVER_UPDATE_SMOKE_TIMEOUT_MS,
+  SERVER_UPDATE_STAGE_MARKER,
   SERVER_UPDATE_STAGING_PREFIX,
 } from "@/constants/serverUpdate";
 import {
@@ -12,6 +16,7 @@ import {
   resolveCliEntry,
   type InstallLayout,
 } from "./installLayout";
+import { verifyStagedDependencies } from "./lockfile";
 import { downloadArtifact, fetchArtifact, type RegistryRequest } from "./registry";
 
 /** Installs an already verified local tarball; only its dependencies come from the registry. */
@@ -52,13 +57,20 @@ export async function verifyStagedPackage(
   const entry = path.join(packageDir, "dist/cli/index.js");
   const stat = await fs.stat(entry);
   if (!stat.isFile()) throw new Error("Staged CLI entry is not a file");
-  // The supervisor execs the launcher symlink directly, so the entry must carry a shebang and be
-  // executable; a parseable file without them would fail every relaunch attempt.
+  // The supervisor execs the launcher symlink directly, so the entry must be executable and name
+  // the interpreter the running install uses; a parseable file with any other first line would
+  // fail every relaunch attempt.
+  const shebang = `${SERVER_UPDATE_CLI_SHEBANG}\n`;
   const handle = await fs.open(entry);
   try {
-    const { buffer, bytesRead } = await handle.read(Buffer.alloc(2), 0, 2, 0);
-    if (bytesRead < 2 || buffer.toString() !== "#!")
-      throw new Error("Staged CLI entry has no interpreter line");
+    const { buffer, bytesRead } = await handle.read(
+      Buffer.alloc(shebang.length),
+      0,
+      shebang.length,
+      0
+    );
+    if (buffer.subarray(0, bytesRead).toString() !== shebang)
+      throw new Error("Staged CLI entry does not start with the expected interpreter line");
   } finally {
     await handle.close();
   }
@@ -66,7 +78,7 @@ export async function verifyStagedPackage(
     throw new Error("Staged CLI entry is not executable");
   // Parse-only: nothing from the registry runs until the operator activates it. The shebang's
   // interpreter is used because process.execPath may be bun, which has no parse-only mode.
-  using smoke = execFileAsync("node", ["--check", entry], {
+  using smoke = execFileAsync(SERVER_UPDATE_CLI_INTERPRETER, ["--check", entry], {
     timeoutMs: SERVER_UPDATE_SMOKE_TIMEOUT_MS,
     signal,
   });
@@ -97,6 +109,21 @@ export interface StageOptions {
   signal?: AbortSignal;
 }
 
+const markerSchema = z.object({ launcher: z.string() });
+
+/** Only a stage this installation created may be pruned; a name collision is not ownership. */
+async function ownsStage(candidate: string, layout: InstallLayout): Promise<boolean> {
+  try {
+    const raw: unknown = JSON.parse(
+      await fs.readFile(path.join(candidate, SERVER_UPDATE_STAGE_MARKER), "utf8")
+    );
+    const marker = markerSchema.safeParse(raw);
+    return marker.success && marker.data.launcher === layout.launcher;
+  } catch {
+    return false;
+  }
+}
+
 export async function stageUpdate(
   layout: InstallLayout,
   version: string,
@@ -118,13 +145,18 @@ export async function stageUpdate(
     )
       continue;
     const candidate = path.join(parent, entry.name);
-    if ((await fs.realpath(candidate)) !== active) await fs.rm(candidate, { recursive: true });
+    if ((await fs.realpath(candidate)) !== active && (await ownsStage(candidate, layout)))
+      await fs.rm(candidate, { recursive: true });
   }
   // Exclusive creation refuses pre-existing links, and never mutates the running installation.
   await fs.mkdir(dir);
+  await fs.writeFile(
+    path.join(dir, SERVER_UPDATE_STAGE_MARKER),
+    JSON.stringify({ launcher: layout.launcher })
+  );
   await fs.writeFile(path.join(dir, "package.json"), JSON.stringify({ private: true }));
-  // Package managers follow redirects, so the release itself is fetched and digest-checked here
-  // and only the dependency tree is left to the manager, as in the operator's original install.
+  // Package managers follow redirects, so the release itself is fetched and digest-checked here;
+  // the dependency tree the manager resolves is anchored to the registry afterwards.
   const tarball = path.join(dir, `xum-${version}.tgz`);
   await downloadArtifact(
     await fetchArtifact(layout.registry, version, request),
@@ -134,5 +166,6 @@ export async function stageUpdate(
   );
   const command = installCommand(layout, tarball);
   await install(command.file, command.args, dir, signal);
+  await verifyStagedDependencies(layout, dir, request, signal);
   return verifyStagedPackage(dir, version, signal);
 }

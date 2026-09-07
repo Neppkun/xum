@@ -107,6 +107,13 @@ export class ServerUpdater {
             : { type: "up-to-date" }
       );
     } catch (error) {
+      // A verified stage stays installable while the registry is unreachable; the dialog offers no
+      // install action on a check error.
+      if (this.staged) {
+        log.warn("Update check failed; the staged update remains installable", error);
+        this.setStatus({ type: "downloaded", info: { version: this.staged.version } });
+        return;
+      }
       this.setStatus(
         options?.source === "auto"
           ? previous

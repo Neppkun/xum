@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import type { UpdateChannel } from "@/common/types/project";
+import { SERVER_UPDATE_LOCKFILES } from "@/constants/serverUpdate";
 
 export interface InstallLayout {
   launcher: string;
@@ -100,10 +101,14 @@ export function resolveInstallLayout(
       if (path.basename(dir) !== "node_modules") continue;
       const parent = path.dirname(dir);
       const managers: Array<InstallLayout["packageManager"]> = [];
-      if (["bun.lock", "bun.lockb"].some((lock) => existsSync(path.join(parent, lock))))
+      if (
+        [SERVER_UPDATE_LOCKFILES.bun, "bun.lockb"].some((lock) =>
+          existsSync(path.join(parent, lock))
+        )
+      )
         managers.push("bun");
-      if (existsSync(path.join(parent, "package-lock.json"))) managers.push("npm");
-      if (existsSync(path.join(parent, "pnpm-lock.yaml"))) managers.push("pnpm");
+      if (existsSync(path.join(parent, SERVER_UPDATE_LOCKFILES.npm))) managers.push("npm");
+      if (existsSync(path.join(parent, SERVER_UPDATE_LOCKFILES.pnpm))) managers.push("pnpm");
       if (managers.length > 1) throw new Error("Ambiguous package manager lockfiles");
       if (managers.length === 1) {
         workdir = parent;
