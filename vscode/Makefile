@@ -21,8 +21,13 @@ node_modules/.installed: package.json
 	@bun install
 	@touch node_modules/.installed
 
+# The webview imports the root's generated version module, so every build path (including a
+# direct `make -C vscode`) must generate it first.
+../src/version.ts:
+	@$(MAKE) -C .. src/version.ts
+
 ## Build extension package
-build: node_modules/.installed ## Build VS Code extension (.vsix)
+build: node_modules/.installed ../src/version.ts ## Build VS Code extension (.vsix)
 	@echo "Building VS Code extension with esbuild..."
 	@rm -rf out mux-0.1.0.vsix
 	@bun run compile

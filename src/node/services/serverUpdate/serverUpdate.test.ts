@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -825,6 +825,52 @@ describe("registry discovery", () => {
     await expectFailure(() =>
       downloadArtifact(artifact, tampered, () => Promise.resolve(new Response("", { status: 404 })))
     );
+  });
+  test("finishes writing a chunk the file handle only partially accepted", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "server-update-"));
+    dirs.push(dir);
+    interface Writer {
+      write: (
+        buffer: Uint8Array,
+        offset?: number,
+        length?: number
+      ) => Promise<{ bytesWritten: number }>;
+    }
+    const probe = await fs.open(path.join(dir, "probe"), "w");
+    const proto = Object.getPrototypeOf(probe) as Writer;
+    await probe.close();
+    const write = proto.write;
+    let shortened = 0;
+    const spy = spyOn(proto, "write").mockImplementation(function (
+      this: Writer,
+      buffer,
+      offset = 0,
+      length
+    ) {
+      // Persist a single byte the first time a multi-byte chunk arrives.
+      if (shortened === 0 && buffer.length - offset > 1) {
+        shortened++;
+        return write.call(this, buffer, offset, 1);
+      }
+      return write.call(this, buffer, offset, length);
+    });
+    try {
+      const registry = fakeRegistry(
+        "2.0.0",
+        new TextEncoder().encode("a tarball with several bytes")
+      );
+      const artifact = await fetchArtifact(
+        "https://registry.example.com",
+        "2.0.0",
+        registry.request
+      );
+      const dest = path.join(dir, "xum.tgz");
+      await downloadArtifact(artifact, dest, registry.request);
+      expect(shortened).toBe(1);
+      expect(new Uint8Array(await fs.readFile(dest))).toEqual(registry.bytes);
+    } finally {
+      spy.mockRestore();
+    }
   });
   test("the stage's abort signal reaches the manifest request", async () => {
     const registry = fakeRegistry("2.0.0");

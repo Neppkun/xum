@@ -138,7 +138,9 @@ export async function downloadArtifact(
     const reader = response.body.getReader();
     for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
       hash.update(chunk.value);
-      await file.write(chunk.value);
+      // A write may persist fewer bytes than offered; the digest must cover what reached disk.
+      for (let offset = 0; offset < chunk.value.length; )
+        offset += (await file.write(chunk.value, offset)).bytesWritten;
     }
   } finally {
     await file.close();
