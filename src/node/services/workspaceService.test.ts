@@ -725,6 +725,53 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
     }
   });
 
+  test("hard Stop during a wake's acceptance window is acknowledged only once the wake's abandon marker is durable", async () => {
+    const h = await createActiveWakeHarness();
+    const release = createDeferred<void>();
+    try {
+      const sessionInternal = h.session as unknown as {
+        persistAutoRetryState(): Promise<void>;
+        getAutoRetryPreferencePath(): string;
+      };
+      const persist = sessionInternal.persistAutoRetryState.bind(h.session);
+      const persisting = createDeferred<void>();
+      spyOn(sessionInternal, "persistAutoRetryState").mockImplementation(async () => {
+        persisting.resolve();
+        await release.promise;
+        await persist();
+      });
+      let stop: Promise<Result<void>> | undefined;
+      const unsubscribe = h.session.onChatEvent(({ message: event }) => {
+        if (event.type === "message" && event.role === "user" && stop == null) {
+          stop = h.service.interruptStream(h.workspaceId, { retireBashMonitorAttention: true });
+        }
+      });
+      const attention = h.addAttention(10);
+      await persisting.promise;
+      unsubscribe();
+      let stopSettled = false;
+      void stop!.then(() => {
+        stopSettled = true;
+      });
+      // Retirement has consumed the signals; Stop still waits for the withdrawn send's marker.
+      expect((await h.reconciler.snapshot(h.workspaceId)).pendingWakeKinds.size).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(stopSettled).toBe(false);
+      release.resolve();
+      expect((await stop!).success).toBe(true);
+      await attention;
+      const persisted = JSON.parse(
+        await fsPromises.readFile(sessionInternal.getAutoRetryPreferencePath(), "utf-8")
+      ) as { startupAutoRetryAbandon?: { reason: string; userMessageId?: string } };
+      expect(persisted.startupAutoRetryAbandon?.reason).toBe("aborted");
+      expect(persisted.startupAutoRetryAbandon?.userMessageId).toBeDefined();
+      expect(h.requests).toHaveLength(0);
+    } finally {
+      release.resolve();
+      await h.finish();
+    }
+  });
+
   test.each(["options", "settings"] as const)(
     "wake yields when a turn starts during %s admission",
     async (gate) => {

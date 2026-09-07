@@ -1849,6 +1849,8 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly bashMonitorWakeReconciler: BashMonitorWakeReconciler;
   private readonly constructedAtMs = Date.now();
   private readonly pendingBashMonitorWakeIdleWaitsByOwner = new Map<string, Promise<void>>();
+  /** The wake send in flight per owner (at most one: dispatch runs under the history lock). */
+  private readonly inFlightBashMonitorWakeSendsByOwner = new Map<string, Promise<unknown>>();
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
@@ -2552,7 +2554,7 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       if (dispatch.cancelSignal.aborted) return "deferred";
 
       let accepted = false;
-      const sendResult = await this.sendMessage(
+      const send = this.sendMessage(
         ownerWorkspaceId,
         dispatch.prompt,
         {
@@ -2581,6 +2583,16 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
           },
         }
       );
+      // Published so a hard Stop that withdraws this wake can join it (see interruptStream).
+      this.inFlightBashMonitorWakeSendsByOwner.set(ownerWorkspaceId, send);
+      let sendResult: Awaited<typeof send>;
+      try {
+        sendResult = await send;
+      } finally {
+        if (this.inFlightBashMonitorWakeSendsByOwner.get(ownerWorkspaceId) === send) {
+          this.inFlightBashMonitorWakeSendsByOwner.delete(ownerWorkspaceId);
+        }
+      }
       if (!sendResult.success && !accepted) {
         this.scheduleBashMonitorWakeReconcileAfterIdle(ownerWorkspaceId);
         return "deferred";
@@ -11621,18 +11633,21 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
       // succeeded: a failed stop leaves the agent running, so its output stays owed. Monitors stay
       // armed for new output. Best-effort, and never behind the history lock (a wake admission
       // holds it across stream construction).
+      const retiring = options?.retireBashMonitorAttention === true;
+      const withdrawnWakeSend = retiring
+        ? this.inFlightBashMonitorWakeSendsByOwner.get(workspaceId)
+        : undefined;
       const stopSettled = Promise.withResolvers<boolean>();
-      const retirement =
-        options?.retireBashMonitorAttention === true
-          ? this.bashMonitorWakeReconciler
-              .consumeCurrent(workspaceId, () => stopSettled.promise)
-              .catch((error: unknown) => {
-                log.warn("Failed to retire bash monitor attention before Stop", {
-                  workspaceId,
-                  error,
-                });
-              })
-          : undefined;
+      const retirement = retiring
+        ? this.bashMonitorWakeReconciler
+            .consumeCurrent(workspaceId, () => stopSettled.promise)
+            .catch((error: unknown) => {
+              log.warn("Failed to retire bash monitor attention before Stop", {
+                workspaceId,
+                error,
+              });
+            })
+        : undefined;
       let stopResult: Result<void> | undefined;
       try {
         stopResult = await session.interruptStream(options);
@@ -11640,6 +11655,11 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         stopSettled.resolve(stopResult?.success === true);
       }
       await retirement;
+      // A wake withdrawn past its point of no return (durable row, not yet PREPARING, so the
+      // session interrupt above saw idle) resolves only after recording the startup abandon marker
+      // for that row. Stop is acknowledged after it settles: a forced exit right after Stop must
+      // not leave the row eligible for startup replay. Its own failure is reported by the dispatch.
+      await withdrawnWakeSend?.catch(() => undefined);
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
