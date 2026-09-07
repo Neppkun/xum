@@ -25,9 +25,11 @@ export function installCommand(
   tarball: string
 ): { file: string; args: string[] } {
   // CLI flags outrank npmrc files and npm_config_* env, so an inherited strict-ssl=false cannot
-  // disable certificate validation for the download. bun has no such setting; its only TLS knob
-  // is the env variable runInstall strips. The text lockfile is required for dependency
-  // verification, so an older bun that only writes bun.lockb must fail here.
+  // disable certificate validation for the download and an inherited package-lock=false or
+  // lockfile=false cannot suppress the lockfile that dependency verification reads. bun has no
+  // such flags; its TLS and lockfile knobs are env variables runInstall strips (a global bunfig
+  // that disables lockfile saving still makes verification fail closed). The text lockfile is
+  // required, so an older bun that only writes bun.lockb must fail here.
   const flags = {
     bun: ["add", "--ignore-scripts", "--save-text-lockfile"],
     npm: [
@@ -38,8 +40,15 @@ export function installCommand(
       "--omit=dev",
       "--ignore-scripts",
       "--strict-ssl",
+      "--package-lock=true",
     ],
-    pnpm: ["add", "--no-global", "--ignore-scripts", "--config.strict-ssl=true"],
+    pnpm: [
+      "add",
+      "--no-global",
+      "--ignore-scripts",
+      "--config.strict-ssl=true",
+      "--config.lockfile=true",
+    ],
   } satisfies Record<InstallLayout["packageManager"], string[]>;
   return {
     file: layout.packageManager,
@@ -95,8 +104,9 @@ async function runInstall(
 ): Promise<void> {
   using install = execFileAsync(file, args, {
     cwd,
-    // Disables TLS validation process-wide in every manager and cannot be outranked by a flag.
-    env: { NODE_TLS_REJECT_UNAUTHORIZED: undefined },
+    // The TLS variable disables certificate validation in every manager and the bun variable
+    // suppresses the lockfile; neither can be outranked by a flag.
+    env: { NODE_TLS_REJECT_UNAUTHORIZED: undefined, BUN_CONFIG_SKIP_SAVE_LOCKFILE: undefined },
     timeoutMs: SERVER_UPDATE_INSTALL_TIMEOUT_MS,
     killTreeOnTermination: true,
     signal,

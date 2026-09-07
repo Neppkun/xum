@@ -117,9 +117,9 @@ const isLocal = (resolved: string) =>
 /**
  * Anchors the staged dependency tree to the configured registry. Managers follow redirects (also
  * to plaintext) while resolving dependencies and record whatever digest they were served, so the
- * lockfile alone proves nothing; each recorded digest must equal the one the registry publishes
- * over verified HTTPS without redirects. Managers do verify every tarball against its recorded
- * digest, which makes that digest the only link that needs anchoring. Returns the verified count.
+ * lockfile alone proves nothing; every recorded digest must be one the registry publishes over
+ * verified HTTPS without redirects. Managers do verify every tarball against its recorded digest,
+ * which makes that digest the only link that needs anchoring. Returns the verified count.
  */
 export async function verifyStagedDependencies(
   layout: InstallLayout,
@@ -152,7 +152,10 @@ export async function verifyStagedDependencies(
           request,
           signal
         );
-        if (!pkg.integrity.split(/\s+/).some((sri) => published.includes(sri)))
+        // A manager accepts a tarball matching any recorded digest of its strongest algorithm, so
+        // one published digest cannot vouch for a foreign one listed beside it.
+        const recorded = pkg.integrity.trim().split(/\s+/);
+        if (!recorded.every((sri) => published.includes(sri)))
           throw new Error(
             `Registry digest for ${pkg.name}@${pkg.version} differs from the staged lockfile`
           );

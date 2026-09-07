@@ -255,12 +255,12 @@ describe("staging and activation", () => {
       expect(command.args).toContain("--ignore-scripts");
       expect(command.args.slice(-2)).toEqual(["--registry", layout.registry]);
     }
-    expect(installCommand({ ...layout, packageManager: "npm" }, "/x.tgz").args).toContain(
-      "--strict-ssl"
-    );
-    expect(installCommand({ ...layout, packageManager: "pnpm" }, "/x.tgz").args).toContain(
-      "--config.strict-ssl=true"
-    );
+    const npmArgs = installCommand({ ...layout, packageManager: "npm" }, "/x.tgz").args;
+    expect(npmArgs).toContain("--strict-ssl");
+    expect(npmArgs).toContain("--package-lock=true");
+    const pnpmArgs = installCommand({ ...layout, packageManager: "pnpm" }, "/x.tgz").args;
+    expect(pnpmArgs).toContain("--config.strict-ssl=true");
+    expect(pnpmArgs).toContain("--config.lockfile=true");
     expect(installCommand({ ...layout, packageManager: "bun" }, "/x.tgz").args).toContain(
       "--save-text-lockfile"
     );
@@ -475,6 +475,19 @@ describe("staging and activation", () => {
         verifyStagedDependencies(managerLayout, stages[packageManager], tampered.request)
       );
     }
+    // A published digest listed beside a foreign one must not vouch for it: managers accept a
+    // tarball matching either.
+    const mixed = await stage(
+      "bun",
+      "bun.lock",
+      bunLock("/stage/xum-2.0.0.tgz", {
+        ...deps,
+        "inner@1.0.0": `${sriOf("evil")} ${deps["inner@1.0.0"]}`,
+      })
+    );
+    await expectFailure(() =>
+      verifyStagedDependencies(layout, mixed, fakeRegistry("2.0.0", undefined, {}, deps).request)
+    );
     const refused = {
       plaintext: `    "evil": ["evil@1.0.0", "http://mirror.example.com/evil-1.0.0.tgz", {}, "${sriOf("evil")}"],`,
       unpinned: '    "evil": ["evil@1.0.0", "", {}],',
